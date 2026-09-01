@@ -15,12 +15,13 @@ python "$PS3RECOMP/tools/gen_imports.py"    "$ELF" -o imports.json
 # --hle-stubs rewrites each import trampoline as ps3_hle_call(nid) so a direct
 # `bl` to an import reaches the HLE handler instead of the literal stub.
 # --code-end stops the branch-target pass from exploding .rodata into functions;
-# 0x1A9328+0x40 is the end of the last executable section.
+# 0x15F3AC is the end of the last SHF_EXECINSTR section (the 103-entry
+# .lib.stub trampoline table at 0x15E6CC+0xCE0 is the last of them).
 rm -rf src/recomp && mkdir -p src/recomp src/gen
 python "$PS3RECOMP/tools/ppu_lifter.py" "$ELF" \
     --functions analysis/functions.json \
     --hle-stubs imports.json \
-    --code-end 0x1A9368 \
+    --code-end 0x15F3AC \
     -o src/recomp
 
 python "$PS3RECOMP/tools/gen_hle_nids.py" --all --out src/gen/ppu_hle_nids.cpp

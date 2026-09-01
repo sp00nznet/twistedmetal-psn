@@ -153,3 +153,80 @@ expecting this layer to exist.
 2. Lift both SPU modules and register them.
 3. `sys_rsx_*` in the runtime, wired to `rsx_live_draw`.
 4. First boot: the emulator's own CRT, then `CoreInit()` / `GPUCoreInit()`.
+
+### 2026-09-01 (later) — Lifted, built, and booting
+
+**Phases 6/7 — Lift (COMPLETE)**
+
+PPU: `ppu_lifter.py` → **3,530 functions** (3,525 + 5 mid-function tail-entry wrappers),
+`src/recomp/ppu_recomp_000.cpp` at 22.8 MB. 1,453 TODOs remain and **every one is a
+`.word` data constant** — jump-table data and padding misclassified as code, never
+executed. Zero real unhandled instructions; the missing-PPC-instruction patch Simpsons
+upstreamed covers this image completely.
+
+`--code-end 0x15F3AC`: the last `SHF_EXECINSTR` section ends there, and the 103-entry
+`.lib.stub` trampoline table at `0x15E6CC`+`0xCE0` is the last of them. (Section names are
+stripped in the decrypted firmware ELF, so the boundary comes from the flags, not the
+names.)
+
+SPU: both embedded ELFs lifted cleanly — **1,429 functions** from the 86 KB image (99.4%
+byte coverage) and **637** from the 59 KB one (93.3%). Only `.word` data unsupported.
+
+One correction along the way: `gen_imports.py` first dereferenced each `.lib.stub` entry
+as an OPD. It is not one — the entry is already the trampoline's code address. The tell
+was every "stub" coming out as `0x39800000`, which is not an address, it is `li r12,0`.
+
+**Phase 8 — Build (COMPLETE)**
+
+Configured against the shared harness and **linked first try**: `build/tmpsn.exe`, 10.2 MB.
+No missing-symbol reconciliation pass was needed, unlike Simpsons.
+
+`clang-cl` outside a VS developer prompt cannot find Microsoft's `rc.exe`, so the configure
+also needs `-DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe"`.
+
+**Phase 9 — First boot (COMPLETE)**
+
+It runs its own code. Not a stub, not a trace — the recompiled emulator's startup:
+
+```
+PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
+argv[0]=/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN
+g_nUpconvertMode 0: g_bImageSmoothing 0
+user_memory_size= 201326592/268435456 <67108864>
+```
+
+Then: 14 `sys_prx_load_module` calls (all soft-failed, all non-fatal), sysutil callback
+registered, `cellVideoOut` negotiated to 1280x720 @ 59.94, `cellAudioOut` configured,
+`[SPU] initialize(nspu=6, nrawspu=5)`, the PS1 BIOS opened, `REGION NUM = 0x00000081
+code=A`, and SPU image 0 handed to `_sys_spu_image_import` — which correctly reports
+`entry=0x00100 nsegs=3 machine=23`, i.e. the exact image we lifted as `spu0`.
+
+The live NV4097 → D3D12 engine comes up on the way past and starts presenting:
+`[rsx] live-draw engine up (D3D12); GDI present suppressed`. **Same renderer as the
+sister ports, confirmed running.** It has nothing to draw yet.
+
+**One real fix to get here:** `/dev_flash/ps1emu/ps1_rom.bin` missed. `ppu_fs.cpp` serves
+`/dev_flash` from a real firmware tree via `$PS3_DEV_FLASH`, but `runtime/syscalls/sys_fs.c`
+— the other half of the split filesystem — never got that branch, so the path resolved
+under the game root instead. Adding it there fixes it for every port, not just this one.
+(The runtime's built-in default still points at a `D:` path that doesn't exist on this
+machine; `tools/run.sh` sets `PS3_DEV_FLASH` explicitly rather than churning a hardcode.)
+
+**Where it stops, and why**
+
+Two unimplemented kernel areas, both identified precisely:
+
+1. **`sys_rsx_*`.** `cellGcmInit` fails → `cell/host.c: 235: GPUCoreInit(): failed`. The
+   statically-linked libgcm has no HLE to land on; see `docs/graphics-path.md`.
+2. **Raw SPU.** `sys_raw_spu_create` (160) is a stub, so nothing runs the imported image,
+   and the emulator spins forever on `[HOTREAD] spinning on 0xE0044014` — the raw-SPU
+   problem-state status register for SPU 0. Both lifted SPU entries are already registered
+   in `src/spu_images.c`, waiting for a dispatcher.
+
+## Next steps
+
+1. `sys_rsx_*` in `runtime/syscalls/`, wired to the existing FIFO drain and
+   `rsx_live_draw`. Unblocks graphics.
+2. `sys_raw_spu_create/destroy/load` + the `0xE0000000` MMIO window, dispatching to the
+   registered lifted images. Unblocks the emulator core.
+3. Then: disc mount (`EBOOT.PBP` → `PSISOIMG0000`), input, audio, memory cards.

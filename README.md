@@ -94,7 +94,19 @@ EDAT/PSAR handling, exactly as it does on hardware.
 
 ## 🎯 Status
 
-**Recon complete; lifting.**
+**It boots.** The recompiled PS1 emulator runs its own startup, prints its build banner,
+configures video and audio, loads the PS1 BIOS, reads its region, and gets as far as
+handing an SPU image to a raw SPU. Two gaps stop it there.
+
+```
+PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
+user_memory_size= 201326592/268435456 <67108864>
+[cellVideoOut] GetResolution(id=2) -> 1280x720
+[sys_fs] open OK: .../dev_flash/ps1emu/ps1_rom.bin
+REGION NUM = 0x00000081 code=A
+[HLE] _sys_spu_image_import -> entry=0x00100 nsegs=3 machine=23 (SPU=23)
+[rsx] live-draw engine up (D3D12); GDI present suppressed
+```
 
 | Milestone | Status |
 |---|---|
@@ -104,15 +116,29 @@ EDAT/PSAR handling, exactly as it does on hardware.
 | Function discovery | ✅ Done — 3,512 |
 | NID / import resolution | ✅ Done — 103 imports, 12 libs, 83% named |
 | Extract the SPU modules | ✅ Done — 2 embedded ELFs, statically |
-| PPU lift → C++ | 🔄 In progress |
-| SPU lift → C | ⬜ |
-| Build on the shared ps3recomp harness | ⬜ |
-| First boot (recompiled CRT runs) | ⬜ |
-| `sys_rsx_*` → live NV4097 draw engine | ⬜ |
-| BIOS (`ps1_rom.bin`) boots | ⬜ |
+| PPU lift → C++ | ✅ Done — 3,530 functions, 23 MB, **0 unhandled instructions** |
+| SPU lift → C | ✅ Done — 1,429 + 637 functions, both clean |
+| Build on the shared ps3recomp harness | ✅ Done — `tmpsn.exe`, 10.2 MB, first try |
+| First boot (recompiled CRT runs) | ✅ Done — the emulator's own banner prints |
+| Video/audio out negotiated | ✅ Done — 1280x720 @ 59.94 |
+| BIOS (`ps1_rom.bin`) loads | ✅ Done |
+| Live NV4097 → D3D12 engine comes up | ✅ Done — presenting, nothing to draw yet |
+| `sys_rsx_*` syscalls | ⬜ **blocker** — `cellGcmInit failed` → `GPUCoreInit(): failed` |
+| Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ⬜ **blocker** — spins on the SPU status register |
 | Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ |
 | Twisted Metal renders | ⬜ |
 | Input / audio / memory cards | ⬜ |
+
+### The two blockers
+
+1. **`sys_rsx_*` is unimplemented**, so the statically-linked libgcm's `cellGcmInit`
+   returns failure and `GPUCoreInit()` gives up. The live draw engine is up and
+   presenting frames — it just has no FIFO to walk. See
+   [`docs/graphics-path.md`](docs/graphics-path.md) for the syscall→HLE mapping.
+2. **No raw-SPU path.** `_sys_spu_image_import` already accepts SPU image 0 (the one at
+   `0x181100` we lifted), but `sys_raw_spu_create` is a stub and nothing runs the image,
+   so the emulator spins forever reading the SPU status register at `0xE0044014`.
+   The lifted entries are registered and waiting in `src/spu_images.c`.
 
 See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 
@@ -125,9 +151,13 @@ See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
   PS3 package never sets bit 28, so the same rule leaves it on the PS3 key throughout.
 - **`tools/gen_imports.py` — new.** Emits the `imports.json` that `ppu_lifter --hle-stubs`
   wants for an `ET_EXEC` image: `prx_analyzer` finds nothing without a dynamic section, so
-  this walks the `sys_proc_prx_param` lib.stub tables (`elf_parser` already does), derefs
-  each stub OPD to the trampoline address, and names NIDs from `nid_database`. Every port
-  so far had been doing this by hand.
+  this walks the `sys_proc_prx_param` lib.stub tables (`elf_parser` already does) and
+  names each NID from `nid_database`. Every port so far had been doing this by hand.
+- **`runtime/syscalls/sys_fs.c` — `/dev_flash` served from a real firmware tree.**
+  `ppu_fs.cpp` already had this branch (`$PS3_DEV_FLASH`); the raw-syscall half of the
+  split filesystem did not, so a firmware path opened through `sys_fs` resolved under the
+  game root and missed. `ps1_netemu` will not boot without
+  `/dev_flash/ps1emu/ps1_rom.bin`.
 
 ## 📦 Building
 
@@ -146,12 +176,15 @@ python ../ps3recomp/tools/pkg_extract.py pkg/*.pkg extracted
 # 2. Lift PPU + SPU and generate the HLE NID table:
 PS3RECOMP=../ps3recomp ./tools/relift.sh
 
-# 3. Build (Release matters -- an unoptimised build of the generated TU runs ~3x slower):
-cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+# 3. Build (Release matters -- an unoptimised build of the generated TU runs ~3x slower).
+#    llvm-rc: clang-cl outside a VS dev prompt cannot find Microsoft's rc.exe.
+cmake -S . -B build -G Ninja       -DCMAKE_C_COMPILER="C:/Program Files/LLVM/bin/clang-cl.exe"       -DCMAKE_CXX_COMPILER="C:/Program Files/LLVM/bin/clang-cl.exe"       -DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe"
 cmake --build build
 
-# 4. Run with the live NV4097 -> D3D12 draw engine:
-RSX_LIVE_DRAW=1 ./build/tmpsn fw/ps1_netemu.elf
+# 4. Run with the live NV4097 -> D3D12 draw engine. tools/run.sh sets PS3_DEV_FLASH
+#    (where /dev_flash/ps1emu/ps1_rom.bin comes from), PS3_HDD0_ROOT (where the
+#    unpacked package lives) and RSX_LIVE_DRAW=1:
+./tools/run.sh
 ```
 
 ## ⚖️ Legal

@@ -2,602 +2,602 @@
  {
   "lib": "cellAudio",
   "nid": "0x04AF134E",
-  "stub": "0x39800000",
+  "stub": "0x0015E6CC",
   "name": "cellAudioCreateNotifyEventQueue"
  },
  {
   "lib": "cellAudio",
   "nid": "0x0B168F92",
-  "stub": "0x39800000",
+  "stub": "0x0015E6EC",
   "name": "cellAudioInit"
  },
  {
   "lib": "cellAudio",
   "nid": "0x377E0CD9",
-  "stub": "0x39800000",
+  "stub": "0x0015E70C",
   "name": "cellAudioSetNotifyEventQueue"
  },
  {
   "lib": "cellAudio",
   "nid": "0x4129FE2D",
-  "stub": "0x39800000",
+  "stub": "0x0015E72C",
   "name": "cellAudioPortClose"
  },
  {
   "lib": "cellAudio",
   "nid": "0x56DFE179",
-  "stub": "0x39800000",
+  "stub": "0x0015E74C",
   "name": "cellAudioSetPortLevel"
  },
  {
   "lib": "cellAudio",
   "nid": "0x5B1E2C73",
-  "stub": "0x39800000",
+  "stub": "0x0015E76C",
   "name": "cellAudioPortStop"
  },
  {
   "lib": "cellAudio",
   "nid": "0x74A66AF0",
-  "stub": "0x39800000",
+  "stub": "0x0015E78C",
   "name": "cellAudioGetPortConfig"
  },
  {
   "lib": "cellAudio",
   "nid": "0x89BE28F2",
-  "stub": "0x39800000",
+  "stub": "0x0015E7AC",
   "name": "cellAudioPortStart"
  },
  {
   "lib": "cellAudio",
   "nid": "0xCA5AC370",
-  "stub": "0x39800000",
+  "stub": "0x0015E7CC",
   "name": "cellAudioQuit"
  },
  {
   "lib": "cellAudio",
   "nid": "0xCD7BC431",
-  "stub": "0x39800000",
+  "stub": "0x0015E7EC",
   "name": "cellAudioPortOpen"
  },
  {
   "lib": "cellAudio",
   "nid": "0xFF3626FD",
-  "stub": "0x39800000",
+  "stub": "0x0015E80C",
   "name": "cellAudioRemoveNotifyEventQueue"
  },
  {
   "lib": "sys_io",
   "nid": "0x1CF98800",
-  "stub": "0x39800000",
+  "stub": "0x0015E82C",
   "name": "cellPadInit"
  },
  {
   "lib": "sys_io",
   "nid": "0x3733EA3C",
-  "stub": "0x39800000"
+  "stub": "0x0015E84C"
  },
  {
   "lib": "sys_io",
   "nid": "0x4D9B75D5",
-  "stub": "0x39800000",
+  "stub": "0x0015E86C",
   "name": "cellPadEnd"
  },
  {
   "lib": "sys_io",
   "nid": "0x578E3C98",
-  "stub": "0x39800000",
+  "stub": "0x0015E88C",
   "name": "cellPadSetPortSetting"
  },
  {
   "lib": "sys_io",
   "nid": "0xA703A51D",
-  "stub": "0x39800000",
+  "stub": "0x0015E8AC",
   "name": "cellPadGetInfo2"
  },
  {
   "lib": "sys_io",
   "nid": "0xF65544EE",
-  "stub": "0x39800000",
+  "stub": "0x0015E8CC",
   "name": "cellPadSetActDirect"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x02FF3C1B",
-  "stub": "0x39800000",
+  "stub": "0x0015E8EC",
   "name": "cellSysutilUnregisterCallback"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x0BAE8772",
-  "stub": "0x39800000",
+  "stub": "0x0015E90C",
   "name": "cellVideoOutConfigure"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x189A74DA",
-  "stub": "0x39800000",
+  "stub": "0x0015E92C",
   "name": "cellSysutilCheckCallback"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x1DFCCE99",
-  "stub": "0x39800000"
+  "stub": "0x0015E94C"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x1E930EEF",
-  "stub": "0x39800000",
+  "stub": "0x0015E96C",
   "name": "cellVideoOutGetDeviceInfo"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x40E895D3",
-  "stub": "0x39800000",
+  "stub": "0x0015E98C",
   "name": "cellSysutilGetSystemParamInt"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x4692AB35",
-  "stub": "0x39800000",
+  "stub": "0x0015E9AC",
   "name": "cellAudioOutConfigure"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x7663E368",
-  "stub": "0x39800000",
+  "stub": "0x0015E9CC",
   "name": "cellAudioOutGetDeviceInfo"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x887572D5",
-  "stub": "0x39800000",
+  "stub": "0x0015E9EC",
   "name": "cellVideoOutGetState"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x9997E6B6",
-  "stub": "0x39800000"
+  "stub": "0x0015EA0C"
  },
  {
   "lib": "cellSysutil",
   "nid": "0x9D98AFA0",
-  "stub": "0x39800000",
+  "stub": "0x0015EA2C",
   "name": "cellSysutilRegisterCallback"
  },
  {
   "lib": "cellSysutil",
   "nid": "0xE558748D",
-  "stub": "0x39800000",
+  "stub": "0x0015EA4C",
   "name": "cellVideoOutGetResolution"
  },
  {
   "lib": "cellSysutil",
   "nid": "0xE5E2B09D",
-  "stub": "0x39800000",
+  "stub": "0x0015EA6C",
   "name": "cellAudioOutGetNumberOfDevice"
  },
  {
   "lib": "cellSysutil",
   "nid": "0xF4E3CAA0",
-  "stub": "0x39800000",
+  "stub": "0x0015EA8C",
   "name": "cellAudioOutGetState"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x04E83D2C",
-  "stub": "0x39800000",
+  "stub": "0x0015EAAC",
   "name": "_sys_strncmp"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x1573DC3F",
-  "stub": "0x39800000",
+  "stub": "0x0015EACC",
   "name": "sys_lwmutex_lock"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x1BC200F4",
-  "stub": "0x39800000",
+  "stub": "0x0015EAEC",
   "name": "sys_lwmutex_unlock"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x24A1EA07",
-  "stub": "0x39800000",
+  "stub": "0x0015EB0C",
   "name": "sys_ppu_thread_create"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x26090058",
-  "stub": "0x39800000",
+  "stub": "0x0015EB2C",
   "name": "sys_prx_load_module"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x2C847572",
-  "stub": "0x39800000",
+  "stub": "0x0015EB4C",
   "name": "_sys_process_atexitspawn"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x2D36462B",
-  "stub": "0x39800000",
+  "stub": "0x0015EB6C",
   "name": "_sys_strlen"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x2F85C0EF",
-  "stub": "0x39800000",
+  "stub": "0x0015EB8C",
   "name": "sys_lwmutex_create"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x350D454E",
-  "stub": "0x39800000",
+  "stub": "0x0015EBAC",
   "name": "sys_ppu_thread_get_id"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x3EF17F8C",
-  "stub": "0x39800000"
+  "stub": "0x0015EBCC"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x42B23552",
-  "stub": "0x39800000",
+  "stub": "0x0015EBEC",
   "name": "sys_prx_register_library"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x459B4393",
-  "stub": "0x39800000",
+  "stub": "0x0015EC0C",
   "name": "_sys_strcmp"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x4A071D98",
-  "stub": "0x39800000",
+  "stub": "0x0015EC2C",
   "name": "sys_interrupt_thread_disestablish"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x67F9FEDB",
-  "stub": "0x39800000",
+  "stub": "0x0015EC4C",
   "name": "sys_game_process_exitspawn2"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x68B9B011",
-  "stub": "0x39800000",
+  "stub": "0x0015EC6C",
   "name": "_sys_memset"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x6BF66EA7",
-  "stub": "0x39800000",
+  "stub": "0x0015EC8C",
   "name": "_sys_memcpy"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x744680A2",
-  "stub": "0x39800000",
+  "stub": "0x0015ECAC",
   "name": "sys_initialize_tls"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x80FB0C19",
-  "stub": "0x39800000",
+  "stub": "0x0015ECCC",
   "name": "sys_prx_stop_module"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x8461E528",
-  "stub": "0x39800000",
+  "stub": "0x0015ECEC",
   "name": "sys_time_get_system_time"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x96328741",
-  "stub": "0x39800000",
+  "stub": "0x0015ED0C",
   "name": "_sys_process_at_Exitspawn"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x99C88692",
-  "stub": "0x39800000",
+  "stub": "0x0015ED2C",
   "name": "_sys_strcpy"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x9F04F7AF",
-  "stub": "0x39800000",
+  "stub": "0x0015ED4C",
   "name": "_sys_printf"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x9F18429D",
-  "stub": "0x39800000",
+  "stub": "0x0015ED6C",
   "name": "sys_prx_start_module"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xA1F9EAFE",
-  "stub": "0x39800000",
+  "stub": "0x0015ED8C",
   "name": "_sys_sprintf"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xA2C7BA64",
-  "stub": "0x39800000",
+  "stub": "0x0015EDAC",
   "name": "sys_prx_exitspawn_with_level"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xAFF080A4",
-  "stub": "0x39800000",
+  "stub": "0x0015EDCC",
   "name": "sys_ppu_thread_exit"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xB995662E",
-  "stub": "0x39800000"
+  "stub": "0x0015EDEC"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xBDB18F83",
-  "stub": "0x39800000",
+  "stub": "0x0015EE0C",
   "name": "_sys_malloc"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xC3476D0C",
-  "stub": "0x39800000",
+  "stub": "0x0015EE2C",
   "name": "sys_lwmutex_destroy"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xE0DA8EFD",
-  "stub": "0x39800000",
+  "stub": "0x0015EE4C",
   "name": "sys_spu_image_close"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xE6F2C1E7",
-  "stub": "0x39800000",
+  "stub": "0x0015EE6C",
   "name": "sys_process_exit"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xE75C40F2",
-  "stub": "0x39800000",
+  "stub": "0x0015EE8C",
   "name": "sys_process_get_paramsfo"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xEBE5F72F",
-  "stub": "0x39800000",
+  "stub": "0x0015EEAC",
   "name": "sys_spu_image_import"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xEEF75113",
-  "stub": "0x39800000",
+  "stub": "0x0015EECC",
   "name": "_sys_toupper"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xF0AECE0D",
-  "stub": "0x39800000",
+  "stub": "0x0015EEEC",
   "name": "sys_prx_unload_module"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xF7F7FB20",
-  "stub": "0x39800000",
+  "stub": "0x0015EF0C",
   "name": "_sys_free"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xFB5DB080",
-  "stub": "0x39800000",
+  "stub": "0x0015EF2C",
   "name": "_sys_memcmp"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x052D29A6",
-  "stub": "0x39800000",
+  "stub": "0x0015F2EC",
   "name": "_sys_strcat"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x191F0C4A",
-  "stub": "0x39800000"
+  "stub": "0x0015F30C"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x27427742",
-  "stub": "0x39800000",
+  "stub": "0x0015F32C",
   "name": "_sys_memmove"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0x3BD53C7B",
-  "stub": "0x39800000"
+  "stub": "0x0015F34C"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xC4FD6121",
-  "stub": "0x39800000"
+  "stub": "0x0015F36C"
  },
  {
   "lib": "sysPrxForUser",
   "nid": "0xD3039D4D",
-  "stub": "0x39800000",
+  "stub": "0x0015F38C",
   "name": "_sys_strncpy"
  },
  {
   "lib": "cellSysconfPs1emu",
   "nid": "0x639ABBDE",
-  "stub": "0x39800000"
+  "stub": "0x0015EF4C"
  },
  {
   "lib": "cellSysconfPs1emu",
   "nid": "0x6A12D11F",
-  "stub": "0x39800000"
+  "stub": "0x0015EF6C"
  },
  {
   "lib": "cellSysconfPs1emu",
   "nid": "0x83E79A23",
-  "stub": "0x39800000"
+  "stub": "0x0015EF8C"
  },
  {
   "lib": "cellSysconfPs1emu",
   "nid": "0xEFDDAF6C",
-  "stub": "0x39800000"
+  "stub": "0x0015EFAC"
  },
  {
   "lib": "cellGamePs1Emu",
   "nid": "0x61CE2BCD",
-  "stub": "0x39800000"
+  "stub": "0x0015EFCC"
  },
  {
   "lib": "cellL10n",
   "nid": "0x2AD091C6",
-  "stub": "0x39800000"
+  "stub": "0x0015EFEC"
  },
  {
   "lib": "cellL10n",
   "nid": "0xFDBF6AC5",
-  "stub": "0x39800000"
+  "stub": "0x0015F00C"
  },
  {
   "lib": "cellRtcAlarm",
   "nid": "0xB287748C",
-  "stub": "0x39800000"
+  "stub": "0x0015F02C"
  },
  {
   "lib": "cellRtcAlarm",
   "nid": "0xDB215455",
-  "stub": "0x39800000"
+  "stub": "0x0015F04C"
  },
  {
   "lib": "cellAdec",
   "nid": "0x1529E506",
-  "stub": "0x39800000",
+  "stub": "0x0015F06C",
   "name": "cellAdecDecodeAu"
  },
  {
   "lib": "cellAdec",
   "nid": "0x487B613E",
-  "stub": "0x39800000",
+  "stub": "0x0015F08C",
   "name": "cellAdecStartSeq"
  },
  {
   "lib": "cellAdec",
   "nid": "0x7E4A4A49",
-  "stub": "0x39800000",
+  "stub": "0x0015F0AC",
   "name": "cellAdecQueryAttr"
  },
  {
   "lib": "cellAdec",
   "nid": "0x847D2380",
-  "stub": "0x39800000",
+  "stub": "0x0015F0CC",
   "name": "cellAdecClose"
  },
  {
   "lib": "cellAdec",
   "nid": "0x97FF2AF1",
-  "stub": "0x39800000",
+  "stub": "0x0015F0EC",
   "name": "cellAdecGetPcm"
  },
  {
   "lib": "cellAdec",
   "nid": "0xBD75F78B",
-  "stub": "0x39800000",
+  "stub": "0x0015F10C",
   "name": "cellAdecGetPcmItem"
  },
  {
   "lib": "cellAdec",
   "nid": "0xD00A6988",
-  "stub": "0x39800000",
+  "stub": "0x0015F12C",
   "name": "cellAdecOpen"
  },
  {
   "lib": "cellAdec",
   "nid": "0xE2EA549B",
-  "stub": "0x39800000",
+  "stub": "0x0015F14C",
   "name": "cellAdecEndSeq"
  },
  {
   "lib": "sceNp",
   "nid": "0x4885AA18",
-  "stub": "0x39800000",
+  "stub": "0x0015F16C",
   "name": "sceNpTerm"
  },
  {
   "lib": "sceNp",
   "nid": "0xAD218FAF",
-  "stub": "0x39800000",
+  "stub": "0x0015F18C",
   "name": "sceNpDrmIsAvailable"
  },
  {
   "lib": "sceNp",
   "nid": "0xBD28FDBF",
-  "stub": "0x39800000",
+  "stub": "0x0015F1AC",
   "name": "sceNpInit"
  },
  {
   "lib": "sys_net",
   "nid": "0x139A9E9B",
-  "stub": "0x39800000",
+  "stub": "0x0015F1CC",
   "name": "sys_net_initialize_network_ex"
  },
  {
   "lib": "sys_net",
   "nid": "0xB68D5625",
-  "stub": "0x39800000",
+  "stub": "0x0015F1EC",
   "name": "sys_net_finalize_network"
  },
  {
   "lib": "cellPngDec",
   "nid": "0x157D30C5",
-  "stub": "0x39800000",
+  "stub": "0x0015F20C",
   "name": "cellPngDecCreate"
  },
  {
   "lib": "cellPngDec",
   "nid": "0x2310F155",
-  "stub": "0x39800000",
+  "stub": "0x0015F22C",
   "name": "cellPngDecDecodeData"
  },
  {
   "lib": "cellPngDec",
   "nid": "0x5B3D1FF1",
-  "stub": "0x39800000",
+  "stub": "0x0015F24C",
   "name": "cellPngDecClose"
  },
  {
   "lib": "cellPngDec",
   "nid": "0x820DAE1A",
-  "stub": "0x39800000",
+  "stub": "0x0015F26C",
   "name": "cellPngDecDestroy"
  },
  {
   "lib": "cellPngDec",
   "nid": "0x9CCDCC95",
-  "stub": "0x39800000",
+  "stub": "0x0015F28C",
   "name": "cellPngDecReadHeader"
  },
  {
   "lib": "cellPngDec",
   "nid": "0xD2BC5BFD",
-  "stub": "0x39800000",
+  "stub": "0x0015F2AC",
   "name": "cellPngDecOpen"
  },
  {
   "lib": "cellPngDec",
   "nid": "0xE97C9BD4",
-  "stub": "0x39800000",
+  "stub": "0x0015F2CC",
   "name": "cellPngDecSetParameter"
  }
 ]
