@@ -1,0 +1,26 @@
+# Copyrighted material: the PS3 firmware emulator, the game package, and
+# everything derived from them. None of this belongs in the repo.
+fw/
+pkg/
+extracted/
+extracted_crack/
+vfs/
+*.rar
+*.pkg
+*.7z
+*.iso
+*.bin
+*.PBP
+*.EDAT
+
+# Generated: lifted C++/C, capture dumps, build output.
+src/recomp/
+src/gen/
+src/spu_gen/
+analysis/functions.json
+analysis/spu/
+build/
+scratch/
+*.log
+*.obj
+*.map
