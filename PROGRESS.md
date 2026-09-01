@@ -10,12 +10,13 @@
 | 3. Decrypt | Firmware SELF → ELF | ✅ |
 | 4. Disasm/find | OPD + heuristic function discovery | ✅ — 3,512 functions |
 | 5. NID resolve | lib.stub tables → library/function names | ✅ — 12 libs, 103 funcs |
-| 6. Lift PPU | `ppu_lifter` → C++ | 🔄 |
-| 7. Lift SPU | 2 embedded SPU ELFs → C | ⬜ |
-| 8. Shared harness | Build on ps3recomp's boot harness | ⬜ |
-| 9. First boot | Enter the recompiled CRT | ⬜ |
-| 10. Graphics | `sys_rsx_*` → live NV4097 → D3D12 | ⬜ |
-| 11. BIOS | `ps1_rom.bin` executes | ⬜ |
+| 6. Lift PPU | `ppu_lifter` → C++ | ✅ — 3,530 functions, 0 unhandled instructions |
+| 7. Lift SPU | 2 embedded SPU ELFs → C | ✅ — 1,429 + 637 functions |
+| 8. Shared harness | Build on ps3recomp's boot harness | ✅ — `tmpsn.exe`, linked first try |
+| 9. First boot | Enter the recompiled CRT | ✅ — the emulator's own banner prints |
+| 10. Graphics | `sys_rsx_*` → live NV4097 → D3D12 | 🔄 — engine up and presenting; syscalls missing |
+| 10b. Raw SPU | `sys_raw_spu_*` + `0xE0000000` MMIO | ⬜ — blocked here |
+| 11. BIOS | `ps1_rom.bin` loads | ✅ |
 | 12. Disc | `EBOOT.PBP` mounts, PS1 executable loads | ⬜ |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | ⬜ |
@@ -146,13 +147,6 @@ than off `cellGcmFlush`. `rsx_live_draw.c`, the method decoder, the D3D12 backen
 `RSX_LIVE_DRAW=1` switch are all untouched. `rsx_live_draw.h` already documents scanout
 registration as coming *from* `sys_rsx_context_attribute(0x104)`, so the engine was written
 expecting this layer to exist.
-
-## Next steps
-
-1. PPU lift, then reconcile the lifter's symbol sets and get it compiling.
-2. Lift both SPU modules and register them.
-3. `sys_rsx_*` in the runtime, wired to `rsx_live_draw`.
-4. First boot: the emulator's own CRT, then `CoreInit()` / `GPUCoreInit()`.
 
 ### 2026-09-01 (later) — Lifted, built, and booting
 
