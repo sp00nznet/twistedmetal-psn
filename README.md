@@ -63,21 +63,29 @@ reach caner's (canersaka) live NV4097 → D3D12 draw engine the same way: they *
 `rsx_live_draw_method()` gets fed. `RSX_LIVE_DRAW=1` and it draws.
 
 **`ps1_netemu` imports no `cellGcmSys`.** Being a firmware module it links libgcm
-*statically* and talks to the GPU through the kernel:
+*statically* and talks to the GPU through the kernel — twelve `sys_rsx_*` syscalls,
+all identified by disassembling each `li r11,N` / `sc` pair with the libgcm wrapper
+around it. (The numbering is two *lower* than the usual published table: `675` is
+`device_map`, not `context_iounmap`.)
 
-```
-syscall 668 sys_rsx_device_open      672 sys_rsx_context_allocate   676 sys_rsx_context_attribute
-        669 sys_rsx_device_close     673 sys_rsx_context_free       677 sys_rsx_device_map
-        670 sys_rsx_memory_allocate  674 sys_rsx_context_iomap  (x24)
-        671 sys_rsx_memory_free      675 sys_rsx_context_iounmap
-```
+So we use **the same renderer, hooked one layer lower** — implemented in
+`ps3recomp/libs/video/sys_rsx.c`. The engine, the method decoder, the D3D12 backend and
+`RSX_LIVE_DRAW=1` are all unchanged; only the tap point moves. Two facts out of the
+disassembly are what make it a bridge rather than a rewrite:
 
-*(all ten confirmed present by scanning `li r11,N` / `sc` pairs in `.text`.)*
+- `*(u32*)lpar_driver_info` must be `0x211` — `cellGcmInit`'s version handshake.
+- the `put`/`get`/`ref` triple sits at `lpar_dma_control + 0x40`, so
+  `context_allocate` returns *(the walker's control address − 0x40)* and the driver's
+  own flushes land exactly where the existing FIFO walker already reads.
 
-So we use **the same renderer, hooked one layer lower**: implement `sys_rsx_*` in the
-ps3recomp runtime and drive the existing FIFO walker from the `sys_rsx_context_attribute`
-kick instead of from `cellGcmFlush`. The engine, the method decoder, the D3D12 backend and
-`RSX_LIVE_DRAW=1` are all unchanged — only the tap point moves.
+**And the thing that was actually failing wasn't graphics at all.** With every RSX
+syscall implemented, `cellGcmInit` still failed — without reaching one of them. It
+gives up when `sys_process_get_sdk_version` returns zero, and that syscall was an
+unimplemented stub leaving its out-param untouched. libgcm sizes its RSX local heap
+off that value on a compatibility ladder (≥2.20 → 249 MB, ≥2.00 → 242, ≥1.90 → 234,
+≥1.80 → 232, else 224), which is how the syscall got identified in the first place.
+Implementing it is what unblocked the GPU. Full derivation:
+[`docs/graphics-path.md`](docs/graphics-path.md).
 
 ## 🛠️ Pipeline
 
@@ -94,9 +102,11 @@ EDAT/PSAR handling, exactly as it does on hardware.
 
 ## 🎯 Status
 
-**It boots.** The recompiled PS1 emulator runs its own startup, prints its build banner,
-configures video and audio, loads the PS1 BIOS, reads its region, and gets as far as
-handing an SPU image to a raw SPU. Two gaps stop it there.
+**It boots, and the GPU is up.** The recompiled PS1 emulator runs its own startup,
+negotiates video and audio, loads the PS1 BIOS, brings RSX up through the kernel,
+drains its own command FIFO into the live NV4097 → D3D12 engine, registers both
+display buffers, and gets through `InitMenu` at a steady 60 fps. One gap stops it
+there: the raw SPU that runs the emulator core.
 
 ```
 PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
@@ -104,8 +114,13 @@ user_memory_size= 201326592/268435456 <67108864>
 [cellVideoOut] GetResolution(id=2) -> 1280x720
 [sys_fs] open OK: .../dev_flash/ps1emu/ps1_rom.bin
 REGION NUM = 0x00000081 code=A
-[HLE] _sys_spu_image_import -> entry=0x00100 nsegs=3 machine=23 (SPU=23)
-[rsx] live-draw engine up (D3D12); GDI present suppressed
+[sys_rsx] memory_allocate(size=0xF900000) -> local=0xC0000000
+[sys_rsx] context_allocate -> dma_control=0x20001FC0 (ctrl=0x20002000)
+[sys_rsx] iomap io=0x00000000 <- ea=0x40100000 size=0x400000
+[cellGcmSys] SetDisplayBuffer(id=0, offset=0x310000, pitch=5120, 1280x720)
+[live-draw] display buffer 0 = loc0:0x00310000 pitch=5120 1280x720
+InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
+[fps] 60.0
 ```
 
 | Milestone | Status |
@@ -122,23 +137,26 @@ REGION NUM = 0x00000081 code=A
 | First boot (recompiled CRT runs) | ✅ Done — the emulator's own banner prints |
 | Video/audio out negotiated | ✅ Done — 1280x720 @ 59.94 |
 | BIOS (`ps1_rom.bin`) loads | ✅ Done |
-| Live NV4097 → D3D12 engine comes up | ✅ Done — presenting, nothing to draw yet |
-| `sys_rsx_*` syscalls | ⬜ **blocker** — `cellGcmInit failed` → `GPUCoreInit(): failed` |
+| Live NV4097 → D3D12 engine comes up | ✅ Done — 60 fps, presenting |
+| `sys_rsx_*` syscalls | ✅ Done — `cellGcmInit` succeeds, FIFO drains, buffers registered |
+| `GPUCoreInit()` / `InitMenu` | ✅ Done |
 | Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ⬜ **blocker** — spins on the SPU status register |
 | Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ |
 | Twisted Metal renders | ⬜ |
 | Input / audio / memory cards | ⬜ |
 
-### The two blockers
+### The blocker
 
-1. **`sys_rsx_*` is unimplemented**, so the statically-linked libgcm's `cellGcmInit`
-   returns failure and `GPUCoreInit()` gives up. The live draw engine is up and
-   presenting frames — it just has no FIFO to walk. See
-   [`docs/graphics-path.md`](docs/graphics-path.md) for the syscall→HLE mapping.
-2. **No raw-SPU path.** `_sys_spu_image_import` already accepts SPU image 0 (the one at
-   `0x181100` we lifted), but `sys_raw_spu_create` is a stub and nothing runs the image,
-   so the emulator spins forever reading the SPU status register at `0xE0044014`.
-   The lifted entries are registered and waiting in `src/spu_images.c`.
+**No raw-SPU path.** `_sys_spu_image_import` already accepts SPU image 0 (the one at
+`0x181100` we lifted), but `sys_raw_spu_create` (160) is a stub and nothing runs the
+image, so the emulator core spins forever reading the SPU status register at
+`0xE0044014`. The lifted entries are registered and waiting in `src/spu_images.c`.
+That is what will produce geometry — the graphics side is ready for it.
+
+Also open, smaller: the menu asks for `/dev_flash/data/font/SCE-PS3-RD-R-LATIN2.ccd`,
+which is not in the installed dev_flash tree (only the `SCE-PS3-*.TTF` set is), and the
+`0x300`/`0x301`/`0x302` attribute packets (tiles, Z-cull) are accepted but ignored,
+which will matter for surface layout once real geometry is drawn.
 
 See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 
@@ -153,6 +171,14 @@ See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
   wants for an `ET_EXEC` image: `prx_analyzer` finds nothing without a dynamic section, so
   this walks the `sys_proc_prx_param` lib.stub tables (`elf_parser` already does) and
   names each NID from `nid_database`. Every port so far had been doing this by hand.
+- **`libs/video/sys_rsx.c` — new, the lv2 RSX syscalls.** Routes 666..677 into the state
+  `cellGcmSys.c` already keeps, so a guest that talks to RSX through the kernel reaches
+  the same live draw engine as one that imports `cellGcmSys`. See above.
+- **`sys_process_get_sdk_version` (25).** Was a stub returning `CELL_OK` with the
+  out-param untouched. Now reports SDK 3.6.0; `PS3_SDK_VERSION` overrides.
+- **`runtime/ppu/ppu_loader.cpp` — `PS3_SCTRACE` now covers the stub path**, which it
+  had skipped: it traced everything *except* the unimplemented syscalls, i.e. exactly
+  the ones a trace is wanted for. Finding the RSX call contract needed this.
 - **`runtime/syscalls/sys_fs.c` — `/dev_flash` served from a real firmware tree.**
   `ppu_fs.cpp` already had this branch (`$PS3_DEV_FLASH`); the raw-syscall half of the
   split filesystem did not, so a firmware path opened through `sys_fs` resolved under the

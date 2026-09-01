@@ -14,7 +14,7 @@
 | 7. Lift SPU | 2 embedded SPU ELFs → C | ✅ — 1,429 + 637 functions |
 | 8. Shared harness | Build on ps3recomp's boot harness | ✅ — `tmpsn.exe`, linked first try |
 | 9. First boot | Enter the recompiled CRT | ✅ — the emulator's own banner prints |
-| 10. Graphics | `sys_rsx_*` → live NV4097 → D3D12 | 🔄 — engine up and presenting; syscalls missing |
+| 10. Graphics | `sys_rsx_*` → live NV4097 → D3D12 | ✅ — FIFO drains, buffers registered, 60 fps |
 | 10b. Raw SPU | `sys_raw_spu_*` + `0xE0000000` MMIO | ⬜ — blocked here |
 | 11. BIOS | `ps1_rom.bin` loads | ✅ |
 | 12. Disc | `EBOOT.PBP` mounts, PS1 executable loads | ⬜ |
@@ -224,3 +224,106 @@ Two unimplemented kernel areas, both identified precisely:
 2. `sys_raw_spu_create/destroy/load` + the `0xE0000000` MMIO window, dispatching to the
    registered lifted images. Unblocks the emulator core.
 3. Then: disc mount (`EBOOT.PBP` → `PSISOIMG0000`), input, audio, memory cards.
+
+
+### 2026-09-01 (later still) — `sys_rsx_*`: graphics up
+
+**Phase 10 — COMPLETE.** `cellGcmInit` succeeds, the FIFO drains real NV4097 methods
+into caner's live engine, both display buffers are registered, a guest clear reaches
+the D3D12 backend, `GPUCoreInit()` returns, and the emulator gets through `InitMenu`
+at a steady 60 fps. Written as `ps3recomp/libs/video/sys_rsx.c` — a bridge into the
+state `cellGcmSys.c` already keeps, not a second RSX. The walker, the method decoder,
+the D3D12 backend and `RSX_LIVE_DRAW=1` are untouched.
+
+**The syscall numbers are two lower than the published table.** The plan assumed
+668 `device_open` … 679 `attribute`. The first RSX call the image makes is `675` with
+`(u64* out, u64* out, 8)` — which is `device_map`'s signature, not `context_iounmap`'s.
+Disassembling every `li r11,N` / `sc` pair together with its libgcm wrapper settled the
+whole block: 666 `device_open`, 667 `device_close`, 668 `memory_allocate`,
+669 `memory_free`, 670 `context_allocate`, 671 `context_free`, 672 `context_iomap`,
+673 `context_iounmap`, 674 `context_attribute`, 675 `device_map`, 676 `device_unmap`,
+677 `attribute`. Identification was structural, not by name: `670` is the one with
+**four** out-pointers plus a handle and a mode (only `context_allocate` looks like
+that); `675`/`676` are a map-then-immediately-unmap pair on `dev_id 9`, i.e. a
+device-presence probe; `672`'s wrapper is `cellGcmMapEaIoAddress(ea, io, size)` with
+both addresses 1MB-alignment-checked.
+
+**Two facts read out of the image, not guessed.**
+
+1. `cellGcmInit`'s version handshake:
+   `ld r7,0x88(r1)` / `lwz r0,0x0(r9)` / `cmpwi r0,529` — `*(u32*)lpar_driver_info`
+   must be `0x211`.
+2. The control register lives at `lpar_dma_control + 0x40`:
+   `lwz r3,0x18(r9)` / `addi r3,r3,64`. That is the whole trick — `context_allocate`
+   returns `cellGcm_control_guest_addr() - 0x40`, so the driver's own `put` writes land
+   on the address the existing walker already reads. No second walker, no shadow copy,
+   no polling.
+
+**Packet ids** for `context_attribute` came from `r4` at all 23 call sites:
+`0x001 0x002 0x003 0x101 0x104 0x106 0x108 0x10A 0x202 0x300 0x301 0x302`. Only two
+matter for pixels. `0x104`'s argument packing was read off `cellGcmSetDisplayBuffer`'s
+prologue (`r3=id r4=offset r5=pitch r6=width r7=height` → `a3 = id & 0xFF`,
+`a4 = (width<<32)|height`, `a5 = (pitch<<32)|offset`) and came out as
+`id=0 offset=0x310000 pitch=5120 1280x720` — exactly right for a 720p 32-bit surface,
+which is the confirmation. The rest are accepted and logged once each rather than
+guessed at: a wrong guess writes plausible garbage into driver state instead of
+failing loudly.
+
+**And the thing that was actually failing was not graphics.** With all twelve syscalls
+implemented, `cellGcmInit` *still* failed — and never reached one of them. Following the
+branch: `GPUCoreInit` calls `cellGcmInit(cmdSize=2MB, ioSize=4MB, ioAddr)` at `0x11FB4`;
+inside, after the `device_map` helper, it calls `func_000123B8` — three instructions
+that return `global+0x80` — and bails with `CELL_GCM_ERROR_FAILURE` if it is zero.
+`global+0x80` is the out-param of **syscall 25**, called as
+`get_sdk_version(getpid(), &out)`, which was an unimplemented stub returning `CELL_OK`
+with the out-param untouched: SDK 0.
+
+What identified the syscall was what libgcm does with the value next — `func_00012018`
+is a compatibility ladder that turns it into the RSX local-heap size:
+
+| threshold | local memory |
+|---|---|
+| `> 0x21FFFF` (SDK ≥ 2.20) | `0xF900000` — 249 MB |
+| `> 0x1FFFFF` (SDK ≥ 2.00) | `0xF200000` — 242 MB |
+| `> 0x18FFFF` (SDK ≥ 1.90) | `0xEA00000` — 234 MB |
+| `> 0x17FFFF` (SDK ≥ 1.80) | `0xE800000` — 232 MB |
+| else | `0xE000000` — 224 MB |
+
+SDK-version-shaped constants, one rung per firmware release that freed up more VRAM.
+Implementing `sys_process_get_sdk_version` (reporting 3.6.0, `PS3_SDK_VERSION`
+overrides) is what unblocked the GPU. A process syscall, not an RSX one.
+
+**One supporting fix:** `PS3_SCTRACE` traced both *handled* syscall paths but not the
+stub path — so it showed everything except the unimplemented syscalls, which are the
+ones a trace is wanted for. Getting the RSX argument contract needed that trace.
+
+**Measured:**
+
+```
+[sys_rsx] device_map(dev=8) -> 0x20030000
+[cellGcmSys] Init(cmdSize=0x10000, ioSize=0x0, ioAddr=0x00000000)
+[sys_rsx] memory_allocate(size=0xF900000 flags=0x80000) -> local=0xC0000000
+[sys_rsx] context_allocate -> dma_control=0x20001FC0 (ctrl=0x20002000) mode=0x820
+[sys_rsx] iomap io=0x00000000 <- ea=0x40100000 size=0x400000
+[sys_rsx] FIFO put=0x00001000 get=0x00001000
+[RSX] methods 0x0180..0x01B8 = 0xFEED0000/0xFEED0001    <- context DMA setup, from the FIFO
+[cellGcmSys] SetDisplayBuffer(id=0, offset=0x310000, pitch=5120, 1280x720)
+[live-draw]  display buffer 0 = loc0:0x00310000 pitch=5120 1280x720
+[live-draw]  display buffer 1 = loc0:0x00694000 pitch=5120 1280x720
+InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
+[fps] 60.0   clears[guest=1]   0 "no IO mapping" resyncs
+```
+
+The screen is still black, which is expected: `clears[guest=1]` is the only thing
+drawn, because the emulator core has not started. No geometry exists yet.
+
+## Next steps
+
+1. **Raw SPU.** `sys_raw_spu_create` (160) + the `0xE0000000` MMIO problem-state window,
+   dispatching to the lifted images registered in `src/spu_images.c`. This is the
+   blocker for everything visible.
+2. `/dev_flash/data/font/SCE-PS3-RD-R-LATIN2.ccd` is missing from the dev_flash tree
+   (only the `.TTF` set is installed), so the menu has no font to render with.
+3. Attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) are accepted and ignored;
+   they affect surface layout and will matter once geometry is drawn.
+4. Then: disc mount (`EBOOT.PBP` → `PSISOIMG0000`), input, audio, memory cards.
