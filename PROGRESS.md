@@ -17,7 +17,8 @@
 | 10. Graphics | `sys_rsx_*` → live NV4097 → D3D12 | ✅ — FIFO drains, buffers registered, 60 fps |
 | 10b. Raw SPU | `sys_raw_spu_*` + `0xE0000000` MMIO | ✅ — all 5 SPUs load, run and handshake |
 | 11. BIOS | `ps1_rom.bin` loads | ✅ |
-| 12. Disc | `EBOOT.PBP` mounts, PS1 executable loads | ⬜ |
+| 11b. Launch args | the nine the VSH passes a PSOne Classic | ✅ — title, region, target, manual read |
+| 12. Disc | `EBOOT.PBP` mounts, PS1 executable loads | ⬜ — blocked: cdrom thread waits on an uncreated semaphore |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -484,13 +485,126 @@ CPU). Six NIDs remain unresolved and none has yet been shown to matter: `0x1DFCC
 (`sys_prx_load_module`, soft-fails harmlessly), `0x56DFE179`, `0x7E4A4A49`, `0xBDB18F83`,
 `0xFDBF6AC5`.
 
+
+### 2026-09-01 (night) — The launch arguments; RPCS3's source as the oracle
+
+A full RPCS3 **source** tree turned out to be sitting at `tools/rpcs3-caner/`. That
+changed the character of this round: three things that had been reverse-engineered from
+call sites got confirmed outright, and the one thing that could not be reverse-engineered
+— what the VSH passes on the command line — was simply written down there.
+
+**The nine arguments.** `Emu/System.cpp`, `m_cat == "1P"`:
+
+```
+argv[0]  /dev_flash/ps1emu/ps1_newemu.self   the emulator self
+argv[1]  <PS1 serial>_mc1.VM1                virtual memory card 1
+argv[2]  <PS1 serial>_mc2.VM1                virtual memory card 2
+argv[3]  0082                                region target
+argv[4]  1600                                resolution scale ("purely a guess")
+argv[5]  /dev_hdd0/game/<content dir>         the game folder -- NOT the serial
+argv[6]  1
+argv[7]  2                                   full screen?
+argv[8]  1                                   smoothing?
+```
+
+plus two 128 KB zero-filled memory-card files under `/dev_hdd0/savedata/vmc/`.
+
+Note the naming split, the same wrinkle that bit `cellGame` earlier: argv[1]/[2] are named
+from the **PS1 serial** (`SCUS94304`), argv[5] from the **content id** (`NPUI94304`).
+
+`ppu_loader.cpp` wrote exactly one argument — fine for a disc title, nowhere near enough
+here. It now honours `PS3_ARGV=<a1>;<a2>;...` and builds the layout lv2 really uses:
+64-bit big-endian pointer slots, NULL-terminated, then a NULL envp, each string 16-byte
+aligned after the slots — verified against RPCS3's `ppu_load_exe`. For a single argument
+the bytes are identical to what it produced before, so no other port moves.
+
+Two Git-Bash traps: MSYS rewrites POSIX-looking paths in *environment values* handed to a
+native binary, so `YDKJ_BOOTPATH=/dev_flash/...` arrived as `C:/Program Files/Git/...`.
+`MSYS2_ENV_CONV_EXCL="*"` stops that — and then stops it for the *host* paths too, so
+`PS3_HDD0_ROOT` arrived as `/g/recomp/...` and every lookup missed. `tools/run.sh` now
+converts host paths explicitly with `cygpath -m` rather than relying on a heuristic that
+has to guess which kind each value is.
+
+**And it works.** The emulator reads all nine and acts on every one that matters:
+
+```
+argc=9   argv[0]=/dev_flash/ps1emu/ps1_netemu.self   argv[5]=/dev_hdd0/game/NPUI94304
+g_strTitle NPUI94304
+[sys_fs] open OK: .../dev_hdd0/game/NPUI94304/USRDIR/CONTENT/DOCUMENT.DAT
+TITLE ID : SCUS94304
+InitMenuManual OK!! PageNum = 30
+target: /dev_hdd0/game/NPUI94304<0>
+REGION NUM = 0x00000082 code=A          <- 0x82 straight out of argv[3]="0082"
+```
+
+It has found the package, read the 30-page manual out of `DOCUMENT.DAT`, taken its region
+from argv[3] (it was `0x81` before), and set its disc target.
+
+**Three earlier identifications confirmed.** `sys_io_3733EA3C` exists in RPCS3 with the
+*exact* signature derived here from the call site — `(u32 port_no, vm::ptr<u32>
+device_type, vm::ptr<CellPadData> data)` — commented "Used by the ps1 emulator built into
+the firmware", forwarding to `cellPadGetDataExtra`, which is what ours does. And RPCS3's
+NID name table gives `0xB995662E` = `sys_raw_spu_image_load` and `0xE0DA8EFD` =
+`sys_spu_image_close`, both as guessed last round.
+
+**Two real bugs found and fixed.**
+
+`_sys_malloc` / `_sys_free` / `_sys_memalign` / `_sys_realloc` were missing from
+`sysPrxForUser` entirely. An unimplemented import is not neutral: the generic stub returns
+`CELL_OK` with `r3` holding whatever was already there, i.e. a garbage pointer the caller
+then writes through. `cellUsbdInit` failed on it; with the allocator in (forwarding to the
+same bump allocator the `sys_heap_*` family uses) it initialises and creates its threads.
+RPCS3's table confirms `0xBDB18F83` is `_sys_malloc`.
+
+`PS3_SCTRACE` was printing the **return value in the first argument's column** for every
+*implemented* syscall — it passed `ctx->gpr[3]` after dispatch had already overwritten it.
+The first argument is the object id across most of lv2, which is the entire reason to read
+a syscall trace; the first pass at the CD-ROM thread was read completely wrong because of
+it (an ESRCH result looked like an ESRCH-shaped *handle*). Everything below depended on
+fixing this first.
+
+**Where it stops now, precisely.** It has the game and never opens `EBOOT.PBP`.
+`_xcdrom_thread` starts and spins **158,738 times** on `sys_semaphore_wait` with **id 0**:
+
+```
+[sc] 47(0x8, 0x3E8, ...)            -> 0            set_priority
+[sc] 90(0x76A760, 0xD0022CB0, 0, 1) -> 0            sys_semaphore_create
+[sc] 92(0x4, 0x30D40, ...)          -> 0            wait(id 4, 200 ms)  -- fine
+[sc] 93(0x0, ...)                   -> 0x80010005   ESRCH
+[sc] 94(0x0, 0x1, ...)              -> 0x80010005   ESRCH
+[sc] 92(0x0, 0x0, ...)              -> 0x80010005   ESRCH   x158,738
+```
+
+The two ids it uses live at `+0x70B8`/`+0x70BC` of its object (`lwz r3,0x70BC(r26)` at
+`0xEFEA0`, `lwz r3,0x70B8(r26)` at `0xEFECC`). The code that creates such a pair is at
+`0x10FFC8`/`0x10FFF4` (`addi r3,r31,56` / `+60` — the same two words seen through a
+different base). It runs twice, for two *other* instances, and never for this one: a
+construction step upstream was skipped.
+
+Ruled out along the way:
+
+- **Not a missing file.** The only failing opens in an entire run are four `SCE-PS3-*.ccd`
+  font probes, each of which falls back to its `.TTF` and succeeds.
+- **Not the argv.** All nine arrive and visibly change behaviour.
+- **Not `ps1_newemu` vs `ps1_netemu`.** RPCS3 launches `newemu`; its import table is a
+  strict *subset* of `netemu`'s (7 fewer — five `cellAudio`, two `sysPrxForUser`), so they
+  are the same codebase and handle argv the same way.
+- **Not the allocator.** `_sys_malloc` is in now and `cellUsbdInit` succeeds.
+
+Also worth recording: syscalls **90-94 are the semaphore family** (`create`, `destroy`,
+`wait`, `trywait`, `post`), which is what the emulator uses for CD-ROM command handoff.
+The first read of that trace mistook them for the event-queue family because our own table
+puts event queues at 128+; the numbers in the table are right, the reading was not.
+
 ## Next steps
 
-1. **Find out what `argv` should contain.** The most direct route is RPCS3's PS1-Classic
-   launch path or a VSH trace; failing that, the emulator's own argv consumer
-   (`func_000B3738` onward) can be read to see which argument it parses into a path. Add
-   multi-argument support to the harness (it writes exactly one) once the answer is known.
-2. Settle the 32-bit vs 64-bit argv slot layout for this binary.
-3. Then: disc mount (`EBOOT.PBP` → `PSISOIMG0000`), R3000 execution, and geometry.
-4. Still open from before: `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs,
-   and attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) are accepted and ignored.
+1. **Find what skips the CD-ROM object's construction.** The creator at `0x10FEC8` has a
+   single caller (`0xD8080`) and is called unconditionally there, so the instance that
+   never gets its semaphores is built somewhere else. A store watchpoint on the failing
+   object's `+0x70B8` would name the writer that never ran; `PPU_WW`/`LBP_WW` already does
+   exactly that.
+2. Then: `EBOOT.PBP` → `PSISOIMG0000` mount, R3000 execution, geometry.
+3. Still open: `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs; attribute
+   packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) accepted and ignored; four NIDs remain
+   unresolved and none has been shown to matter (`cellAudioSetPortLevel` `0x56DFE179`,
+   `cellAdecQueryAttr` `0x7E4A4A49`, cellL10n `0xFDBF6AC5`, cellSysutil `0x1DFCCE99`).

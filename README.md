@@ -102,13 +102,14 @@ EDAT/PSAR handling, exactly as it does on hardware.
 
 ## 🎯 Status
 
-**It boots, the GPU is up, and all five SPUs are running.** The recompiled PS1
-emulator runs its own startup, negotiates video and audio, loads the PS1 BIOS, brings
-RSX up through the kernel, drains its own command FIFO into the live NV4097 → D3D12
-engine, starts its five raw SPUs (four GPU cores — the banner says `-sgpu-sli4` — plus
-the second module), and completes its whole subsystem bring-up: fonts, audio mixing
-thread, pad, memory card, CD-ROM thread, NP, ATRAC. It idles there at 60 fps without
-loading the disc.
+**It boots, the GPU is up, all five SPUs run, and it has found the game.** The
+recompiled PS1 emulator runs its own startup, negotiates video and audio, loads the PS1
+BIOS, brings RSX up through the kernel, drains its own command FIFO into the live
+NV4097 → D3D12 engine, starts its five raw SPUs (four GPU cores — the banner says
+`-sgpu-sli4` — plus the second module), completes its whole subsystem bring-up, and —
+once given the nine command-line arguments the VSH passes a PSOne Classic — reads the
+package: title, region, disc target, and the 30-page manual out of `DOCUMENT.DAT`. It
+stops one step short of loading the disc itself.
 
 ```
 PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
@@ -128,6 +129,11 @@ InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
 [spu-raw] W spu0 +0x4400C = 0x40600000 <- and the PPU's first command to it
 App:Fonts Initialize Lv1 pass!
 [cellAudio] PortOpen(nChannel=2, nBlock=8) / Mixing thread started
+g_strTitle NPUI94304
+[sys_fs] open OK: .../dev_hdd0/game/NPUI94304/USRDIR/CONTENT/DOCUMENT.DAT
+TITLE ID : SCUS94304   /   InitMenuManual OK!! PageNum = 30
+target: /dev_hdd0/game/NPUI94304<0>
+REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 [fps] 60.0
 ```
 
@@ -150,8 +156,112 @@ App:Fonts Initialize Lv1 pass!
 | `GPUCoreInit()` / `InitMenu` | ✅ Done |
 | Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ✅ Done — all 5 SPUs load, run and handshake |
 | Emulator subsystems (font/audio/pad/VMC/CD-ROM/NP) | ✅ Done — all initialise |
-| Input (the pad read) | ✅ Done — unnamed `sys_io` NID served from `cellPadGetData` |
-| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — never attempted; see below |
+| Input (the pad read) | ✅ Done — confirmed against RPCS3's `sys_io_3733EA3C` |
+| Launch arguments (the nine the VSH passes) | ✅ Done — title, region, disc target, manual all read |
+| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — `_xcdrom_thread` waits on a semaphore that was never created |
+| Twisted Metal renders | ⬜ |
+
+### The blocker
+
+It has the game and never opens `EBOOT.PBP`. `groups[seen=0 exec=0]` — no geometry has
+reached the renderer, so the window is still the clear colour.
+
+The emulator is not stuck: its main loop is the *game-is-running* loop
+(`cellSysutilCheckCallback` + `sys_timer_usleep(16666)`, exited only when
+`R3000Exit(): PS1_EXIT_STOP` fires). It believes it is emulating. The thread that would
+actually read the disc, `_xcdrom_thread`, starts and immediately spins **158,738 times**
+on `sys_semaphore_wait` with **id 0** — a handle nothing ever filled in:
+
+```
+[sc] 90(0x76A760, 0xD0022CB0, 0, 1) -> 0            sys_semaphore_create
+[sc] 92(0x4, 0x30D40, ...)          -> 0            wait(id 4, 200 ms)  -- fine
+[sc] 92(0x0, 0x0, ...)              -> 0x80010005   ESRCH  x158,738
+```
+
+The ids live at `+0x70B8`/`+0x70BC` of its object; the code that creates such a pair
+(`0x10FFC8`/`0x10FFF4`) runs twice, for two *other* instances, and never for this one — so
+a construction step upstream was skipped. Ruled out: a missing file (the only failing opens
+in a whole run are four `.ccd` font probes that all fall back to `.TTF`), the argv (all nine
+arrive and visibly change behaviour), and `ps1_newemu` vs `ps1_netemu` (newemu's imports are
+a strict subset — same codebase). Detail and the next measurement in
+[`docs/boot-argv.md`](docs/boot-argv.md).
+
+Also open: `sys_interrupt_thread_establish` (84) and `eoi` (88) are still stubs (the PPU
+polls, so nothing has needed them), and the `0x300`/`0x301`/`0x302` attribute packets
+(tiles, Z-cull) are accepted but ignored, which will matter once geometry is drawn.
+
+## 🛠️ Pipeline
+
+```
+  dev_flash ─► ps1_netemu.self ─► .elf ─► ppu_lifter ─► C++ ─┐
+              (firmware SELF)   (decrypt)  (3,512 fns)       ├─► link ps3recomp ─► tmpsn.exe
+                                2 SPU ELFs ─► spu_lifter ─►──┘        (harness + HLE)
+                                                                              │
+  PSN PKG ─► EBOOT.PBP + ISO.BIN.EDAT ─────────────────────────────► game data (fed, not lifted)
+```
+
+The PS1 disc is **never** decrypted by us: the recompiled emulator does its own
+EDAT/PSAR handling, exactly as it does on hardware.
+
+## 🎯 Status
+
+**It boots, the GPU is up, all five SPUs run, and it has found the game.** The
+recompiled PS1 emulator runs its own startup, negotiates video and audio, loads the PS1
+BIOS, brings RSX up through the kernel, drains its own command FIFO into the live
+NV4097 → D3D12 engine, starts its five raw SPUs (four GPU cores — the banner says
+`-sgpu-sli4` — plus the second module), completes its whole subsystem bring-up, and —
+once given the nine command-line arguments the VSH passes a PSOne Classic — reads the
+package: title, region, disc target, and the 30-page manual out of `DOCUMENT.DAT`. It
+stops one step short of loading the disc itself.
+
+```
+PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
+user_memory_size= 201326592/268435456 <67108864>
+[cellVideoOut] GetResolution(id=2) -> 1280x720
+[sys_fs] open OK: .../dev_flash/ps1emu/ps1_rom.bin
+REGION NUM = 0x00000081 code=A
+[sys_rsx] memory_allocate(size=0xF900000) -> local=0xC0000000
+[sys_rsx] context_allocate -> dma_control=0x20001FC0 (ctrl=0x20002000)
+[sys_rsx] iomap io=0x00000000 <- ea=0x40100000 size=0x400000
+[cellGcmSys] SetDisplayBuffer(id=0, offset=0x310000, pitch=5120, 1280x720)
+[live-draw] display buffer 0 = loc0:0x00310000 pitch=5120 1280x720
+InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
+[spu-raw] image_load spu0: 3 segments, 84992 bytes into LS, NPC=0x00100
+[spu-raw] spu0 START pc=0x00100 ls=guest:0xE0000000 nonzero lines=1324/4096
+[spu-raw] spu0 out mbox = 0x00015010   <- the SPU's ready handshake
+[spu-raw] W spu0 +0x4400C = 0x40600000 <- and the PPU's first command to it
+App:Fonts Initialize Lv1 pass!
+[cellAudio] PortOpen(nChannel=2, nBlock=8) / Mixing thread started
+g_strTitle NPUI94304
+[sys_fs] open OK: .../dev_hdd0/game/NPUI94304/USRDIR/CONTENT/DOCUMENT.DAT
+TITLE ID : SCUS94304   /   InitMenuManual OK!! PageNum = 30
+target: /dev_hdd0/game/NPUI94304<0>
+REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
+[fps] 60.0
+```
+
+| Milestone | Status |
+|---|---|
+| Extract the PSN PKG | ✅ Done — needed new mixed-key support, see below |
+| Identify the real recomp target | ✅ Done — `ps1_netemu.self`, not a game EBOOT |
+| Decrypt the firmware SELF → ELF | ✅ Done — `rpcs3 --decrypt`, key rev `0x1C` |
+| Function discovery | ✅ Done — 3,512 |
+| NID / import resolution | ✅ Done — 103 imports, 12 libs, 83% named |
+| Extract the SPU modules | ✅ Done — 2 embedded ELFs, statically |
+| PPU lift → C++ | ✅ Done — 3,530 functions, 23 MB, **0 unhandled instructions** |
+| SPU lift → C | ✅ Done — 1,429 + 637 functions, both clean |
+| Build on the shared ps3recomp harness | ✅ Done — `tmpsn.exe`, 10.2 MB, first try |
+| First boot (recompiled CRT runs) | ✅ Done — the emulator's own banner prints |
+| Video/audio out negotiated | ✅ Done — 1280x720 @ 59.94 |
+| BIOS (`ps1_rom.bin`) loads | ✅ Done |
+| Live NV4097 → D3D12 engine comes up | ✅ Done — 60 fps, presenting |
+| `sys_rsx_*` syscalls | ✅ Done — `cellGcmInit` succeeds, FIFO drains, buffers registered |
+| `GPUCoreInit()` / `InitMenu` | ✅ Done |
+| Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ✅ Done — all 5 SPUs load, run and handshake |
+| Emulator subsystems (font/audio/pad/VMC/CD-ROM/NP) | ✅ Done — all initialise |
+| Input (the pad read) | ✅ Done — confirmed against RPCS3's `sys_io_3733EA3C` |
+| Launch arguments (the nine the VSH passes) | ✅ Done — title, region, disc target, manual all read |
+| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — `_xcdrom_thread` waits on a semaphore that was never created |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker: it thinks it is already running
@@ -218,6 +328,18 @@ See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 - **`runtime/ppu/ppu_loader.cpp` — `PS3_SCTRACE` now covers the stub path**, which it
   had skipped: it traced everything *except* the unimplemented syscalls, i.e. exactly
   the ones a trace is wanted for. Finding the RSX call contract needed this.
+- **`runtime/ppu/ppu_loader.cpp` — `PS3_ARGV`, multiple guest arguments.** It wrote
+  exactly one, which is all a disc title needs and nowhere near enough for a firmware
+  module launched by the VSH. Layout matches lv2 (64-bit BE pointer slots, NULL-terminated,
+  NULL envp, strings 16-byte aligned), verified against RPCS3's `ppu_load_exe`, and is
+  byte-identical to the old output for a single argument.
+  See [`docs/boot-argv.md`](docs/boot-argv.md).
+- **`sysPrxForUser` — `_sys_malloc` / `_sys_free` / `_sys_memalign` / `_sys_realloc`.**
+  Missing entirely, so callers got the unresolved-NID stub: `CELL_OK` with a garbage
+  pointer in `r3` that they then wrote through. `cellUsbdInit` failed on it.
+- **`PS3_SCTRACE` printed the return value in the first argument's column** for every
+  implemented syscall (it passed `ctx->gpr[3]` after dispatch had overwritten it). The
+  first argument is the object id across most of lv2 — the whole reason to read the trace.
 - **`runtime/spu/spu_raw.c` — new, raw SPUs.** The `0xE0000000` MMIO window plus
   `sys_raw_spu_*`, and `sys_raw_spu_image_load` — which is not a syscall, so its stub NID
   left local store full of zeros and the SPU "ran" straight into them. `spu_context.ls`
