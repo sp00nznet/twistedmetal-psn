@@ -162,7 +162,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Disc image opened (`ISO.BIN.EDAT`) | ✅ Done |
 | Disc **decrypted** (NPDRM / EDAT) | ✅ Done — `PSISOIMG0000`, serial `_SCUS_94304` |
 | Disc header read, streamed and hashed | ✅ Done — guest SHA-1 matches Python byte for byte |
-| Disc body opens (`EBOOT.PBP`) | ⬜ **blocker** — header ECDSA signature does not verify |
+| Disc body opens (`EBOOT.PBP`) | ⬜ **blocker** — lifted ECDSA rejects a valid signature |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
@@ -214,14 +214,21 @@ Ruled out: it is not a stubbed dependency (the verify calls only real code in th
 import trampolines), not the hash input, and not our carry arithmetic on review (`adde`,
 `subfe`, `addc`, `subfc`, `addze` all lift correctly).
 
-**Which `ISO.BIN.EDAT` to use — and the likely cause.** The retail file is license type 2:
-`NP_PSX_KEY` verifies against its `dev_hash`, but the *data* is under the RIF key from a
-per-console RAP, so every block hash fails. The archive's second package carries the same
-file as license type 3, where the klicensee is the file key — that one decrypts, and it is
-what `vfs/` currently holds. But an EDAT is only a container: re-wrapping authentic plaintext
-would leave the signature intact, while any edit to the header itself would not. So the
-likeliest read is that the type-3 header is not the one Sony signed, and the legitimate route
-is the **retail** EDAT decrypted with the owner's own RAP/RIF for `NPUI94304`.
+**The signature is valid — so the bug is ours.** The curve is built at runtime, not stored in
+the ELF, so it was read out of the guest's own memory (`func_000109C4` copies six 20-byte
+fields into a 144-byte context; replaying those writes in order, before the struct is reused
+as scratch, gives them exactly). It is a 160-bit curve with `a = p-3`, the table in the
+classic `p, a, b, N, Gx, Gy` order; both the generator and the public key lie on it and
+`n*G` is the point at infinity. Verified offline against that curve, the header's signature
+**passes** — `X.x mod n == r` exactly. So `ISO.BIN.EDAT` is authentic and Sony-signed, and
+`func_00010D24` returns the wrong answer on correct data. That is a ps3recomp lifter bug, and
+it is worth fixing properly: any title that checks a signature will hit it.
+
+That also settles what the crack does, and it is the ordinary thing. An EDAT is only a
+container, so re-wrapping the same plaintext under a free klicensee (license type 3 instead of
+the retail type 2, which is bound to a per-console RAP) leaves Sony's signature intact. It has
+to — cracked PSOne Classics ran on real consoles, and `ps1_netemu` runs this check
+unconditionally.
 
 Checked against a second title: `2Xtreme [NPUI-94508]` has the identical package layout,
 with an `ISO.BIN.EDAT` of **exactly** the same 1,049,920 bytes — that size is what this form

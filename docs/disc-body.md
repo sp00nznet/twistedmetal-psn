@@ -136,34 +136,86 @@ because the header signature does not verify.**
 - **Not `ps1_newemu` vs `ps1_netemu`**, the argv, the allocator, or the semaphore spin, all
   of which were ruled out earlier and have not come back.
 
-## The open question
+## The signature is valid — the bug is ours
 
-Either our lifted bignum code is wrong in a way SHA-1 does not exercise, or the header we are
-feeding it is not the one Sony signed.
+The curve is not in the ELF. `*(TOC-0x6B0C)` points at `0x15F7F0`, but the constants there
+do not parse as a curve under any field assignment, because the table is **built at runtime**.
+So it was read out of the guest's own memory instead: `func_000109C4` copies six 20-byte
+fields into a 144-byte context (each 4-zero-padded to 24 bytes by `func_000108F0`), and
+watching that context on the stack — replaying the writes in order, before the struct is
+reused as scratch — gives them directly.
 
-The second is the more likely, and for a concrete reason: the `ISO.BIN.EDAT` in `vfs/` comes
-from the archive's **`_Crack.pkg`** (license type 3), not the retail package (license type 2,
-whose data is under a RIF key from a per-console RAP we do not have). An EDAT is only a
-container, so re-wrapping authentic plaintext under a free klicensee would leave the signature
-intact — but any edit to the header itself would not. The size field at `0x0C` being zero
-where the PSAR carries `0x0416F340` is the kind of difference that would do it, though it may
-equally be by design.
+```
+p  = ffffffffffffffff00000001ffffffffffffffff
+a  = ffffffffffffffff00000001fffffffffffffffc     (a = p-3)
+b  = a68bedc33418029c1d3ce33b9a321fccbb9e0f0b
+Gx = 128ec4256487fd8fdf64e2437bc0a1f6d5afde2c
+Gy = 5958557eb1db001260425524dbc379d5ac5f4adf
+n  = fffffffffffffffeffffb5ae3c523e63944f2127
+```
 
-Attempting to confirm this by parsing the curve out of the table did not work: no assignment
-of the six 20-byte fields — over a wide range of base offsets, both endiannesses, all
-permutations — puts both the generator and the public key on the same curve. So the table
-encoding is still unread, and the signature has not been checked independently.
+The table order is `p, a, b, N, Gx, Gy` — the classic `curve_t` layout PS3 tooling uses. Both
+the generator and the public key at `0x175510` lie on it, and `n*G` is the point at infinity,
+so the curve is genuine and completely determined.
+
+With it, the signature verifies:
+
+```
+n*G == infinity : True
+SIGNATURE VALID : True
+  X.x mod n = 0x3df7e732dfd6834e25ac8284c5bce7b8451078d4
+  r         = 0x3df7e732dfd6834e25ac8284c5bce7b8451078d4
+```
+
+**So the header is authentic and Sony-signed, and `func_00010D24` returns the wrong answer on
+correct data.** This is a ps3recomp lifter bug, not a content problem.
+
+That also settles what the crack does, and it is the ordinary thing: an EDAT is only a
+container, so re-wrapping the same plaintext under a free klicensee leaves Sony's signature
+intact. It has to — cracked PSOne Classics ran on real consoles, and `ps1_netemu` performs
+this check unconditionally. The earlier speculation that the header had been edited was wrong.
+
+## What the bug is not
+
+`func_00010D24` is a thin wrapper: it unpacks `r`, `s`, `Qx`, `Qy`, the hash and the curve
+context and tail-calls `func_001584A0`, returning its result unchanged. There is no early
+range check to fail, so the fault is inside that subtree — 29 functions, reachable by direct
+call from `0x1584A0`.
+
+Ruled out so far:
+
+- **Not an unlifted instruction.** All 29 functions lift with zero `TODO: .word` slots. (56
+  functions elsewhere in the image do have them; none are in this subtree.)
+- **Not a stubbed import.** The subtree calls only image-internal code.
+- **Not the obvious instruction rules.** The subtree's rare instructions were each checked
+  against PowerISA: `addic` (used twice in the whole image, once here), `sld`/`sld.`, `srd`,
+  `cmpld` (50 uses), `divdu`, `mulld`, `mfcr` (38 uses), `mtcrf`, `subfic`, `sradi`, `neg`,
+  `addze`, `subfe`, `subfc`, `stdx` (the image's only one), `ldx`. All correct, including the
+  64-bit widths and the `XER[CA]` carry-outs.
+- **Not record-form CR0.** Dot-forms get their CR0 update from a generic wrapper in
+  `_translate`, so `addic.` and `sld.` are covered even though their own rules do not emit it.
+- **Not the CR bit order.** `cr0` sits in the top nibble and `cr7` in the bottom, consistent
+  between the compare handlers, the record-form wrapper and `mfcr`.
 
 ## Next
 
-The legitimate route is the retail `ISO.BIN.EDAT`, which is the file Sony actually signed:
-recover the RAP or RIF for `NPUI94304` from the owner's own PSN activation, decrypt the
-type-2 EDAT with it, and this check should pass on authentic data.
+A differential test is the way in, not more reading. The computation is pure and its inputs
+and expected intermediates are all known:
 
-Failing that, read the curve table properly — most usefully by dumping the ECDSA context the
-guest builds rather than guessing at the layout — and verify the signature offline. That
-distinguishes a lifter bug from a data problem, and it is the one question worth answering
-before anything else here.
+```
+w     = 4dc0b56c40d9a33a5b451b9d9dfd920aa233c6f5     (s^-1 mod n)
+u1    = a53abb93bb101112885815809da262a456a2609b     (e*w mod n)
+u2    = 8c0800d362533422eb2e4ffd349195bb1b6376c2     (r*w mod n)
+u1G.x = 96d915a04469a0b2b7695017d2a448b3e406dc58
+u2Q.x = 346c05b692c309f269f5ae6e1b09f36fe6d77933
+X.x   = 3df7e732dfd6834e25ac8284c5bce7b8451078d4     (== r, so valid)
+```
 
-Deliberately not done: patching out the check. It is an integrity check on content we did not
-author, and disabling it would prove nothing about whether the recompilation is correct.
+Calling the lifted `func_001584A0` from a small harness with these inputs, then bisecting down
+the 29-function tree against the same values computed in Python, localises the fault to one
+routine and then to one instruction. Watching guest memory did not find these intermediates —
+the bignum scratch is neither in the reader's stack frame nor the window below it, so the
+harness is the cheaper route than hunting for the working buffers.
+
+Worth fixing properly rather than working around: any title that checks a signature — and
+plenty do — will hit the same bug.

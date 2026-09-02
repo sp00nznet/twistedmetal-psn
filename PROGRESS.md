@@ -21,7 +21,7 @@
 | 12. Disc | image opened (`ISO.BIN.EDAT`) | ✅ — unblocked by the `cellAdecOpen` ABI fix |
 | 12b. NPDRM | EDAT decryption | ✅ — `PSISOIMG0000`, serial `_SCUS_94304` |
 | 12c. Header | read, streamed and hashed | ✅ — guest SHA-1 matches Python byte for byte |
-| 12d. Body | disc body opens (`EBOOT.PBP`) | ⬜ — blocked: header ECDSA signature does not verify |
+| 12d. Body | disc body opens (`EBOOT.PBP`) | ⬜ — blocked: lifted ECDSA rejects a valid signature |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -808,6 +808,50 @@ Tooling: added `LBP_WW_MAX` (raise the 64-hit cap) and `LBP_WW_CHAIN` (dump the 
 chain on every hit, not just the first) to the store watchpoint -- which is how the teardown's
 nine call sites were narrowed to the one at `0xF0930`. Also repaired a stray NUL byte that an
 earlier scripted edit had left in `README.md`.
+
+Detail: [`docs/disc-body.md`](docs/disc-body.md).
+
+## 2026-09-02 (later) -- the signature is valid; the bug is ours
+
+Recovered the ECDSA curve and verified the disc header's signature offline. **It passes.**
+
+The curve is not in the ELF -- `*(TOC-0x6B0C)` points at `0x15F7F0` but nothing there parses
+as a curve, because the table is built at runtime. So it came out of the guest's own memory:
+`func_000109C4` copies six 20-byte fields into a 144-byte context (4-zero-padded to 24 bytes
+each by `func_000108F0`), and replaying those stack writes in order -- before the struct is
+reused as scratch -- gives them directly:
+
+    p  = ffffffffffffffff00000001ffffffffffffffff
+    a  = ffffffffffffffff00000001fffffffffffffffc   (a = p-3)
+    b  = a68bedc33418029c1d3ce33b9a321fccbb9e0f0b
+    Gx = 128ec4256487fd8fdf64e2437bc0a1f6d5afde2c
+    Gy = 5958557eb1db001260425524dbc379d5ac5f4adf
+    n  = fffffffffffffffeffffb5ae3c523e63944f2127
+
+Table order is `p, a, b, N, Gx, Gy` -- the classic PS3 `curve_t`. Both the generator and the
+public key at `0x175510` lie on the curve and `n*G` is the point at infinity, so it is fully
+determined. Against it, `X.x mod n == r` exactly: the header is authentic and Sony-signed.
+
+**So `func_00010D24` returns the wrong answer on correct data -- a ps3recomp lifter bug.**
+That inverts yesterday's guess, and it also explains the crack correctly: an EDAT is only a
+container, so re-wrapping the same plaintext under a free klicensee leaves the signature
+intact. It has to, since cracked PSOne Classics ran on real consoles and this check is
+unconditional.
+
+Narrowed but not yet found. The fault is inside `func_001584A0`'s subtree (29 functions,
+reached by direct call). Ruled out: no unlifted instructions anywhere in those 29 (56 other
+functions in the image do have `TODO: .word` slots; none here); no stubbed imports, the
+subtree is entirely image-internal; and every rare instruction in it checked correct against
+PowerISA -- `addic` (twice in the whole image, once here), `sld`/`sld.`, `srd`, `cmpld` (50
+uses), `divdu`, `mulld`, `mfcr` (38 uses), `mtcrf`, `subfic`, `sradi`, `neg`, `addze`,
+`subfe`, `subfc`, `stdx` (the image's only one), `ldx`, including 64-bit widths and XER[CA]
+carry-outs. Record-form CR0 comes from a generic wrapper, so `addic.`/`sld.` are covered, and
+the CR nibble order is consistent across compares, that wrapper and `mfcr`.
+
+Next is a differential harness rather than more reading: call the lifted `func_001584A0` with
+the known inputs and bisect the 29-function tree against the intermediates computed in Python
+(`w`, `u1`, `u2`, `u1*G`, `u2*Q`, `X`). Watching guest memory did not locate those values --
+the bignum scratch is not in the reader's frame nor the window below it.
 
 Detail: [`docs/disc-body.md`](docs/disc-body.md).
 
