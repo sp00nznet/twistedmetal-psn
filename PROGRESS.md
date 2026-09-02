@@ -21,7 +21,9 @@
 | 12. Disc | image opened (`ISO.BIN.EDAT`) | ✅ — unblocked by the `cellAdecOpen` ABI fix |
 | 12b. NPDRM | EDAT decryption | ✅ — `PSISOIMG0000`, serial `_SCUS_94304` |
 | 12c. Header | read, streamed and hashed | ✅ — guest SHA-1 matches Python byte for byte |
-| 12d. Body | disc body opens (`EBOOT.PBP`) | ⬜ — blocked: lifted ECDSA rejects a valid signature |
+| 12d. Body | disc body opens (`EBOOT.PBP`) | ✅ — header signature verifies |
+| 12e. Boot | firmware boots the PS1 title | ✅ — `North American Title detected!` |
+| 12f. Core | R3000/GTE core runs | ⬜ — blocked: SPU 4 parks on a channel read |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -883,6 +885,36 @@ the function makes no calls.
 only 8/16/32-bit stores were. Every bignum limb and 64-bit struct field is written with `std`,
 so a watch on one reported nothing and read as "nobody writes this", which is why several
 earlier hunts for these values came up empty.
+
+Detail: [`docs/disc-body.md`](docs/disc-body.md).
+
+## 2026-09-02 (evening) -- THE DISC MOUNTS
+
+The ECDSA bug is a **lifter bug**, found and fixed. `func_0015ABEC` is a Montgomery multiply
+(its third argument is `2^384 mod p` = R-squared for R = 2^192, and `n' = 1` is correct since
+`p` is congruent to -1 mod 2^64). At `0x15AED4` the guest does `ld r25, -0x78(r1)` -- a real
+load of the high word of a two-word product temp -- and the lifter rewrote it to the cached
+value of r25 at function entry, i.e. the CALLER's r25, a pointer. That went straight into the
+carry chain.
+
+Three conditions let the callee-save rewrite misfire, each individually reasonable: no `stdu`
+(it is a PPC64 leaf keeping locals in the protected zone below r1); `_write_counts` saw no
+write to -0x78 because the body writes it THROUGH a pointer (`addi r5,r1,-128` then
+`std r9,0x8(r30)`); and `_off_escapes` matched only the exact taken offset -0x80. The prologue
+saves r25 at -0x38, so the offsets never matched -- the register did.
+
+Fix in `ppu_lifter.py`: attribute stores made through a frame pointer to the slot they land
+on, by tracking registers holding `r1+off` across the zero-extend and register-move idioms.
+Two broader fixes were tried first and both regressed `GPUCoreInit`, so the fix had to be
+exact -- the heuristic is load-bearing elsewhere.
+
+Result: the probe returns 0 (VALID), and the boot runs past every wall it has ever hit --
+`title: 0xc0546d88U, "SCUS_943.04"`, `North American Title detected!`,
+`boot from /dev_hdd0/game/NPUI94304`. `ExitPS1(): code=3` and `CoreBoot() failed` are gone,
+`EBOOT.PBP` is opened for the first time, and every earlier milestone still passes.
+
+Next: the PS1 core start-up. SPU 4 parks on a channel read at `pc=0x0A5E8` and the PPU spins
+on `0xD0009F90` -- the R3000/GTE core waiting for work.
 
 Detail: [`docs/disc-body.md`](docs/disc-body.md).
 

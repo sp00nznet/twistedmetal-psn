@@ -162,7 +162,9 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Disc image opened (`ISO.BIN.EDAT`) | ✅ Done |
 | Disc **decrypted** (NPDRM / EDAT) | ✅ Done — `PSISOIMG0000`, serial `_SCUS_94304` |
 | Disc header read, streamed and hashed | ✅ Done — guest SHA-1 matches Python byte for byte |
-| Disc body opens (`EBOOT.PBP`) | ⬜ **blocker** — lifted ECDSA: stale limb in `func_0015ABEC` |
+| Disc body opens (`EBOOT.PBP`) | ✅ Done — header signature verifies, `EBOOT.PBP` opened |
+| PS1 title boots | ✅ Done — `North American Title detected!`, `boot from /dev_hdd0/game/NPUI94304` |
+| PS1 core runs (R3000 on SPU) | ⬜ **blocker** — SPU 4 parks on a channel read |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

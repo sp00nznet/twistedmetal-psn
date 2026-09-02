@@ -1,7 +1,8 @@
 # The disc body: two files, one signature
 
-**The disc path works.** Decryption, streaming and hashing are correct end to end — proven,
-not assumed. What stops the boot is a single ECDSA signature check on the disc header.
+**The disc mounts and the PS1 title boots.** Decryption, streaming, hashing and the header
+signature check all pass. The last wall was a lifter bug in one Montgomery multiply, found
+by bisection and fixed in `ppu_lifter.py`; the story below is how.
 
 ## Correcting the previous note
 
@@ -264,9 +265,85 @@ reported nothing and read as *"nobody writes this"*. That is why several earlier
 these values in guest memory came up empty. `runtime/ppu/ppu_loader.cpp` now reports the
 64-bit store as two halves, so a watch still fires when only one word of it is covered.
 
+## Found: a callee-save heuristic that ate a real load
+
+`func_0015ABEC` is a **Montgomery multiply** — `func_0015ABEC(out, a, b, curve, n')`,
+confirmed by its third argument being `2^384 mod p`, which is `R²` for `R = 2^192`, and by
+`n' = 1`, which is correct here because `p ≡ -1 (mod 2^64)`.
+
+Its accumulator starts correctly zeroed, and `1 × R²` produces exactly `R²` in the first
+stage. The pointer appears in the **reduction** step, and one line explains it:
+
+```c
+ctx->gpr[25] = _cs_25;        // what the lifter emitted, mid-loop
+ctx->gpr[3]  = ctx->gpr[6] + ctx->gpr[25];   // then used as the carry
+```
+
+The guest instruction there is `ld r25, -0x78(r1)` at `0x15AED4` — a genuine load of the
+high word of a two-word product temp. But `_cs_25` is the lifter's cached copy of r25 **at
+function entry**, i.e. the caller's r25, which held a pointer. That pointer went straight into
+the carry chain.
+
+### Why the heuristic misfired
+
+The lifter rewrites `ld rN, off(r1)` into a cached entry value when it believes the load is a
+callee-save restore. Three conditions let it fire here, and each was individually reasonable:
+
+- **`not _has_stdu`** — true, because `func_0015ABEC` is a PPC64 **leaf** that keeps its
+  locals in the 288-byte protected zone below `r1` (`addi r22, r1, -224`) and never adjusts
+  the stack pointer. The heuristic read "no frame" as "must be a tail-entry stub".
+- **`_write_counts['-0x78'] == 0`** — true, because the body writes that slot *through a
+  pointer*: `addi r5, r1, -128` then `std r9, 0x8(r30)`. Only literal `r1 + off` stores were
+  counted, so the write was invisible.
+- **`_off_escapes('-0x78')`** — false, because the address taken was `-0x80`, and the check
+  matched the exact offset rather than the slot the store actually lands on.
+
+The prologue saves r25 at `-0x38(r1)`, so the offsets never matched — the register did.
+
+### The fix
+
+`tools/ppu_lifter.py` now attributes stores made **through** a frame pointer to the slot they
+land on. A small forward pass tracks registers holding `r1 + off` (following the zero-extend
+and register-move idioms the compiler emits — `ppc_rldicl(x, 0, 32)` and `or rD, rS, rS`) and
+charges `std rX, disp(rN)` to `off + disp`. `-0x78` is then correctly seen as written, the
+rewrite does not fire, and the load lifts as `vm_read64(ctx->gpr[1] + -0x78)`.
+
+Two broader fixes were tried first and both regressed the boot, which is worth recording:
+
+- Disabling the rewrite for any function that saves to its own frame broke `GPUCoreInit`.
+- Poisoning a 0x100-byte window above every taken address broke it the same way.
+
+The heuristic is load-bearing elsewhere, so the fix had to be exact: only slots that are
+*genuinely* written may be excluded. It already carried scars from this same class of bug —
+the comments cite newlib's `dtoa` and gcm/cube's vertex pointers.
+
+## Result
+
+```
+[ecdsa] returned 0 (0x00000000) -- expected 0 (VALID)
+```
+
+and the boot runs past every wall it has ever hit:
+
+```
+title: 0xc0546d88U, "SCUS_943.04" P
+North American Title detected!
+ad hoc param: 0 <11624>
+boot from /dev_hdd0/game/NPUI94304[1] 0
+```
+
+`ExitPS1(): code=3` and `CoreBoot() failed` are **gone**, `EBOOT.PBP` is opened for the first
+time, and the firmware recognises the disc from its own title database. Every earlier
+milestone — fonts, menu, `TITLE ID : SCUS94304`, the 30-page manual — still passes, and
+`GPUCoreInit` is clean, so nothing regressed.
+
 ## Next
 
-Find where `func_0015ABEC`'s working buffer should get its high limb and does not. The shift
-loop at `loc_0015AF68` and the copy at `0x15B0AC` are both faithful to the original; the
-missing write is upstream of them, in the ~200 instructions that compute the reduction. The
-probe makes each hypothesis a sub-second test.
+The PS1 core start-up. It now stalls with SPU 4 parked on a channel read at `pc=0x0A5E8` and
+the PPU spinning on `0xD0009F90` — the R3000/GTE core waiting for work that never arrives.
+That is the next thing to trace, and it is a much later failure than anything before it.
+
+Worth doing early: this was a lifter bug, not a title bug, so it affects every port. The other
+PSOne Classics in the archive are the natural regression suite — each ships a different
+`ISO.BIN.EDAT` with its own valid signature, so pointing the probe at two or three of them
+tests the fix against independent data rather than the single case it was found on.
