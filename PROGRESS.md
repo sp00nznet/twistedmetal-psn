@@ -19,7 +19,7 @@
 | 11. BIOS | `ps1_rom.bin` loads | ✅ |
 | 12. Disc | `EBOOT.PBP` mounts, PS1 executable loads | ⬜ |
 | 13. Render | Twisted Metal on screen | ⬜ |
-| 14. Input / audio / VMC | | ⬜ |
+| 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
 ## Detailed log
 
@@ -405,16 +405,92 @@ App:Fonts Initialize Lv1 pass!
 The screen is still black, and `groups[seen=0 exec=0]` says why: no geometry has reached
 the renderer. The emulator has not loaded the disc.
 
+
+### 2026-09-01 (late) — Input served; the real blocker located
+
+Two fixes, and a diagnosis that changes what "stuck" means here.
+
+**The unnamed pad read, served without knowing its name.** `sys_io` imports six
+functions; five compute cleanly from their names, and the sixth — `0x3733EA3C` — matched
+none of ~120 candidate libpad/libkb/libmouse spellings against the (verified) NID
+algorithm. It is *not* `cellPadGetData`, which is `0x8B72CDA1` and is not imported at all.
+
+The name was not needed; the call site gives the contract. `ps1_netemu`'s pad poll
+(`func_000EB784`) is
+
+```
+cellPadGetInfo2(&info2);                       // 0x15E8AC, named
+for (port = 0; port <= 6; port++)
+    if (info2.port_status[port] & 1)
+        UNNAMED(port, &slot[port].extra, &slot[port].data);
+if (slot[port].data.len) { ...consume... }
+```
+
+and the prologue pins the layout: `addi r27,r1,276` … stride 136, with each call passing
+`r4 = r5 + 132`. A 136-byte per-port slot of `{ CellPadData data; u32 extra; }`. That the
+132-byte half really is a `CellPadData` is not a guess — `sizeof(CellPadData)` is
+`4 + 2*CELL_PAD_MAX_CODES` = 132 exactly, the guest `memcpy`s 132 bytes out of it, and it
+gates on the first word, which is `.len`. Confirmed at runtime: the two pointers came in
+0x84 = 132 apart.
+
+Served from the runtime's own `cellPadGetData` in `src/hle_overrides.c` — kept in the port
+rather than `libs/input/cellPad.c`, because the mapping rests on one firmware module's
+call site rather than a known libpad export.
+
+**`cellGame` was reporting a placeholder title id.** The harness reads it from
+`<vfs>/PS3_GAME/PARAM.SFO`; our layout only had the package's SFO under
+`dev_hdd0/game/NPUI94304/`, so it kept `BLES00000` and every `/dev_hdd0/game/<id>` path it
+built pointed at a title that does not exist. `tools/run.sh` stages the file now.
+
+Worth recording, because it breaks an assumption the harness makes: for a **PSOne Classic**
+the SFO's `TITLE_ID` is the **PS1 serial** (`SCUS94304`), while the content directory is
+named from the *content id* (`NPUI94304`). "Title id == directory name" holds for ordinary
+PS3 titles and not for this category.
+
+**The diagnosis: it is not stuck — it thinks it is already running.** Reading the main
+thread's loop (it sits at `lr=0x000B1434` forever):
+
+```
+func_000B13F8:  func_00105D74()                 ; exit_flag = 0
+  loop:         cellSysutilCheckCallback()
+                if (func_00105D84() != 0)       ; exit_flag still 0
+                    { sys_timer_usleep(16666); goto loop; }
+                ...shutdown path...
+```
+
+`func_00105D84` reads one word and reports "still zero"; the only writer that sets it is
+`func_00105E18`, which prints `R3000Exit(): PS1_EXIT_STOP` first. So this is the
+*game-is-running* loop, and the emulator will sit in it until the PS1 CPU halts. It
+believes it has a disc and is emulating one.
+
+It has just never been told which. **Nothing in the whole run ever opens `EBOOT.PBP`.**
+
+The lead is `argv`. The emulator imports **no `cellGame` at all** — twelve libraries, none
+of them `cellGame` — so its content path cannot come from `cellGameContentPermit`. On
+hardware the VSH launches `ps1_netemu` with the path on the command line, and the emulator
+does echo what it receives (`argc=%d` and `argv[%d]=%s` at `0x170F48`/`0x170F58`, printed
+during boot). The harness hardcodes one argument,
+`argv[0] = /dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN` (`YDKJ_BOOTPATH` overrides it) — correct
+for a disc title, meaningless to this one.
+
+Two details to settle before guessing at contents: the emulator's argv walker reads
+**32-bit** pointers (`lwz r5,0(r9)` / `addi r9,r9,4`) where the harness writes 64-bit
+slots, and nobody has established what the VSH actually passes for a PSOne Classic.
+
+**State after this round:** 5 raw SPUs running, graphics stack up, pad served, all
+subsystems initialised, ~32 fps (down from 60 — the five SPU host threads now cost real
+CPU). Six NIDs remain unresolved and none has yet been shown to matter: `0x1DFCCE99`
+(cellSysutil, called once with r3=2 just before the main loop), `0x26090058`
+(`sys_prx_load_module`, soft-fails harmlessly), `0x56DFE179`, `0x7E4A4A49`, `0xBDB18F83`,
+`0xFDBF6AC5`.
+
 ## Next steps
 
-1. **Find what drives the menu.** The strongest candidate is input: `sys_io` imports six
-   functions and the sixth, `0x3733EA3C`, is unnamed — not `cellPadGetData`
-   (`0x8B72CDA1`), and no match across ~120 candidate names. `xPadThread` polls it in a
-   loop and gets nothing, so the menu would be waiting on a button press that never comes.
-   Naming it (a firmware symbol dump, or matching the call shape against libpad) is the
-   next concrete step.
-2. Disc mount (`EBOOT.PBP` → `PSISOIMG0000`) once something starts the game.
-3. `sys_interrupt_thread_establish` (84) / `eoi` (88) are still stubs. Nothing has needed
-   them — the PPU polls — but the class-2 mailbox interrupt path is only half-built.
-4. Attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) are accepted and ignored;
-   they affect surface layout once geometry is drawn.
+1. **Find out what `argv` should contain.** The most direct route is RPCS3's PS1-Classic
+   launch path or a VSH trace; failing that, the emulator's own argv consumer
+   (`func_000B3738` onward) can be read to see which argument it parses into a path. Add
+   multi-argument support to the harness (it writes exactly one) once the answer is known.
+2. Settle the 32-bit vs 64-bit argv slot layout for this binary.
+3. Then: disc mount (`EBOOT.PBP` → `PSISOIMG0000`), R3000 execution, and geometry.
+4. Still open from before: `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs,
+   and attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) are accepted and ignored.

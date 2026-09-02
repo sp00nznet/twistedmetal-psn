@@ -150,26 +150,52 @@ App:Fonts Initialize Lv1 pass!
 | `GPUCoreInit()` / `InitMenu` | ✅ Done |
 | Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ✅ Done — all 5 SPUs load, run and handshake |
 | Emulator subsystems (font/audio/pad/VMC/CD-ROM/NP) | ✅ Done — all initialise |
-| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — never attempted; nothing drives the menu |
+| Input (the pad read) | ✅ Done — unnamed `sys_io` NID served from `cellPadGetData` |
+| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — never attempted; see below |
 | Twisted Metal renders | ⬜ |
-| Input | ⬜ — see below |
 
-### The blocker
+### The blocker: it thinks it is already running
 
-**Nothing drives the menu, so the disc is never loaded.** `groups[seen=0 exec=0]` — no
-geometry has reached the renderer, and the window is still the clear colour.
+`groups[seen=0 exec=0]` — no geometry has ever reached the renderer, and the window is
+still the clear colour. But the emulator is not stuck. Its main loop is:
 
-The best candidate is input. `sys_io` imports six functions; five resolve to
-`cellPadInit` / `End` / `SetPortSetting` / `GetInfo2` / `SetActDirect`, and the sixth —
-`0x3733EA3C` — is unnamed. It is **not** `cellPadGetData` (`0x8B72CDA1`), and it did not
-match any of ~120 candidate names, so it is a firmware-internal pad read. The emulator's
-`xPadThread` polls it in a loop and gets nothing back, which would leave the menu waiting
-on a button press that can never arrive.
+```
+func_000B13F8:  clear the R3000-exit flag
+  loop:         cellSysutilCheckCallback()
+                if (exit_flag == 0) { sys_timer_usleep(16666); goto loop; }
+                ...shutdown...
+```
 
-Also open, smaller: `sys_interrupt_thread_establish` (84) and `eoi` (88) are still stubs
-(the PPU polls instead, so nothing has needed them yet), and the `0x300`/`0x301`/`0x302`
-attribute packets (tiles, Z-cull) are accepted but ignored, which will matter for surface
-layout once real geometry is drawn.
+That is the *game is running* loop — it exits only when `R3000Exit(): PS1_EXIT_STOP`
+sets the flag. So `ps1_netemu` believes it has a disc and is emulating it. It has simply
+never been told which one: **nothing ever opens `EBOOT.PBP`.**
+
+The lead is `argv`. The emulator imports **no `cellGame` at all** (12 libraries, none of
+them `cellGame`), so its content path cannot come from `cellGameContentPermit` — on
+hardware the VSH passes it on the command line, and the emulator does echo what it gets
+(`argc=%d` / `argv[%d]=%s`, printed at boot). The harness hardcodes a single
+`argv[0] = /dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN` (overridable with `YDKJ_BOOTPATH`), which
+is right for a disc title and meaningless to this one. Two details to settle before
+guessing: the emulator's argv walker reads **32-bit** pointers (`lwz r5,0(r9)` /
+`addi r9,r9,4`) while the harness writes 64-bit slots, and nobody has yet established what
+the VSH actually passes.
+
+Two smaller things fixed on the way:
+
+- **The pad read is served now.** `sys_io`'s sixth import `0x3733EA3C` is unnamed (it is
+  *not* `cellPadGetData`, `0x8B72CDA1`, and matched none of ~120 candidate spellings), but
+  its call site gives the contract exactly: `(u32 port, u32* extra, CellPadData* data)`,
+  from a 136-byte per-port slot laid out `{ CellPadData data; u32 extra; }`. Served from
+  the runtime's own `cellPadGetData` in [`src/hle_overrides.c`](src/hle_overrides.c).
+- **`cellGame` now reports a real title id.** The harness reads it from
+  `<vfs>/PS3_GAME/PARAM.SFO`, which our layout did not have, so it kept the `BLES00000`
+  placeholder. Note the PSOne-Classic wrinkle: the SFO's `TITLE_ID` is the **PS1 serial**
+  (`SCUS94304`), while the content directory is named from the content id (`NPUI94304`) —
+  so "title id == directory name" does not hold for this category.
+
+Also open: `sys_interrupt_thread_establish` (84) and `eoi` (88) are still stubs (the PPU
+polls, so nothing has needed them), and the `0x300`/`0x301`/`0x302` attribute packets
+(tiles, Z-cull) are accepted but ignored, which will matter once geometry is drawn.
 
 See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 

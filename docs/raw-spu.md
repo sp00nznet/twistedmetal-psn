@@ -142,11 +142,12 @@ cannot be reproduced by a stock FNV-1a-64, which cost a debugging round here.
 - **No PS1 frame yet.** The emulator initialises fully and idles; it has not loaded the
   disc. `groups[seen=0 exec=0]` — no geometry has reached the renderer, so the window is
   still the clear colour.
-- **The pad read is an unnamed NID.** `sys_io` imports six functions; five are
-  `cellPadInit` / `End` / `SetPortSetting` / `GetInfo2` / `SetActDirect`, and the sixth,
-  `0x3733EA3C`, is not `cellPadGetData` (`0x8B72CDA1`) and did not match ~120 candidate
-  names. Its `xPadThread` polls it in a loop and gets nothing, so no input reaches the
-  menu — which is a strong candidate for why the emulator never starts the game.
+- **The pad read is served** (since fixed): `sys_io`'s unnamed sixth import `0x3733EA3C`
+  is a pad read with signature `(u32 port, u32* extra, CellPadData* data)`, derived from
+  its call site and served from `cellPadGetData` in `src/hle_overrides.c`. It was not the
+  reason the game never starts — see the README's blocker section: the emulator never
+  learns which disc to load, and its content path does not come from `cellGame` (which it
+  does not import) but from `argv`, which the harness hardcodes.
 - **Interrupt delivery is registered but untested.** `sys_interrupt_thread_establish` (84)
   and `eoi` (88) are still stubs; the class-2 mailbox interrupt status is maintained, but
   nothing has needed to fire yet because the PPU polls.
