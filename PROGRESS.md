@@ -20,7 +20,8 @@
 | 11b. Launch args | the nine the VSH passes a PSOne Classic | ✅ — title, region, target, manual read |
 | 12. Disc | image opened (`ISO.BIN.EDAT`) | ✅ — unblocked by the `cellAdecOpen` ABI fix |
 | 12b. NPDRM | EDAT decryption | ✅ — `PSISOIMG0000`, serial `_SCUS_94304` |
-| 12c. Mount | image mounts with a non-zero track count | ⬜ — blocked: a 12-byte `PSISOIMG0000` compare fails |
+| 12c. Header | read, streamed and hashed | ✅ — guest SHA-1 matches Python byte for byte |
+| 12d. Body | disc body opens (`EBOOT.PBP`) | ⬜ — blocked: header ECDSA signature does not verify |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -766,12 +767,60 @@ path. The decrypted `ISO.BIN.EDAT` has that same region in the clear: the serial
 track 9, i.e. a data track plus eight CD-DA tracks). So the EDAT is the PS3-side header and
 index; the PSAR is the bulk data, under a second and different encryption.
 
+## 2026-09-02 — The disc path is correct; one signature gate remains
+
+Traced the mount failure to its exact instruction, and in doing so proved the whole disc
+chain correct.
+
+**Two earlier readings were wrong and are corrected.** The `PSISOIMG0000` compare *passes* --
+a watch on `cdrom_obj + 0x70D8` shows `func_000EFBA8` writing the track count at `0xF004C`,
+the match branch. And the exit is via `0x111BC8`, not `0x110E50`: the reader returns `-1` and
+`0x1111AC` branches straight into `ExitPS1(3)`.
+
+**The two-file design, confirmed from the binary.** `func_000EFBA8` builds *both*
+`/USRDIR/ISO.BIN.EDAT` and `/USRDIR/CONTENT/EBOOT.PBP`. Diffing the decrypted EDAT against
+`DATA.PSAR` shows only 29% of the first megabyte matching, with the PSAR being ` PGD`
+ciphertext from 0x400 on while the EDAT holds the same region in the clear. So
+`ISO.BIN.EDAT` is Sony's *decrypted, signed* copy of the PSAR header; the PS3 never runs PGD
+and streams the body from the PBP. The subsystem names itself: `pspi/pspi.c`.
+
+**Proof that our side is right.** The reader consumes the whole header (position climbs in
+0x1000 steps to exactly 0x100000, then 0x100028 for a 40-byte trailer) and hashes it. The
+digest the guest computes is `6c55da7ff8eb8c09df8d5269dca4444b561097aa` -- byte for byte what
+Python computes over `dec[0:0x100000]`. That one comparison validates the EDAT decryption,
+the block-key derivation, the ring buffer's ordering and the lifted SHA-1 at once.
+
+**Where it stops.** At `0xF132C`, immediately after `SHA1_Final`, the emulator reads the
+40-byte trailer and calls `func_00010D24(sig, hash, key@0x175510, 2)` -- an ECDSA verify over
+curve 2 of a table at `0x15F7F0`. On success it closes the EDAT and opens `EBOOT.PBP` at
+`0xF1590`; that instruction is the only one in the image that points the open-path field at
+the PBP buffer, and a watch confirms it never runs. The verify fails, so the disc body is
+never opened.
+
+Ruled out: not a stubbed dependency (the verify calls only real code, no import trampolines);
+not the hash input; and not our carry arithmetic on review (`adde`, `subfe`, `addc`, `subfc`,
+`addze` all lift correctly, that path having already had one such bug found and fixed).
+
+Left deliberately undone: patching the check out. It is an integrity check on content we did
+not author, and disabling it would prove nothing about whether the recompilation is correct.
+
+Tooling: added `LBP_WW_MAX` (raise the 64-hit cap) and `LBP_WW_CHAIN` (dump the guest caller
+chain on every hit, not just the first) to the store watchpoint -- which is how the teardown's
+nine call sites were narrowed to the one at `0xF0930`. Also repaired a stray NUL byte that an
+earlier scripted edit had left in `README.md`.
+
+Detail: [`docs/disc-body.md`](docs/disc-body.md).
+
 ## Next steps
 
-1. **Find what `func_000EFBA8` is handed as its first argument** -- the buffer the
-   `PSISOIMG0000` comparison reads -- and whether the sector data is meant to come from
-   `EBOOT.PBP`, which would need PGD/amctrl decryption as a second layer.
-2. Then: R3000 execution and geometry.
+1. **Decide whether the ECDSA failure is ours or the data's.** Either read the curve table
+   properly -- best by dumping the context the guest builds rather than guessing the layout,
+   since no field assignment tried puts both the generator and the public key on one curve --
+   and check the signature offline; or obtain the **retail** `ISO.BIN.EDAT` (license type 2,
+   the file Sony actually signed) by recovering the owner's own RAP/RIF for `NPUI94304`. The
+   copy in `vfs/` is the archive's license-type-3 rewrap, and a rewrap preserves the signature
+   only if the plaintext was left untouched.
+2. Then: the disc body out of `EBOOT.PBP`, R3000 execution and geometry.
 3. Still open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
    (non-fatal); `cellAdecQueryAttr` (`0x7E4A4A49`) returns `CELL_OK` with its attr struct
    untouched; `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs; attribute

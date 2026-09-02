@@ -161,12 +161,13 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | CD-ROM subsystem starts | ✅ Done — was one wrong function signature (`cellAdecOpen`) |
 | Disc image opened (`ISO.BIN.EDAT`) | ✅ Done |
 | Disc **decrypted** (NPDRM / EDAT) | ✅ Done — `PSISOIMG0000`, serial `_SCUS_94304` |
-| Disc image mounts (track count > 0) | ⬜ **blocker** — mount succeeds but the track count stays 0 |
+| Disc header read, streamed and hashed | ✅ Done — guest SHA-1 matches Python byte for byte |
+| Disc body opens (`EBOOT.PBP`) | ⬜ **blocker** — header ECDSA signature does not verify |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
 
-The disc decrypts and the emulator opens it, then still exits:
+The disc decrypts, streams and hashes **correctly** — and then one signature check stops it:
 
 ```
 [edat] ...ISO.BIN.EDAT: version=3 license=3 flags=0x00000000 block=0x4000 size=1048616
@@ -176,34 +177,61 @@ The disc decrypts and the emulator opens it, then still exits:
 ExitPS1(): code=3 <0>
 ```
 
-The exit is exact. At `0x110E20` the emulator mounts the image (`bl 0xEE018`, which
-*succeeds*), then reads a count back — `func_000ED2E0` is three instructions returning
-`*(s32*)(cdrom_obj + 0x70D8)` — and gives up with code 3 when it is not positive. So the
-image mounts and the track count stays zero.
+**How far it actually gets.** The `PSISOIMG0000` compare passes. The streaming reader
+consumes the entire megabyte — the stream position climbs in `0x1000` steps to exactly
+`0x100000`, then to `0x100028` after a 40-byte trailer — hashing as it goes. Watching the
+digest the guest writes:
 
-The count is set in `func_000EFBA8`, the CD-ROM streaming reader, and only after a
-12-byte `memcmp` of its first argument against the literal `"PSISOIMG0000"` (`0xF002C`;
-`func_000A8088` is memcmp). Our decrypted file begins with exactly those bytes, so the next
-measurement is what actually lands in that buffer.
+```
+guest  SHA1(header) = 6c55da7ff8eb8c09df8d5269dca4444b561097aa
+python SHA1(dec[0:0x100000]) = 6c55da7ff8eb8c09df8d5269dca4444b561097aa
+```
+
+Byte for byte. One comparison validates the whole chain: the EDAT decryption, the block-key
+derivation, the ring buffer's ordering, and the lifted SHA-1 over a megabyte.
+
+**The two-file design.** `ps1_netemu` builds *both* `/USRDIR/ISO.BIN.EDAT` and
+`/USRDIR/CONTENT/EBOOT.PBP`. Comparing them shows why: the PSAR's header is `\0PGD`
+ciphertext from `0x400` on, while the EDAT has the same region in the clear — serial
+`_SCUS_94304`, a valid 9-track CD TOC, and the block index. `ISO.BIN.EDAT` is Sony's
+**decrypted, signed** copy of the PSAR's `0x100000`-byte header; the PS3 never runs PGD and
+streams the compressed body out of `EBOOT.PBP`. The strings name the subsystem: `pspi/pspi.c`.
+
+**Where it stops.** At `0xF132C`, right after `SHA1_Final`:
+
+```
+r5 = *(TOC-0x7A1C) = 0x175510      ; a 40-byte public key
+bl  0x10D24 (sig, hash, key, 2)    ; ECDSA verify, curve 2
+beq cr7, 0xF14F4                   ; VERIFY OK -> close EDAT, open EBOOT.PBP
+```
+
+The branch is not taken, so `0xF1590` — the one instruction in the image that points the
+open-path field at the `EBOOT.PBP` buffer — is never reached, and the reader returns `-1`
+into `ExitPS1(3)`. **The disc body is never opened because the header signature does not
+verify.** Detail: [`docs/disc-body.md`](docs/disc-body.md).
+
+Ruled out: it is not a stubbed dependency (the verify calls only real code in the image, no
+import trampolines), not the hash input, and not our carry arithmetic on review (`adde`,
+`subfe`, `addc`, `subfc`, `addze` all lift correctly).
+
+**Which `ISO.BIN.EDAT` to use — and the likely cause.** The retail file is license type 2:
+`NP_PSX_KEY` verifies against its `dev_hash`, but the *data* is under the RIF key from a
+per-console RAP, so every block hash fails. The archive's second package carries the same
+file as license type 3, where the klicensee is the file key — that one decrypts, and it is
+what `vfs/` currently holds. But an EDAT is only a container: re-wrapping authentic plaintext
+would leave the signature intact, while any edit to the header itself would not. So the
+likeliest read is that the type-3 header is not the one Sony signed, and the legitimate route
+is the **retail** EDAT decrypted with the owner's own RAP/RIF for `NPUI94304`.
 
 Checked against a second title: `2Xtreme [NPUI-94508]` has the identical package layout,
-with an `ISO.BIN.EDAT` of **exactly** the same 1,049,920 bytes — so that size is what this
-form always is, not a truncation. `EBOOT.PBP`'s `DATA.PSAR` also begins `PSISOIMG0000`, but
-its payload is PSP **PGD**-encrypted, whereas the decrypted EDAT has the serial and a valid
-9-track CD TOC in the clear. Detail: [`docs/npdrm.md`](docs/npdrm.md).
-
-**Note on which `ISO.BIN.EDAT` to use.** The retail file is license type 2: `NP_PSX_KEY`
-verifies against its `dev_hash`, but the *data* is under the RIF key from a per-console RAP,
-so every block hash fails. The archive's second package carries the same file as license
-type 3, where the klicensee is the file key — that one decrypts, and it is what `vfs/`
-should hold.
+with an `ISO.BIN.EDAT` of **exactly** the same 1,049,920 bytes — that size is what this form
+always is, not a truncation.
 
 Also open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
 (non-fatal — the emulator prints `failed` and continues); `cellAdecQueryAttr`
 (`0x7E4A4A49`) still returns `CELL_OK` with its attr struct untouched;
 `sys_interrupt_thread_establish` (84) and `eoi` (88) are stubs; and the
 `0x300`/`0x301`/`0x302` attribute packets (tiles, Z-cull) are accepted but ignored.
-
 
 ## 🔧 Toolchain changes upstreamed to ps3recomp
 
@@ -225,7 +253,7 @@ Also open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EIS
   had skipped: it traced everything *except* the unimplemented syscalls, i.e. exactly
   the ones a trace is wanted for. Finding the RSX call contract needed this.
 - **`libs/filesystem/edat.c` — new, NPDRM (EDAT/SDAT) decryption.** A file beginning
-  `NPD ` is decrypted once into a cache file and that is opened in its place, so every
+  `NPD\0` is decrypted once into a cache file and that is opened in its place, so every
   read/seek/stat path stays unchanged. Self-contained AES-128 + AES-CMAC (no new
   dependency), with the FIPS-197 and RFC 4493 vectors checked before first use and every
   block's CMAC verified. See [`docs/npdrm.md`](docs/npdrm.md).
