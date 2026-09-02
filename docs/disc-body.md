@@ -175,47 +175,98 @@ container, so re-wrapping the same plaintext under a free klicensee leaves Sony'
 intact. It has to — cracked PSOne Classics ran on real consoles, and `ps1_netemu` performs
 this check unconditionally. The earlier speculation that the header had been edited was wrong.
 
-## What the bug is not
+## Bisecting the lifter bug
 
-`func_00010D24` is a thin wrapper: it unpacks `r`, `s`, `Qx`, `Qy`, the hash and the curve
-context and tail-calls `func_001584A0`, returning its result unchanged. There is no early
-range check to fail, so the fault is inside that subtree — 29 functions, reachable by direct
-call from `0x1584A0`.
+`src/ecdsa_probe.c` drives the firmware's verify directly instead of waiting for a boot.
+`ECDSA_PROBE=1` builds the exact arguments `func_00010D24` hands to `func_001584A0` — `r`, `s`,
+the hash, the public key and a 144-byte curve context, each value a 24-byte slot of 4 zero
+bytes plus 20 big-endian — and calls it through the generated `function_table` (the lifted
+symbols are C++; the table has C linkage, and going through it makes the probe
+address-driven, which is what bisecting needs).
 
-Ruled out so far:
+The curve context is built from the constants above rather than by calling the guest's
+`func_000109C4`, because the curve table at `0x15F7F0` is populated at runtime and going
+through the initialiser would make the probe depend on when it runs.
 
-- **Not an unlifted instruction.** All 29 functions lift with zero `TODO: .word` slots. (56
-  functions elsewhere in the image do have them; none are in this subtree.)
-- **Not a stubbed import.** The subtree calls only image-internal code.
-- **Not the obvious instruction rules.** The subtree's rare instructions were each checked
-  against PowerISA: `addic` (used twice in the whole image, once here), `sld`/`sld.`, `srd`,
-  `cmpld` (50 uses), `divdu`, `mulld`, `mfcr` (38 uses), `mtcrf`, `subfic`, `sradi`, `neg`,
-  `addze`, `subfe`, `subfc`, `stdx` (the image's only one), `ldx`. All correct, including the
-  64-bit widths and the `XER[CA]` carry-outs.
-- **Not record-form CR0.** Dot-forms get their CR0 update from a generic wrapper in
-  `_translate`, so `addic.` and `sld.` are covered even though their own rules do not emit it.
-- **Not the CR bit order.** `cr0` sits in the top nibble and `cr7` in the bottom, consistent
-  between the compare handlers, the record-form wrapper and `mfcr`.
+```
+[ecdsa] calling func_001584A0(sig=0x50004210 e=0x50004310 Q=0x50004410 curve=0x50004510)
+[ecdsa] returned -1 (0xFFFFFFFF) -- expected 0 (VALID)  <== BUG REPRODUCED
+```
+
+Sub-second, deterministic, and it reproduces what the real boot does — a later run shows the
+same code running at `r30=d0022750` on the guest's own stack with the same outcome.
+
+## What is proven correct
+
+Instrumenting the generated C at each stage and comparing against the same computation in
+Python:
+
+| stage | guest | |
+|---|---|---|
+| `w = s^-1 mod n` | `4dc0b56c40d9a33a5b451b9d9dfd920aa233c6f5` | ✅ |
+| `u1 = e*w mod n` | `a53abb93bb101112885815809da262a456a2609b` | ✅ |
+| `u2 = r*w mod n` | `8c0800d362533422eb2e4ffd349195bb1b6376c2` | ✅ |
+| `X.x` | `50042b80a2b51a125fa40d253e2768585c03d66d` | ❌ (`3df7e732…78d4`) |
+
+So the modular inverse and both modular multiplies are exact — which is a lot of bignum
+arithmetic working perfectly — and the three ECDSA range checks all pass. The failure is
+confined to the point arithmetic. Dumping the Jacobian point the scalar multiply returns and
+testing `Y^2 == X^3 + aXZ^4 + bZ^6 (mod p)` in Python: **not on the curve**. The inputs to it
+are all correct — `G`, `Q` and the curve are byte-exact where the multiply reads them.
+
+## The corruption
+
+Every wrong value carries the same signature: **limb 2 of a 4-limb bignum holds a pointer.**
+Both coordinates of the result, and all three of the point fed to the first double, hold the
+identical value `0x50042CA0` in that slot.
+
+Tracing it back with a store watch:
+
+1. `func_0015ABEC` — a leaf that converts a value into the internal form, with no stack frame
+   of its own (`addi r22, r1, -224`, all locals in the PPC64 red zone) — is called four times
+   to fill a table with `Gx`, `Gy`, `1`, `Qx`. Its **inputs are correct**, its output is not.
+2. Inside it, the loop at `loc_0015AF68` shifts the limb array down one limb
+   (`buf[i] = buf[i+1]`).
+3. That loop propagates a **stale top limb** into limb 2, and the stale value is a pointer
+   left in the scratch buffer.
+4. The copy loop at `0x15B0AC` then copies the whole thing out to the caller, and the
+   corrupted limb flows through the entire point multiply.
+
+So the working buffer's high limb is not being initialised where it should be, and everything
+downstream inherits it.
+
+## What has been ruled out
+
+- **No unlifted instructions.** All 29 functions in the subtree lift with zero `TODO: .word`
+  slots. (56 functions elsewhere in the image do have them; none here.) The 74 `.word`s a raw
+  scan reports in the address range are inter-function padding the lifter correctly skips.
+- **No stubbed imports.** The subtree calls only image-internal code.
+- **Every rare instruction in it, checked against PowerISA**: `addic` (twice in the whole
+  image, once here), `sld`/`sld.`, `srd`, `cmpld` (50 uses), `divdu`, `mulld`, `mfcr` (38
+  uses), `mtcrf`, `subfic`, `sradi`, `neg`, `addze`, `subfe`, `subfc`, `stdx` (the image's only
+  one), `ldx` — all correct, including 64-bit widths and the `XER[CA]` carry-outs.
+- **The MD-form rotate decode**, hand-checked against the encoding: `rldicr r8,r10,32,31` /
+  `rldicr r3,r8,32,59` decode and evaluate exactly as the hardware would, so the address
+  arithmetic in the point setup is right.
+- **Record-form CR0**, which comes from a generic wrapper, so `addic.`/`sld.` are covered; and
+  the CR nibble order, which is consistent across the compare handlers, that wrapper and
+  `mfcr`.
+- **Conditional returns** (`beqlr`/`bgelr`/`blelr`/`bnelr`) — used only in the broken path, so
+  a natural suspect — parse and lift correctly, including the no-operand `cr0` form.
+- **Not a red-zone violation.** `func_0015ABEC` makes no calls, so its use of the 288-byte
+  protected zone below `r1` is legitimate and nothing clobbers it.
+
+## A real diagnostic gap, fixed on the way
+
+`vm_write64` was never hooked into the `LBP_WW` store watch — only the 8/16/32-bit stores
+were. Every bignum limb and every 64-bit struct field is written with `std`, so a watch on one
+reported nothing and read as *"nobody writes this"*. That is why several earlier searches for
+these values in guest memory came up empty. `runtime/ppu/ppu_loader.cpp` now reports the
+64-bit store as two halves, so a watch still fires when only one word of it is covered.
 
 ## Next
 
-A differential test is the way in, not more reading. The computation is pure and its inputs
-and expected intermediates are all known:
-
-```
-w     = 4dc0b56c40d9a33a5b451b9d9dfd920aa233c6f5     (s^-1 mod n)
-u1    = a53abb93bb101112885815809da262a456a2609b     (e*w mod n)
-u2    = 8c0800d362533422eb2e4ffd349195bb1b6376c2     (r*w mod n)
-u1G.x = 96d915a04469a0b2b7695017d2a448b3e406dc58
-u2Q.x = 346c05b692c309f269f5ae6e1b09f36fe6d77933
-X.x   = 3df7e732dfd6834e25ac8284c5bce7b8451078d4     (== r, so valid)
-```
-
-Calling the lifted `func_001584A0` from a small harness with these inputs, then bisecting down
-the 29-function tree against the same values computed in Python, localises the fault to one
-routine and then to one instruction. Watching guest memory did not find these intermediates —
-the bignum scratch is neither in the reader's stack frame nor the window below it, so the
-harness is the cheaper route than hunting for the working buffers.
-
-Worth fixing properly rather than working around: any title that checks a signature — and
-plenty do — will hit the same bug.
+Find where `func_0015ABEC`'s working buffer should get its high limb and does not. The shift
+loop at `loc_0015AF68` and the copy at `0x15B0AC` are both faithful to the original; the
+missing write is upstream of them, in the ~200 instructions that compute the reduction. The
+probe makes each hypothesis a sub-second test.

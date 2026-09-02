@@ -855,6 +855,37 @@ the bignum scratch is not in the reader's frame nor the window below it.
 
 Detail: [`docs/disc-body.md`](docs/disc-body.md).
 
+## 2026-09-02 (later still) -- the ECDSA bug, bisected to one stale limb
+
+Built `src/ecdsa_probe.c`: `ECDSA_PROBE=1` drives `func_001584A0` directly with the exact
+argument shape `func_00010D24` uses, through the generated `function_table`. Sub-second and
+deterministic instead of a 40-second boot, and it reproduces what the real path does.
+
+Bisected every stage against Python. The modular inverse `w`, both modular multiplies `u1`
+and `u2`, and all three ECDSA range checks are **exact** -- a great deal of bignum arithmetic
+working perfectly. Only the point arithmetic fails, and the Jacobian point the scalar
+multiply returns is not on the curve, while its inputs (`G`, `Q`, the curve) are byte-exact.
+
+Every wrong value has the same signature: limb 2 of a 4-limb bignum holds a pointer. Traced
+with a store watch to `func_0015ABEC`, a leaf conversion using the PPC64 red zone: its inputs
+are correct, its output is not, and the loop at `loc_0015AF68` (which shifts the limb array
+down by one, `buf[i] = buf[i+1]`) propagates a stale top limb into limb 2. The copy at
+`0x15B0AC` then hands it to the caller and it flows through the whole multiply.
+
+Ruled out along the way: no unlifted instructions in any of the 29 subtree functions; no
+stubbed imports; every rare instruction checked against PowerISA (`addic`, `sld.`, `cmpld`,
+`divdu`, `mulld`, `mfcr`, `mtcrf`, `subfic`, `sradi`, `addze`, `subfe`, `subfc`, `stdx`,
+`ldx`); the MD-form rotate decode hand-checked against the encoding; record-form CR0 and the
+CR nibble order; the conditional-return forms; and the red zone, which is legitimate since
+the function makes no calls.
+
+**Runtime fix worth keeping:** `vm_write64` was never hooked into the `LBP_WW` store watch --
+only 8/16/32-bit stores were. Every bignum limb and 64-bit struct field is written with `std`,
+so a watch on one reported nothing and read as "nobody writes this", which is why several
+earlier hunts for these values came up empty.
+
+Detail: [`docs/disc-body.md`](docs/disc-body.md).
+
 ## Next steps
 
 1. **Decide whether the ECDSA failure is ours or the data's.** Either read the curve table

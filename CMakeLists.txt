@@ -57,6 +57,7 @@ add_executable(tmpsn
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"            # cellFs VFS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/spu_images.c"       # lifted SPU modules -> registry
     "${CMAKE_CURRENT_SOURCE_DIR}/src/hle_overrides.c"    # firmware imports we serve ourselves
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ecdsa_probe.c"      # ECDSA_PROBE=1: drive the firmware verify directly
     ${GEN_SOURCES}
     ${SPU_SOURCES}
     ${RECOMP_SOURCES}
