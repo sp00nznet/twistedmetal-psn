@@ -181,11 +181,16 @@ The exit is exact. At `0x110E20` the emulator mounts the image (`bl 0xEE018`, wh
 `*(s32*)(cdrom_obj + 0x70D8)` — and gives up with code 3 when it is not positive. So the
 image mounts and the track count stays zero.
 
-The plaintext suggests why: it is **1,048,616 bytes with only 161 of its 2049 512-byte
-blocks non-zero** — `PSISOIMG0000`, the serial `_SCUS_94304` at 0x400 and a CD TOC at
-0x800, but no 300 MB of disc. This package is the hybrid PSP/PS3 form: the real image is
-the 68 MB `DATA.PSAR` inside `USRDIR/CONTENT/EBOOT.PBP`, which nothing in the run opens.
-Next measurement is `func_0000EE018` itself. Detail: [`docs/npdrm.md`](docs/npdrm.md).
+The count is set in `func_000EFBA8`, the CD-ROM streaming reader, and only after a
+12-byte `memcmp` of its first argument against the literal `"PSISOIMG0000"` (`0xF002C`;
+`func_000A8088` is memcmp). Our decrypted file begins with exactly those bytes, so the next
+measurement is what actually lands in that buffer.
+
+Checked against a second title: `2Xtreme [NPUI-94508]` has the identical package layout,
+with an `ISO.BIN.EDAT` of **exactly** the same 1,049,920 bytes — so that size is what this
+form always is, not a truncation. `EBOOT.PBP`'s `DATA.PSAR` also begins `PSISOIMG0000`, but
+its payload is PSP **PGD**-encrypted, whereas the decrypted EDAT has the serial and a valid
+9-track CD TOC in the clear. Detail: [`docs/npdrm.md`](docs/npdrm.md).
 
 **Note on which `ISO.BIN.EDAT` to use.** The retail file is license type 2: `NP_PSX_KEY`
 verifies against its `dev_hash`, but the *data* is under the RIF key from a per-console RAP,

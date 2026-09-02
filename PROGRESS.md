@@ -20,7 +20,7 @@
 | 11b. Launch args | the nine the VSH passes a PSOne Classic | ✅ — title, region, target, manual read |
 | 12. Disc | image opened (`ISO.BIN.EDAT`) | ✅ — unblocked by the `cellAdecOpen` ABI fix |
 | 12b. NPDRM | EDAT decryption | ✅ — `PSISOIMG0000`, serial `_SCUS_94304` |
-| 12c. Mount | image mounts with a non-zero track count | ⬜ — blocked here: `ExitPS1(): code=3` |
+| 12c. Mount | image mounts with a non-zero track count | ⬜ — blocked: a 12-byte `PSISOIMG0000` compare fails |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -724,11 +724,53 @@ blocks non-zero**: `PSISOIMG0000`, the serial `_SCUS_94304` at 0x400, a CD TOC a
 and no 300 MB of disc. This package is the hybrid PSP/PS3 form, where the real image is the
 68 MB `DATA.PSAR` inside `USRDIR/CONTENT/EBOOT.PBP`, and nothing in the run opens that file.
 
+**Where the mount actually stops (same day, after the comparison).** Of the seven writes
+to `cdrom_obj + 0x70D8`, five reset it to 0; the two that make it positive are both in
+`func_000EFBA8`, the CD-ROM streaming reader, and both sit behind one gate:
+
+```
+000F002C:  bl    0xA8088            ; func_000A8088 is memcmp(a, b, n)
+000F0038:  bne   cr7, 0xF09B8       ; mismatch -> error path, count stays 0
+000F004C:  stw   r0, 0x70D8(r30)    ; match    -> count = 1
+```
+
+with `r3 = r27` (the reader's own first argument), `r4 = *(TOC-0x7A34) = 0x175610 =
+"PSISOIMG0000"`, `r5 = 12`. The whole disc path turns on a 12-byte magic comparison, and
+our decrypted file begins with exactly those bytes -- so the open question is what lands in
+that buffer, not whether the plaintext is right.
+
+One correction worth carrying forward: `*(TOC-0x7A38) = 0x76B004` looked like the reader's
+ring buffer and is not. Watching it showed `67452301 EFCDAB89 98BADCFE 10325476 C3D2E1F0`
+-- the SHA-1 initial constants. It is a SHA-1 context; there is an integrity-hash step in
+this path too.
+
+Also confirmed: the `sys_semaphore_wait` ESRCH spin is gone since the `cellAdecOpen` fix,
+so this is genuinely the next failure rather than the previous one resurfacing.
+
+**The package form, checked against a second title.** `2Xtreme [NPUI-94508]` from
+`X:/Roms/PS3/PSN` has the identical layout, including an `ISO.BIN.EDAT` of **exactly** the
+same 1,049,920 bytes. So that size is what this package form always is, not a truncation,
+and the emulator is expected to cope with it. Both titles also ship a separate `_Crack.pkg`
+whose only payload is a license-type-3 `ISO.BIN.EDAT`.
+
+| | Twisted Metal [NPUI-94304] | 2Xtreme [NPUI-94508] |
+|---|---|---|
+| `USRDIR/ISO.BIN.EDAT` | 1,049,920 | 1,049,920 |
+| `USRDIR/CONTENT/EBOOT.PBP` | 68,727,509 | 59,461,367 |
+| `USRDIR/CONTENT/DOCUMENT.DAT` | 5,105,104 | 1,859,880 |
+
+The two halves carry different things. `EBOOT.PBP`'s `DATA.PSAR` (at 0x18000) also begins
+`PSISOIMG0000`, but its payload from 0x400 is ` PGD` -- PSP **PGD**-encrypted, the POPS
+path. The decrypted `ISO.BIN.EDAT` has that same region in the clear: the serial
+`_SCUS_94304` at 0x400 and a valid CD TOC at 0x800 (points A0/A1/A2 -- first track 1, last
+track 9, i.e. a data track plus eight CD-DA tracks). So the EDAT is the PS3-side header and
+index; the PSAR is the bulk data, under a second and different encryption.
+
 ## Next steps
 
-1. **Read `func_0000EE018`** (the mount) and find what it fills `cdrom_obj + 0x70D8` from,
-   and whether it is meant to open `EBOOT.PBP` for the sector data. That is the last
-   unknown between here and a PS1 executable running.
+1. **Find what `func_000EFBA8` is handed as its first argument** -- the buffer the
+   `PSISOIMG0000` comparison reads -- and whether the sector data is meant to come from
+   `EBOOT.PBP`, which would need PGD/amctrl decryption as a second layer.
 2. Then: R3000 execution and geometry.
 3. Still open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
    (non-fatal); `cellAdecQueryAttr` (`0x7E4A4A49`) returns `CELL_OK` with its attr struct
