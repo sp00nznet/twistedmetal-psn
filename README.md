@@ -109,7 +109,7 @@ NV4097 → D3D12 engine, starts its five raw SPUs (four GPU cores — the banner
 `-sgpu-sli4` — plus the second module), completes its whole subsystem bring-up, and —
 once given the nine command-line arguments the VSH passes a PSOne Classic — reads the
 package: title, region, disc target, and the 30-page manual out of `DOCUMENT.DAT`. It
-stops one step short of loading the disc itself.
+opens the disc image. It stops at the DRM layer.
 
 ```
 PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
@@ -158,156 +158,50 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator subsystems (font/audio/pad/VMC/CD-ROM/NP) | ✅ Done — all initialise |
 | Input (the pad read) | ✅ Done — confirmed against RPCS3's `sys_io_3733EA3C` |
 | Launch arguments (the nine the VSH passes) | ✅ Done — title, region, disc target, manual all read |
-| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — `_xcdrom_thread` waits on a semaphore that was never created |
+| CD-ROM subsystem starts | ✅ Done — was one wrong function signature (`cellAdecOpen`) |
+| Disc image opened (`ISO.BIN.EDAT`) | ✅ Done |
+| Disc **decrypted** (NPDRM / EDAT) | ⬜ **blocker** — `ExitPS1(): code=3`; nothing decrypts the EDAT |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
 
-It has the game and never opens `EBOOT.PBP`. `groups[seen=0 exec=0]` — no geometry has
-reached the renderer, so the window is still the clear colour.
-
-The emulator is not stuck: its main loop is the *game-is-running* loop
-(`cellSysutilCheckCallback` + `sys_timer_usleep(16666)`, exited only when
-`R3000Exit(): PS1_EXIT_STOP` fires). It believes it is emulating. The thread that would
-actually read the disc, `_xcdrom_thread`, starts and immediately spins **158,738 times**
-on `sys_semaphore_wait` with **id 0** — a handle nothing ever filled in:
+It opens the disc and stops at the DRM layer:
 
 ```
-[sc] 90(0x76A760, 0xD0022CB0, 0, 1) -> 0            sys_semaphore_create
-[sc] 92(0x4, 0x30D40, ...)          -> 0            wait(id 4, 200 ms)  -- fine
-[sc] 92(0x0, 0x0, ...)              -> 0x80010005   ESRCH  x158,738
+[cellAdec] Open -> handle=0
+[hle] unresolved NID 0xAD218FAF                      <- sceNpDrmIsAvailable
+[sys_fs] open OK: .../NPUI94304/USRDIR/ISO.BIN.EDAT  <- the disc
+ExitPS1(): code=3 <0>
+cell/host.c: 625: CoreBoot() failed
 ```
 
-The ids live at `+0x70B8`/`+0x70BC` of its object; the code that creates such a pair
-(`0x10FFC8`/`0x10FFF4`) runs twice, for two *other* instances, and never for this one — so
-a construction step upstream was skipped. Ruled out: a missing file (the only failing opens
-in a whole run are four `.ccd` font probes that all fall back to `.TTF`), the argv (all nine
-arrive and visibly change behaviour), and `ps1_newemu` vs `ps1_netemu` (newemu's imports are
-a strict subset — same codebase). Detail and the next measurement in
-[`docs/boot-argv.md`](docs/boot-argv.md).
+`ISO.BIN.EDAT` is an encrypted EDAT. On lv2, `sceNpDrmIsAvailable(klicensee, path)` primes
+the kernel to decrypt that path *transparently*, so the following `cellFsOpen` returns
+plaintext. Ours is unimplemented and returns `CELL_OK`, so the plain open hands the
+emulator ciphertext; it reads a garbage header and exits with code 3. Confirmed by
+substitution — the archive's second package carries a DRM-free `ISO.BIN.EDAT` (NPD version
+3, license type 3, versus retail's version 1 / type 2) and it fails identically, because
+nothing decrypts *either* form yet.
 
-Also open: `sys_interrupt_thread_establish` (84) and `eoi` (88) are still stubs (the PPU
-polls, so nothing has needed them), and the `0x300`/`0x301`/`0x302` attribute packets
-(tiles, Z-cull) are accepted but ignored, which will matter once geometry is drawn.
+The fix is EDAT decryption in the FS layer plus `sceNpDrmIsAvailable` to arm it. RPCS3's
+`Crypto/unedat.cpp` handles exactly the free-license case (`version == 3`,
+`(license & 3) == 3`), so no per-title RAP is needed for that form.
 
-## 🛠️ Pipeline
+**What unblocked the CD-ROM subsystem was one wrong function signature.** Ours took five
+arguments where `cellAdecOpen` takes four, splitting the guest's `CellAdecCb` struct into
+separate `cbFunc`/`cbArg` parameters — which pushed `handle` off `r6` onto `r7`, so the
+out-pointer read as zero and *every* open returned `CELL_ADEC_ERROR_ARG`. `ps1_netemu`
+opens a decoder for CD-DA / XA audio inside its CD-ROM constructor, so one wrong parameter
+list meant no disc — presenting as a thread spinning 158,738 times on a semaphore that was
+never created. The trail from that spin to the signature is in
+[`docs/disc-path.md`](docs/disc-path.md).
 
-```
-  dev_flash ─► ps1_netemu.self ─► .elf ─► ppu_lifter ─► C++ ─┐
-              (firmware SELF)   (decrypt)  (3,512 fns)       ├─► link ps3recomp ─► tmpsn.exe
-                                2 SPU ELFs ─► spu_lifter ─►──┘        (harness + HLE)
-                                                                              │
-  PSN PKG ─► EBOOT.PBP + ISO.BIN.EDAT ─────────────────────────────► game data (fed, not lifted)
-```
+Also open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
+(non-fatal — the emulator prints `failed` and continues); `cellAdecQueryAttr`
+(`0x7E4A4A49`) still returns `CELL_OK` with its attr struct untouched;
+`sys_interrupt_thread_establish` (84) and `eoi` (88) are stubs; and the
+`0x300`/`0x301`/`0x302` attribute packets (tiles, Z-cull) are accepted but ignored.
 
-The PS1 disc is **never** decrypted by us: the recompiled emulator does its own
-EDAT/PSAR handling, exactly as it does on hardware.
-
-## 🎯 Status
-
-**It boots, the GPU is up, all five SPUs run, and it has found the game.** The
-recompiled PS1 emulator runs its own startup, negotiates video and audio, loads the PS1
-BIOS, brings RSX up through the kernel, drains its own command FIFO into the live
-NV4097 → D3D12 engine, starts its five raw SPUs (four GPU cores — the banner says
-`-sgpu-sli4` — plus the second module), completes its whole subsystem bring-up, and —
-once given the nine command-line arguments the VSH passes a PSOne Classic — reads the
-package: title, region, disc target, and the 30-page manual out of `DOCUMENT.DAT`. It
-stops one step short of loading the disc itself.
-
-```
-PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
-user_memory_size= 201326592/268435456 <67108864>
-[cellVideoOut] GetResolution(id=2) -> 1280x720
-[sys_fs] open OK: .../dev_flash/ps1emu/ps1_rom.bin
-REGION NUM = 0x00000081 code=A
-[sys_rsx] memory_allocate(size=0xF900000) -> local=0xC0000000
-[sys_rsx] context_allocate -> dma_control=0x20001FC0 (ctrl=0x20002000)
-[sys_rsx] iomap io=0x00000000 <- ea=0x40100000 size=0x400000
-[cellGcmSys] SetDisplayBuffer(id=0, offset=0x310000, pitch=5120, 1280x720)
-[live-draw] display buffer 0 = loc0:0x00310000 pitch=5120 1280x720
-InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
-[spu-raw] image_load spu0: 3 segments, 84992 bytes into LS, NPC=0x00100
-[spu-raw] spu0 START pc=0x00100 ls=guest:0xE0000000 nonzero lines=1324/4096
-[spu-raw] spu0 out mbox = 0x00015010   <- the SPU's ready handshake
-[spu-raw] W spu0 +0x4400C = 0x40600000 <- and the PPU's first command to it
-App:Fonts Initialize Lv1 pass!
-[cellAudio] PortOpen(nChannel=2, nBlock=8) / Mixing thread started
-g_strTitle NPUI94304
-[sys_fs] open OK: .../dev_hdd0/game/NPUI94304/USRDIR/CONTENT/DOCUMENT.DAT
-TITLE ID : SCUS94304   /   InitMenuManual OK!! PageNum = 30
-target: /dev_hdd0/game/NPUI94304<0>
-REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
-[fps] 60.0
-```
-
-| Milestone | Status |
-|---|---|
-| Extract the PSN PKG | ✅ Done — needed new mixed-key support, see below |
-| Identify the real recomp target | ✅ Done — `ps1_netemu.self`, not a game EBOOT |
-| Decrypt the firmware SELF → ELF | ✅ Done — `rpcs3 --decrypt`, key rev `0x1C` |
-| Function discovery | ✅ Done — 3,512 |
-| NID / import resolution | ✅ Done — 103 imports, 12 libs, 83% named |
-| Extract the SPU modules | ✅ Done — 2 embedded ELFs, statically |
-| PPU lift → C++ | ✅ Done — 3,530 functions, 23 MB, **0 unhandled instructions** |
-| SPU lift → C | ✅ Done — 1,429 + 637 functions, both clean |
-| Build on the shared ps3recomp harness | ✅ Done — `tmpsn.exe`, 10.2 MB, first try |
-| First boot (recompiled CRT runs) | ✅ Done — the emulator's own banner prints |
-| Video/audio out negotiated | ✅ Done — 1280x720 @ 59.94 |
-| BIOS (`ps1_rom.bin`) loads | ✅ Done |
-| Live NV4097 → D3D12 engine comes up | ✅ Done — 60 fps, presenting |
-| `sys_rsx_*` syscalls | ✅ Done — `cellGcmInit` succeeds, FIFO drains, buffers registered |
-| `GPUCoreInit()` / `InitMenu` | ✅ Done |
-| Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ✅ Done — all 5 SPUs load, run and handshake |
-| Emulator subsystems (font/audio/pad/VMC/CD-ROM/NP) | ✅ Done — all initialise |
-| Input (the pad read) | ✅ Done — confirmed against RPCS3's `sys_io_3733EA3C` |
-| Launch arguments (the nine the VSH passes) | ✅ Done — title, region, disc target, manual all read |
-| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — `_xcdrom_thread` waits on a semaphore that was never created |
-| Twisted Metal renders | ⬜ |
-
-### The blocker: it thinks it is already running
-
-`groups[seen=0 exec=0]` — no geometry has ever reached the renderer, and the window is
-still the clear colour. But the emulator is not stuck. Its main loop is:
-
-```
-func_000B13F8:  clear the R3000-exit flag
-  loop:         cellSysutilCheckCallback()
-                if (exit_flag == 0) { sys_timer_usleep(16666); goto loop; }
-                ...shutdown...
-```
-
-That is the *game is running* loop — it exits only when `R3000Exit(): PS1_EXIT_STOP`
-sets the flag. So `ps1_netemu` believes it has a disc and is emulating it. It has simply
-never been told which one: **nothing ever opens `EBOOT.PBP`.**
-
-The lead is `argv`. The emulator imports **no `cellGame` at all** (12 libraries, none of
-them `cellGame`), so its content path cannot come from `cellGameContentPermit` — on
-hardware the VSH passes it on the command line, and the emulator does echo what it gets
-(`argc=%d` / `argv[%d]=%s`, printed at boot). The harness hardcodes a single
-`argv[0] = /dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN` (overridable with `YDKJ_BOOTPATH`), which
-is right for a disc title and meaningless to this one. Two details to settle before
-guessing: the emulator's argv walker reads **32-bit** pointers (`lwz r5,0(r9)` /
-`addi r9,r9,4`) while the harness writes 64-bit slots, and nobody has yet established what
-the VSH actually passes.
-
-Two smaller things fixed on the way:
-
-- **The pad read is served now.** `sys_io`'s sixth import `0x3733EA3C` is unnamed (it is
-  *not* `cellPadGetData`, `0x8B72CDA1`, and matched none of ~120 candidate spellings), but
-  its call site gives the contract exactly: `(u32 port, u32* extra, CellPadData* data)`,
-  from a 136-byte per-port slot laid out `{ CellPadData data; u32 extra; }`. Served from
-  the runtime's own `cellPadGetData` in [`src/hle_overrides.c`](src/hle_overrides.c).
-- **`cellGame` now reports a real title id.** The harness reads it from
-  `<vfs>/PS3_GAME/PARAM.SFO`, which our layout did not have, so it kept the `BLES00000`
-  placeholder. Note the PSOne-Classic wrinkle: the SFO's `TITLE_ID` is the **PS1 serial**
-  (`SCUS94304`), while the content directory is named from the content id (`NPUI94304`) —
-  so "title id == directory name" does not hold for this category.
-
-Also open: `sys_interrupt_thread_establish` (84) and `eoi` (88) are still stubs (the PPU
-polls, so nothing has needed them), and the `0x300`/`0x301`/`0x302` attribute packets
-(tiles, Z-cull) are accepted but ignored, which will matter once geometry is drawn.
-
-See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 
 ## 🔧 Toolchain changes upstreamed to ps3recomp
 
@@ -328,6 +222,12 @@ See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 - **`runtime/ppu/ppu_loader.cpp` — `PS3_SCTRACE` now covers the stub path**, which it
   had skipped: it traced everything *except* the unimplemented syscalls, i.e. exactly
   the ones a trace is wanted for. Finding the RSX call contract needed this.
+- **`libs/codec/cellAdec.c` — `cellAdecOpen` had the wrong arity.** Five parameters where
+  the real one takes four (the guest's `CellAdecCb` struct split in two), so `handle` was
+  read from `r7` instead of `r6` and every open failed `ARG`. Confirmed against RPCS3.
+- **`runtime/syscalls/sys_semaphore.c` — `SEM_BADID=1`.** On a wait/post against an id that
+  was never created, report the caller and its pointer-shaped registers once per (id, lr).
+  The id says nothing; where the guest *read* it from is the whole diagnosis.
 - **`runtime/ppu/ppu_loader.cpp` — `PS3_ARGV`, multiple guest arguments.** It wrote
   exactly one, which is all a disc title needs and nowhere near enough for a firmware
   module launched by the VSH. Layout matches lv2 (64-bit BE pointer slots, NULL-terminated,

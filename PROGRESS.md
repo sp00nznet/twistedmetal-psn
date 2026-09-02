@@ -18,7 +18,8 @@
 | 10b. Raw SPU | `sys_raw_spu_*` + `0xE0000000` MMIO | ✅ — all 5 SPUs load, run and handshake |
 | 11. BIOS | `ps1_rom.bin` loads | ✅ |
 | 11b. Launch args | the nine the VSH passes a PSOne Classic | ✅ — title, region, target, manual read |
-| 12. Disc | `EBOOT.PBP` mounts, PS1 executable loads | ⬜ — blocked: cdrom thread waits on an uncreated semaphore |
+| 12. Disc | image opened (`ISO.BIN.EDAT`) | ✅ — unblocked by the `cellAdecOpen` ABI fix |
+| 12b. NPDRM | EDAT decryption + `sceNpDrmIsAvailable` | ⬜ — blocked here: `ExitPS1(): code=3` |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -596,15 +597,80 @@ Also worth recording: syscalls **90-94 are the semaphore family** (`create`, `de
 The first read of that trace mistook them for the event-queue family because our own table
 puts event queues at 128+; the numbers in the table are right, the reading was not.
 
+
+### 2026-09-01 (late night) — The disc opens: one wrong function signature
+
+`_xcdrom_thread` was spinning 158,738 times on `sys_semaphore_wait` with id 0. Four steps
+from there to the cause, each one narrowing the search rather than guessing:
+
+**1. Which object?** Added `SEM_BADID=1` to `sys_semaphore.c`: on a wait/post against an id
+that was never created, report the caller and every pointer-shaped register once per
+(id, lr). The id itself says nothing — where the guest *read* it from is the diagnosis.
+It gave `r26 = 0x00764000`, `r31 = 0x003B4000`; the code computes `addis r26, r31, 0x3B`,
+so the missing ids live at `0x76B0B8`/`0x76B0BC` of a TOC-global object.
+
+**2. Which creator?** That is a `+0`/`+4` pair. Of the ten `sys_semaphore_create` sites in
+the image exactly one creates such a pair — `0xED5D4`/`0xED600`, inside `func_000ED3CC`,
+which reads the same TOC global (`-0x7AEC`), does `addis r30, r9, 0x3B` and memsets
+0x3B8000 bytes. The CD-ROM object's constructor.
+
+**3. Did it run?** The runtime's `[sem] create` line already prints the guest LR, and
+semaphore **id=8** carried `lr=0x000ED4D8` — the return address of the `bl` at `0xED4D4`,
+inside that constructor. So it ran and cleared its first three gates
+(`sys_net_initialize_network_ex`, `sceNpInit`, `cellAdecQueryAttr`). The bail had to be in
+the ~0x30 instructions between that create and the pair.
+
+**4. Which of the two exits?** That span has exactly two: `cellAdecOpen` returning non-zero,
+and a `memalign(128, 0x40000)` returning null. The log answered it — `[cellAdec]
+Open(codecType=5)` appeared but the `Open -> handle=` line that follows a success did not.
+
+**The bug.** `cellAdecOpen` takes **four** arguments, `(type, res, cb, handle)`. Ours took
+five, splitting the guest's `CellAdecCb` struct into separate `cbFunc` and `cbArg`
+parameters — `cb` is a *pointer* to `{ u32 cbFunc; u32 cbArg; }`, not two registers. That
+pushed `handle` off `r6` onto `r7`, which held whatever was left there, so the null check
+failed and **every** `cellAdecOpen` returned `CELL_ADEC_ERROR_ARG`. The call site says the
+same thing outright: `r5 = r1+128`, and the two words written there just before the call
+(`stw r11,0x80(r1)` / `stw r25,0x84(r1)`) are a two-field struct built on the stack. RPCS3
+has the four-argument form at `Modules/cellAdec.cpp:1577`.
+
+`ps1_netemu` opens a decoder for CD-DA / XA-ADPCM audio *inside its CD-ROM constructor*,
+so one wrong parameter list meant no disc — and it presented three subsystems away, as a
+thread spinning on a semaphore that was never created.
+
+**With it fixed, the disc opens:**
+
+```
+[cellAdec] Open(codecType=5, cb=0xD0022C80, handle=0x0076A700)
+[cellAdec] Open -> handle=0
+slot1 = NULL / slot2 = NULL
+load config file: /USRDIR/    -> EISDIR, "failed"   (non-fatal, see below)
+[hle] unresolved NID 0xAD218FAF                      <- sceNpDrmIsAvailable
+[sys_fs] open OK: .../NPUI94304/USRDIR/ISO.BIN.EDAT  <- the disc
+ExitPS1(): code=3 <0>
+cell/host.c: 625: CoreBoot() failed
+```
+
+**The new wall is NPDRM.** `ISO.BIN.EDAT` is an encrypted EDAT. On lv2,
+`sceNpDrmIsAvailable(klicensee, path)` primes the kernel to decrypt that path
+*transparently*, so the following `cellFsOpen` returns plaintext. Ours is unimplemented,
+returns `CELL_OK`, and the plain open hands the emulator ciphertext — it reads a garbage
+header and exits with code 3.
+
+Confirmed by substitution rather than assumed: the archive's second package carries a
+DRM-free `ISO.BIN.EDAT` (NPD **version 3, license type 3** — the free form — against
+retail's version 1 / type 2, which is bound to a console key). Swapping it in changes
+nothing, because nothing decrypts *either* form yet.
+
 ## Next steps
 
-1. **Find what skips the CD-ROM object's construction.** The creator at `0x10FEC8` has a
-   single caller (`0xD8080`) and is called unconditionally there, so the instance that
-   never gets its semaphores is built somewhere else. A store watchpoint on the failing
-   object's `+0x70B8` would name the writer that never ran; `PPU_WW`/`LBP_WW` already does
-   exactly that.
-2. Then: `EBOOT.PBP` → `PSISOIMG0000` mount, R3000 execution, geometry.
-3. Still open: `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs; attribute
-   packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) accepted and ignored; four NIDs remain
-   unresolved and none has been shown to matter (`cellAudioSetPortLevel` `0x56DFE179`,
-   `cellAdecQueryAttr` `0x7E4A4A49`, cellL10n `0xFDBF6AC5`, cellSysutil `0x1DFCCE99`).
+1. **EDAT decryption in the FS layer, plus `sceNpDrmIsAvailable` to arm it.** RPCS3's
+   `Crypto/unedat.cpp` is the oracle and already handles exactly the case the free EDAT
+   uses (`npd->version == 3`, `(npd->license & 3) == 3`, `validate_dev_klic`), so no
+   per-title RAP is needed for that form. `tools/ps3sce/` in this tree carries the same
+   AES/SHA1 primitives.
+2. Then: `PSISOIMG0000` mount, R3000 execution, geometry.
+3. Smaller, open: a bare `/USRDIR/` config path resolves to the VFS root and fails
+   `EISDIR` (the emulator prints `failed` and continues, so not blocking, but the mapping
+   is wrong); `cellAdecQueryAttr` (`0x7E4A4A49`) returns `CELL_OK` with its attr struct
+   untouched; `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs; attribute
+   packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) accepted and ignored.
