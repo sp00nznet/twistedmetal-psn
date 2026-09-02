@@ -15,7 +15,7 @@
 | 8. Shared harness | Build on ps3recomp's boot harness | ✅ — `tmpsn.exe`, linked first try |
 | 9. First boot | Enter the recompiled CRT | ✅ — the emulator's own banner prints |
 | 10. Graphics | `sys_rsx_*` → live NV4097 → D3D12 | ✅ — FIFO drains, buffers registered, 60 fps |
-| 10b. Raw SPU | `sys_raw_spu_*` + `0xE0000000` MMIO | ⬜ — blocked here |
+| 10b. Raw SPU | `sys_raw_spu_*` + `0xE0000000` MMIO | ✅ — all 5 SPUs load, run and handshake |
 | 11. BIOS | `ps1_rom.bin` loads | ✅ |
 | 12. Disc | `EBOOT.PBP` mounts, PS1 executable loads | ⬜ |
 | 13. Render | Twisted Metal on screen | ⬜ |
@@ -217,7 +217,7 @@ Two unimplemented kernel areas, both identified precisely:
    problem-state status register for SPU 0. Both lifted SPU entries are already registered
    in `src/spu_images.c`, waiting for a dispatcher.
 
-## Next steps
+### What was next at that point (both since done)
 
 1. `sys_rsx_*` in `runtime/syscalls/`, wired to the existing FIFO drain and
    `rsx_live_draw`. Unblocks graphics.
@@ -317,13 +317,104 @@ InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
 The screen is still black, which is expected: `clears[guest=1]` is the only thing
 drawn, because the emulator core has not started. No geometry exists yet.
 
+
+### 2026-09-01 (evening) — Raw SPU: all five cores running
+
+**Phase 10b — COMPLETE.** Every raw SPU the emulator asks for comes up: four running the
+86 KB GPU core (the banner's `-sgpu-sli4` is literal — a four-way SPU GPU) and one running
+the 59 KB second module. Each loads its image, starts at its ELF entry, writes its ready
+word to the outbound mailbox, and takes command words back. `ps1_netemu` then completes its
+whole subsystem bring-up — fonts, `cellAudio` port open + mixing thread, `cellPad` across
+seven ports, `_xMcThread` (memory card), `_xcdrom_thread`, `sceNp`, `cellAdec` — and idles
+at 60 fps.
+
+Written as `ps3recomp/runtime/spu/spu_raw.c`. Full write-up in
+[`docs/raw-spu.md`](docs/raw-spu.md); the short version is four failures, each hiding the
+next.
+
+**1. The syscalls.** Numbers read off the call sites: 150 `create_interrupt_tag`,
+151/152 `set/get_int_mask`, 153/154 `set/get_int_stat`, 160 `create`, 161 `destroy`,
+163 `read_puint_mb`. 163 was identified from how it is used rather than by name — the
+interrupt thread does `get_int_stat(id,2,&st); if (st & 1) { 163(id,&v);
+set_int_stat(id,2,1); }`, which is the read half of a class-2 mailbox interrupt.
+
+**2. `sys_raw_spu_image_load` is not a syscall.** With every syscall implemented the SPU
+started and stopped after **two instructions** at pc 0, with local store all zeros
+(`nonzero lines=0/4096`). Nothing had loaded the image. libsysutil exports the load, so it
+arrived as a NID and the stub logged one line and returned success. It was already in the
+trace, between the import and the run:
+
+```
+[hle] unresolved NID 0xB995662E   = sys_raw_spu_image_load
+[hle] unresolved NID 0xE0DA8EFD   = sys_spu_image_close
+```
+
+Both identified by computing NIDs for candidate names against those two values. Implementing
+the load (walk the descriptor's segment array, COPY/FILL into the window, set NPC) brought
+local store up to `84992 bytes, 1324/4096 nonzero lines`.
+
+**3. Both SPU images had been lifted at the wrong base — my error, now a hard error.**
+`spu_lifter.py` has two modes and the difference is silent: given an ELF positionally with
+`--functions`, it reads the file as a **raw image at base 0**, so the ELF header becomes the
+first instructions and every function lands at its **file offset**. This image is
+`p_offset 0x100` / `p_vaddr 0x80`, so everything sat 0x80 low and the SPU executed the wrong
+instructions — code that compiled, linked and ran. The tell was the entry: LS 0x100 is
+`ila $r8, 0x3FFD0`, a stack-pointer setup and a plausible `_start`, but the lifted
+`spu_func_00000100` began `ila $r2, 0xC6D0`. `--auto-functions` parses the ELF and lifts at
+the load address. The lifter now refuses the ambiguous combination outright.
+
+**4. A published register went stale and deadlocked both sides.** With correct code the SPU
+booted, handshook (`out mbox = 0x00015010`), the PPU read it and sent one command word — and
+then both waited forever. `SPU_MBox_Status` was being *published* into guest memory on MMIO
+operations, but the SPU consumes its inbound mailbox on its own thread through the channel
+layer, touching no MMIO path — so the published copy still read "0 free slots" after the SPU
+had drained it. The PPU never sent a second word; the SPU waited for one. Derived registers
+(`SPU_MBox_Status`, `SPU_Status`) are now computed on read.
+
+**One structural change to the runtime.** `spu_context.ls` was a 256 KB array inside the
+context. A raw SPU's local store cannot be a private copy: lv2 maps it into the process and
+the PPU writes the SPU's code and command buffers there *while it runs*, so copy-in/copy-out
+would race every frame. `ls` is now a pointer — `ls_store` for every other context,
+`vm_base + window` for a raw SPU. Every `ctx->ls[i]` / `&ctx->ls[i]` / `ctx->ls + n` in the
+runtime still compiles and means the same thing.
+
+**A fingerprint footnote.** `spu_workload_fingerprint()` says FNV-1a-64 but its offset basis
+is `1469598103934665603` — one digit short of the real `14695981039346656037`. The
+constants in `src/spu_images.c` had been computed with the canonical basis and matched
+nothing. It is only a hash and every shipped port is already keyed to it, so match it rather
+than "fix" it; but it does mean those constants cannot be reproduced by a stock FNV-1a-64.
+
+**Measured:**
+
+```
+[spu-raw] create -> raw spu 0, window 0xE0000000
+[spu-raw] image_load spu0: 3 segments, 84992 bytes into LS, NPC=0x00100
+[spu-raw] spu0 START pc=0x00100 ls=guest:0xE0000000 image=1 nonzero lines=1324/4096
+[spu-raw] spu0 out mbox = 0x00015010      R spu0 OUT_MBOX -> 0x00015010
+[spu-raw] W spu0 +0x4400C = 0x40600000    W spu0 +0x4400C = 0x00D70E80
+   ... spu1, spu2, spu3 identically ...
+[spu-raw] create -> raw spu 4, window 0xE0400000
+[spu-raw] image_load spu4: 3 segments, 58208 bytes into LS, NPC=0x000E0
+[spu-raw] spu4 out mbox = 0x0000E500
+[spu-raw] W spu4 +0x5C00C = 0x60000000 / 0x60000800 / 0x60001000 ...   (SigNotify2)
+App:Fonts Initialize Lv1 pass!
+[cellAudio] PortOpen(nChannel=2, nBlock=8) / Mixing thread started
+[fps] 60.0
+```
+
+The screen is still black, and `groups[seen=0 exec=0]` says why: no geometry has reached
+the renderer. The emulator has not loaded the disc.
+
 ## Next steps
 
-1. **Raw SPU.** `sys_raw_spu_create` (160) + the `0xE0000000` MMIO problem-state window,
-   dispatching to the lifted images registered in `src/spu_images.c`. This is the
-   blocker for everything visible.
-2. `/dev_flash/data/font/SCE-PS3-RD-R-LATIN2.ccd` is missing from the dev_flash tree
-   (only the `.TTF` set is installed), so the menu has no font to render with.
-3. Attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) are accepted and ignored;
-   they affect surface layout and will matter once geometry is drawn.
-4. Then: disc mount (`EBOOT.PBP` → `PSISOIMG0000`), input, audio, memory cards.
+1. **Find what drives the menu.** The strongest candidate is input: `sys_io` imports six
+   functions and the sixth, `0x3733EA3C`, is unnamed — not `cellPadGetData`
+   (`0x8B72CDA1`), and no match across ~120 candidate names. `xPadThread` polls it in a
+   loop and gets nothing, so the menu would be waiting on a button press that never comes.
+   Naming it (a firmware symbol dump, or matching the call shape against libpad) is the
+   next concrete step.
+2. Disc mount (`EBOOT.PBP` → `PSISOIMG0000`) once something starts the game.
+3. `sys_interrupt_thread_establish` (84) / `eoi` (88) are still stubs. Nothing has needed
+   them — the PPU polls — but the class-2 mailbox interrupt path is only half-built.
+4. Attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) are accepted and ignored;
+   they affect surface layout once geometry is drawn.

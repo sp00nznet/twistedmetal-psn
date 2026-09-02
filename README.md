@@ -102,11 +102,13 @@ EDAT/PSAR handling, exactly as it does on hardware.
 
 ## 🎯 Status
 
-**It boots, and the GPU is up.** The recompiled PS1 emulator runs its own startup,
-negotiates video and audio, loads the PS1 BIOS, brings RSX up through the kernel,
-drains its own command FIFO into the live NV4097 → D3D12 engine, registers both
-display buffers, and gets through `InitMenu` at a steady 60 fps. One gap stops it
-there: the raw SPU that runs the emulator core.
+**It boots, the GPU is up, and all five SPUs are running.** The recompiled PS1
+emulator runs its own startup, negotiates video and audio, loads the PS1 BIOS, brings
+RSX up through the kernel, drains its own command FIFO into the live NV4097 → D3D12
+engine, starts its five raw SPUs (four GPU cores — the banner says `-sgpu-sli4` — plus
+the second module), and completes its whole subsystem bring-up: fonts, audio mixing
+thread, pad, memory card, CD-ROM thread, NP, ATRAC. It idles there at 60 fps without
+loading the disc.
 
 ```
 PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
@@ -120,6 +122,12 @@ REGION NUM = 0x00000081 code=A
 [cellGcmSys] SetDisplayBuffer(id=0, offset=0x310000, pitch=5120, 1280x720)
 [live-draw] display buffer 0 = loc0:0x00310000 pitch=5120 1280x720
 InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
+[spu-raw] image_load spu0: 3 segments, 84992 bytes into LS, NPC=0x00100
+[spu-raw] spu0 START pc=0x00100 ls=guest:0xE0000000 nonzero lines=1324/4096
+[spu-raw] spu0 out mbox = 0x00015010   <- the SPU's ready handshake
+[spu-raw] W spu0 +0x4400C = 0x40600000 <- and the PPU's first command to it
+App:Fonts Initialize Lv1 pass!
+[cellAudio] PortOpen(nChannel=2, nBlock=8) / Mixing thread started
 [fps] 60.0
 ```
 
@@ -140,23 +148,28 @@ InitMenu Start c1d00000 / InitMenuManual / InitMenu End c36e2000
 | Live NV4097 → D3D12 engine comes up | ✅ Done — 60 fps, presenting |
 | `sys_rsx_*` syscalls | ✅ Done — `cellGcmInit` succeeds, FIFO drains, buffers registered |
 | `GPUCoreInit()` / `InitMenu` | ✅ Done |
-| Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ⬜ **blocker** — spins on the SPU status register |
-| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ |
+| Raw SPU (`sys_raw_spu_*` + `0xE0000000` MMIO) | ✅ Done — all 5 SPUs load, run and handshake |
+| Emulator subsystems (font/audio/pad/VMC/CD-ROM/NP) | ✅ Done — all initialise |
+| Disc mounts (`EBOOT.PBP` → `PSISOIMG0000`) | ⬜ **blocker** — never attempted; nothing drives the menu |
 | Twisted Metal renders | ⬜ |
-| Input / audio / memory cards | ⬜ |
+| Input | ⬜ — see below |
 
 ### The blocker
 
-**No raw-SPU path.** `_sys_spu_image_import` already accepts SPU image 0 (the one at
-`0x181100` we lifted), but `sys_raw_spu_create` (160) is a stub and nothing runs the
-image, so the emulator core spins forever reading the SPU status register at
-`0xE0044014`. The lifted entries are registered and waiting in `src/spu_images.c`.
-That is what will produce geometry — the graphics side is ready for it.
+**Nothing drives the menu, so the disc is never loaded.** `groups[seen=0 exec=0]` — no
+geometry has reached the renderer, and the window is still the clear colour.
 
-Also open, smaller: the menu asks for `/dev_flash/data/font/SCE-PS3-RD-R-LATIN2.ccd`,
-which is not in the installed dev_flash tree (only the `SCE-PS3-*.TTF` set is), and the
-`0x300`/`0x301`/`0x302` attribute packets (tiles, Z-cull) are accepted but ignored,
-which will matter for surface layout once real geometry is drawn.
+The best candidate is input. `sys_io` imports six functions; five resolve to
+`cellPadInit` / `End` / `SetPortSetting` / `GetInfo2` / `SetActDirect`, and the sixth —
+`0x3733EA3C` — is unnamed. It is **not** `cellPadGetData` (`0x8B72CDA1`), and it did not
+match any of ~120 candidate names, so it is a firmware-internal pad read. The emulator's
+`xPadThread` polls it in a loop and gets nothing back, which would leave the menu waiting
+on a button press that can never arrive.
+
+Also open, smaller: `sys_interrupt_thread_establish` (84) and `eoi` (88) are still stubs
+(the PPU polls instead, so nothing has needed them yet), and the `0x300`/`0x301`/`0x302`
+attribute packets (tiles, Z-cull) are accepted but ignored, which will matter for surface
+layout once real geometry is drawn.
 
 See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 
@@ -179,6 +192,15 @@ See [`PROGRESS.md`](PROGRESS.md) for the blow-by-blow.
 - **`runtime/ppu/ppu_loader.cpp` — `PS3_SCTRACE` now covers the stub path**, which it
   had skipped: it traced everything *except* the unimplemented syscalls, i.e. exactly
   the ones a trace is wanted for. Finding the RSX call contract needed this.
+- **`runtime/spu/spu_raw.c` — new, raw SPUs.** The `0xE0000000` MMIO window plus
+  `sys_raw_spu_*`, and `sys_raw_spu_image_load` — which is not a syscall, so its stub NID
+  left local store full of zeros and the SPU "ran" straight into them. `spu_context.ls`
+  became a pointer so a raw SPU's local store can BE the guest window rather than a copy
+  the PPU races. See [`docs/raw-spu.md`](docs/raw-spu.md).
+- **`tools/spu_lifter.py` — refuse an ELF passed as a raw image.** Given positionally with
+  `--functions` and no `--base`, it lifts the ELF *header* as code and puts every function
+  at its file offset instead of its local-store address. It compiles, links and runs the
+  wrong instructions. Now an error naming `--auto-functions`.
 - **`runtime/syscalls/sys_fs.c` — `/dev_flash` served from a real firmware tree.**
   `ppu_fs.cpp` already had this branch (`$PS3_DEV_FLASH`); the raw-syscall half of the
   split filesystem did not, so a firmware path opened through `sys_fs` resolved under the

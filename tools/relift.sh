@@ -31,12 +31,17 @@ python "$PS3RECOMP/tools/gen_hle_nids.py" --all --out src/gen/ppu_hle_nids.cpp
 # (the R3000/GTE and GPU cores), so they extract statically -- no SPU_DUMP_MISS
 # capture run needed.
 python "$PS3RECOMP/tools/extract_spu_images.py" "$ELF" --out analysis/spu
+#
+# --auto-functions, not --functions: it makes the lifter parse the ELF, so the
+# code lands at its LOCAL STORE address. Handing the same ELF in positionally
+# with --functions reads it as a raw image at base 0, which silently puts every
+# function at its FILE OFFSET instead -- here that is LS+0x80 (p_vaddr 0x80,
+# p_offset 0x100), so the SPU entry ran the wrong instructions and stopped after
+# two of them. The lifter now refuses that combination outright.
 i=0
 for img in analysis/spu/*.elf; do
     pfx="spu$i"; i=$((i+1))
-    python "$PS3RECOMP/tools/find_spu_functions.py" "$img" --out "analysis/spu/${pfx}_funcs.json"
     rm -rf "src/spu_gen/$pfx" && mkdir -p "src/spu_gen/$pfx"
-    python "$PS3RECOMP/tools/spu_lifter.py" "$img" \
-        --functions "analysis/spu/${pfx}_funcs.json" \
+    python "$PS3RECOMP/tools/spu_lifter.py" "$img" --auto-functions "$img" \
         --symbol-prefix "${pfx}_" -o "src/spu_gen/$pfx"
 done

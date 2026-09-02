@@ -21,12 +21,12 @@ void tmpsn_spu_register_all(void)
 {
     /* Embedded SPU ELF at vaddr 0x181100, 86,452 B, entry 0x100. */
     spu_begin_image(1); spu0_spu_recomp_register();
-    spu_workload_register_img(0x3BBE265426524921ULL, spu0_spu_func_00000100,
+    spu_workload_register_img(0x5BCAF5D9B58AB103ULL, spu0_spu_func_00000100,
                               1, "ps1_netemu_spu0");
 
     /* Embedded SPU ELF at vaddr 0x19A200, 59,580 B, entry 0xE0. */
     spu_begin_image(2); spu1_spu_recomp_register();
-    spu_workload_register_img(0x9AF43B28CD836733ULL, spu1_spu_func_000000E0,
+    spu_workload_register_img(0x85B3AE0C8712C641ULL, spu1_spu_func_000000E0,
                               2, "ps1_netemu_spu1");
 }
 
