@@ -109,7 +109,7 @@ NV4097 → D3D12 engine, starts its five raw SPUs (four GPU cores — the banner
 `-sgpu-sli4` — plus the second module), completes its whole subsystem bring-up, and —
 once given the nine command-line arguments the VSH passes a PSOne Classic — reads the
 package: title, region, disc target, and the 30-page manual out of `DOCUMENT.DAT`. It
-opens the disc image. It stops at the DRM layer.
+opens and DECRYPTS the disc image. It stops one step later, mounting it.
 
 ```
 PS1 emulator Build Date 20/01/30/13:20 -sgpu-sli4 [titledb:r11624]
@@ -160,41 +160,38 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Launch arguments (the nine the VSH passes) | ✅ Done — title, region, disc target, manual all read |
 | CD-ROM subsystem starts | ✅ Done — was one wrong function signature (`cellAdecOpen`) |
 | Disc image opened (`ISO.BIN.EDAT`) | ✅ Done |
-| Disc **decrypted** (NPDRM / EDAT) | ⬜ **blocker** — `ExitPS1(): code=3`; nothing decrypts the EDAT |
+| Disc **decrypted** (NPDRM / EDAT) | ✅ Done — `PSISOIMG0000`, serial `_SCUS_94304` |
+| Disc image mounts (track count > 0) | ⬜ **blocker** — mount succeeds but the track count stays 0 |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
 
-It opens the disc and stops at the DRM layer:
+The disc decrypts and the emulator opens it, then still exits:
 
 ```
-[cellAdec] Open -> handle=0
-[hle] unresolved NID 0xAD218FAF                      <- sceNpDrmIsAvailable
-[sys_fs] open OK: .../NPUI94304/USRDIR/ISO.BIN.EDAT  <- the disc
+[edat] ...ISO.BIN.EDAT: version=3 license=3 flags=0x00000000 block=0x4000 size=1048616
+[edat] klicensee NP_PSX_KEY verified against dev_hash
+[edat] decrypted 1048616 bytes -> ...ISO.BIN.EDAT.dec
+[sys_fs] open OK: ...ISO.BIN.EDAT.dec
 ExitPS1(): code=3 <0>
-cell/host.c: 625: CoreBoot() failed
 ```
 
-`ISO.BIN.EDAT` is an encrypted EDAT. On lv2, `sceNpDrmIsAvailable(klicensee, path)` primes
-the kernel to decrypt that path *transparently*, so the following `cellFsOpen` returns
-plaintext. Ours is unimplemented and returns `CELL_OK`, so the plain open hands the
-emulator ciphertext; it reads a garbage header and exits with code 3. Confirmed by
-substitution — the archive's second package carries a DRM-free `ISO.BIN.EDAT` (NPD version
-3, license type 3, versus retail's version 1 / type 2) and it fails identically, because
-nothing decrypts *either* form yet.
+The exit is exact. At `0x110E20` the emulator mounts the image (`bl 0xEE018`, which
+*succeeds*), then reads a count back — `func_000ED2E0` is three instructions returning
+`*(s32*)(cdrom_obj + 0x70D8)` — and gives up with code 3 when it is not positive. So the
+image mounts and the track count stays zero.
 
-The fix is EDAT decryption in the FS layer plus `sceNpDrmIsAvailable` to arm it. RPCS3's
-`Crypto/unedat.cpp` handles exactly the free-license case (`version == 3`,
-`(license & 3) == 3`), so no per-title RAP is needed for that form.
+The plaintext suggests why: it is **1,048,616 bytes with only 161 of its 2049 512-byte
+blocks non-zero** — `PSISOIMG0000`, the serial `_SCUS_94304` at 0x400 and a CD TOC at
+0x800, but no 300 MB of disc. This package is the hybrid PSP/PS3 form: the real image is
+the 68 MB `DATA.PSAR` inside `USRDIR/CONTENT/EBOOT.PBP`, which nothing in the run opens.
+Next measurement is `func_0000EE018` itself. Detail: [`docs/npdrm.md`](docs/npdrm.md).
 
-**What unblocked the CD-ROM subsystem was one wrong function signature.** Ours took five
-arguments where `cellAdecOpen` takes four, splitting the guest's `CellAdecCb` struct into
-separate `cbFunc`/`cbArg` parameters — which pushed `handle` off `r6` onto `r7`, so the
-out-pointer read as zero and *every* open returned `CELL_ADEC_ERROR_ARG`. `ps1_netemu`
-opens a decoder for CD-DA / XA audio inside its CD-ROM constructor, so one wrong parameter
-list meant no disc — presenting as a thread spinning 158,738 times on a semaphore that was
-never created. The trail from that spin to the signature is in
-[`docs/disc-path.md`](docs/disc-path.md).
+**Note on which `ISO.BIN.EDAT` to use.** The retail file is license type 2: `NP_PSX_KEY`
+verifies against its `dev_hash`, but the *data* is under the RIF key from a per-console RAP,
+so every block hash fails. The archive's second package carries the same file as license
+type 3, where the klicensee is the file key — that one decrypts, and it is what `vfs/`
+should hold.
 
 Also open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
 (non-fatal — the emulator prints `failed` and continues); `cellAdecQueryAttr`
@@ -222,6 +219,11 @@ Also open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EIS
 - **`runtime/ppu/ppu_loader.cpp` — `PS3_SCTRACE` now covers the stub path**, which it
   had skipped: it traced everything *except* the unimplemented syscalls, i.e. exactly
   the ones a trace is wanted for. Finding the RSX call contract needed this.
+- **`libs/filesystem/edat.c` — new, NPDRM (EDAT/SDAT) decryption.** A file beginning
+  `NPD ` is decrypted once into a cache file and that is opened in its place, so every
+  read/seek/stat path stays unchanged. Self-contained AES-128 + AES-CMAC (no new
+  dependency), with the FIPS-197 and RFC 4493 vectors checked before first use and every
+  block's CMAC verified. See [`docs/npdrm.md`](docs/npdrm.md).
 - **`libs/codec/cellAdec.c` — `cellAdecOpen` had the wrong arity.** Five parameters where
   the real one takes four (the guest's `CellAdecCb` struct split in two), so `handle` was
   read from `r7` instead of `r6` and every open failed `ARG`. Confirmed against RPCS3.

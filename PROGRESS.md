@@ -19,7 +19,8 @@
 | 11. BIOS | `ps1_rom.bin` loads | ✅ |
 | 11b. Launch args | the nine the VSH passes a PSOne Classic | ✅ — title, region, target, manual read |
 | 12. Disc | image opened (`ISO.BIN.EDAT`) | ✅ — unblocked by the `cellAdecOpen` ABI fix |
-| 12b. NPDRM | EDAT decryption + `sceNpDrmIsAvailable` | ⬜ — blocked here: `ExitPS1(): code=3` |
+| 12b. NPDRM | EDAT decryption | ✅ — `PSISOIMG0000`, serial `_SCUS_94304` |
+| 12c. Mount | image mounts with a non-zero track count | ⬜ — blocked here: `ExitPS1(): code=3` |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -661,16 +662,75 @@ DRM-free `ISO.BIN.EDAT` (NPD **version 3, license type 3** — the free form —
 retail's version 1 / type 2, which is bound to a console key). Swapping it in changes
 nothing, because nothing decrypts *either* form yet.
 
+
+### 2026-09-02 — NPDRM: the disc decrypts
+
+`ISO.BIN.EDAT` now comes back as `PSISOIMG0000` with the PS1 serial `_SCUS_94304` in its
+header, transparently, through the ordinary filesystem path.
+
+**Where it belongs.** The guest never decrypts an EDAT itself: it calls
+`sceNpDrmIsAvailable(klicensee, path)`, the kernel notes the path, and every later
+`cellFsOpen`/read returns plaintext. So this is a filesystem concern, not a guest one —
+`libs/filesystem/edat.c` decrypts a file beginning `NPD\0` once into a `<name>.dec` cache
+and opens that in its place. Path substitution rather than a read hook, which is why every
+read/seek/stat path above it stays unchanged and `sceNpDrmIsAvailable` can remain a no-op.
+
+**The format.** NPD header, then EDAT header (flags, block size, file size), then one
+0x10-byte CMAC per block at 0x100, then the encrypted blocks. Per block the key is
+`dev_hash[0..0xB]` (zeros for NPD version ≤ 1) plus the big-endian block index, AES-ECB
+encrypted under the file key; that result is both the AES-CBC key for the data and the
+AES-CMAC key for the block hash. IV is the NPD digest, or zeros for version ≤ 1.
+
+**The file says which key it wants.** `dev_hash` is `CMAC(klic ^ NP_OMAC_KEY_2)` over the
+header's own first 0x60 bytes, so rather than branching on content type, `edat.c` tries the
+published candidates and keeps the one that verifies. For a PSOne Classic that is
+**`NP_PSX_KEY`**.
+
+**A verified klicensee is not a decryptable file.** The retail `ISO.BIN.EDAT` is license
+type 2: `NP_PSX_KEY` verifies against its `dev_hash` and then every block hash fails,
+because the *data* is under the RIF key from a per-console RAP. That cost a round of
+debugging, so the code now says exactly that instead of reporting a hash mismatch. The
+archive's second package carries the same file as license type 3, where the klicensee *is*
+the file key — that one decrypts, and it is what `vfs/` should hold.
+
+**Three checks, because silently-wrong crypto is the expensive failure here.**
+`edat_selftest()` verifies AES-128 against FIPS-197 (both directions) and AES-CMAC against
+RFC 4493 before anything is decrypted; the `dev_hash` CMAC picks the klicensee; and every
+block's CMAC is checked, stopping the whole decryption and deleting the partial cache on a
+mismatch rather than writing garbage. The third one earned its keep immediately — it caught
+the NPD-version-1 rule (zero block-key seed, zero IV) by failing block 0 on the first
+attempt instead of producing a megabyte of noise.
+
+Scope: uncompressed EDATs with AES-CMAC block hashes. Compressed blocks, the 0x20/0x10
+metadata layouts, encrypted-ERK files, debug data and RAP-bound license types are refused
+by name rather than mis-handled. AES-128 and AES-CMAC are implemented in the file, so the
+runtime still has no crypto dependency.
+
+**Where it stops now.** The emulator opens the decrypted image and still exits `code=3`.
+The exit is exact — at `0x110E20`:
+
+```
+bl 0xEE018                ; mount the image -- returns >= 0, so this SUCCEEDS
+bl 0xED2E0                ; three instructions: return *(s32*)(cdrom_obj + 0x70D8)
+cmpwi cr7, r3, 0
+bgt  cr7, 0x110134        ; > 0 -> carry on
+li   r3, 3 ; bl ExitPS1   ; otherwise give up
+```
+
+The image mounts; the track/sector count at `+0x70D8` stays zero.
+
+The plaintext suggests why. It is 1,048,616 bytes with only **161 of its 2049 512-byte
+blocks non-zero**: `PSISOIMG0000`, the serial `_SCUS_94304` at 0x400, a CD TOC at 0x800 —
+and no 300 MB of disc. This package is the hybrid PSP/PS3 form, where the real image is the
+68 MB `DATA.PSAR` inside `USRDIR/CONTENT/EBOOT.PBP`, and nothing in the run opens that file.
+
 ## Next steps
 
-1. **EDAT decryption in the FS layer, plus `sceNpDrmIsAvailable` to arm it.** RPCS3's
-   `Crypto/unedat.cpp` is the oracle and already handles exactly the case the free EDAT
-   uses (`npd->version == 3`, `(npd->license & 3) == 3`, `validate_dev_klic`), so no
-   per-title RAP is needed for that form. `tools/ps3sce/` in this tree carries the same
-   AES/SHA1 primitives.
-2. Then: `PSISOIMG0000` mount, R3000 execution, geometry.
-3. Smaller, open: a bare `/USRDIR/` config path resolves to the VFS root and fails
-   `EISDIR` (the emulator prints `failed` and continues, so not blocking, but the mapping
-   is wrong); `cellAdecQueryAttr` (`0x7E4A4A49`) returns `CELL_OK` with its attr struct
+1. **Read `func_0000EE018`** (the mount) and find what it fills `cdrom_obj + 0x70D8` from,
+   and whether it is meant to open `EBOOT.PBP` for the sector data. That is the last
+   unknown between here and a PS1 executable running.
+2. Then: R3000 execution and geometry.
+3. Still open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
+   (non-fatal); `cellAdecQueryAttr` (`0x7E4A4A49`) returns `CELL_OK` with its attr struct
    untouched; `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs; attribute
    packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) accepted and ignored.
