@@ -1785,3 +1785,51 @@ quantified version of it.
 
 Option 1 is the one to do. Until then `PS3_SAMPLE` is honest only at module granularity, and
 the header comment in `ppu_loader.cpp` says so.
+
+### The profiler, fixed --- and the first trustworthy answer
+
+Merging `spu_channels.c`'s registry into the sampler's map was the fix. The gaps that used to
+swallow samples are now real entries, so `[entry, next_entry)` describes one function:
+
+```
+[samp] map: 3530 PPU + 2066 SPU entries
+[samp] 4964 samples, 428 in guest code (8.6%)
+[samp]    47.7%  spu_LS_00001268  (204)
+[samp]    26.2%  spu_LS_00000100  (112)
+[samp]     6.1%  spu_LS_0000893C  (26)
+[samp]     4.7%  spu_LS_00014BF0  (20)
+[samp]     3.5%  spu_LS_00009BA8  (15)
+[samp]     0.7%  func_00013040    (3)     <- the ONLY PPU code in the profile
+[samp] host  89.1%  ntdll.dll     (4423)
+```
+
+**Essentially all guest execution is SPU code. The PPU is idle** --- three samples out of 4,964.
+That is the opposite of what the broken tool said (99% in a PPU function), and it is consistent
+with everything measured independently: the R3000 executes <50k instructions, GPU packets stay
+at 6, and the main thread sits in a fence wait.
+
+`0x00000100` is image 1's **entry point** (`NPC=0x00100` in the load log), and `0x0000893C` is
+the audio SPU's loop already disassembled above. The dominant one, LS `0x1268` at 47.7%, is a
+spin on **local-store state**:
+
+```
+01268  nor   $r20, $r7, $r7
+0126C  lqr   $r8, 0x15010        ; load a quadword from LS 0x15010
+01274  ceq   $r19, $r84, $r8     ; compare it against r84
+01294  cgti  $r35, $r85, 0
+0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
+```
+
+So the four image-1 SPUs (the GPU cores) sit at their entry and in this loop, waiting on state
+in their own local store --- which on hardware the PPU writes through the raw-SPU LS window
+(`0xE0000000 + n*0x100000`). They are not deadlocked on a channel; they are polling memory that
+nothing updates.
+
+**That is the first concrete, validated statement of what the emulator is actually doing**, and
+it points somewhere specific: what should write LS `0x15010` (and the state behind `r84`/`r85`)
+on these SPUs, and why it never happens. Note it is *not* the same wait as the audio SPU's
+`rchcnt SPU_RdEventStat` at `0x893C` --- that one was fixed earlier and shows only 6.1% here.
+
+Worth stating plainly: this answer only exists because the tool was fixed after it produced a
+confident wrong one. The measured/inferred distinction earlier in this file applies to
+instruments too --- a profiler is not trustworthy because it is a profiler.

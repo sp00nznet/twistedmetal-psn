@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — not located; ~89% of the process is idle |
+| R3000 runs continuously | ⬜ **blocker** — GPU SPUs spin on local-store state nothing writes |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -234,37 +234,47 @@ spin polls are 43 us apart and `GCM_RATE=1` shows a steady **270 FIFO walks/sec*
 the poll loop nor the walk is starved --- the ~2 s is the guest's own work between fences, and
 the fence wait is a symptom.
 
-**Then the tool that was missing all along --- and a retraction.** Every probe here reports
-where a thread *blocks*; none could say where one spends time while *running*. `PS3_SAMPLE=<ms>`
-now samples thread RIPs. Its first answer was "99.1% of guest CPU in `func_00022F28`", and
-**that was my own tool lying**:
+**Then the tool that was missing all along --- which first lied, then answered.**
+`PS3_SAMPLE=<ms>` samples thread RIPs. Its first result, "99.1% of guest CPU in one PPU
+function", was an artefact: the function table holds **PPU functions only**, so SPU-lifted code
+sat in the gaps and an `[entry, next_entry)` extent blamed the preceding PPU function. (That
+the answer shifted from 5 threads to 4 when I tightened an unrelated bound should have been the
+tell.) Switching to exact `.pdata` lookup was no better --- a startup self-check reports
+`NO .pdata entry` for the lifted bodies, so that mode is blind to guest code and its `0` is a
+silent failure.
 
-| attribution | guest samples | top guest function |
-|---|---|---|
-| extent `[entry, next_entry)` | 446 / 4960 | `func_00022F28` **99.1%**, 5 threads |
-| extent capped at `0x20000` | 338 / 4949 | `func_00022F28` 98.8%, **4** threads |
-| exact, `RtlLookupFunctionEntry` | **0 / 4931** | **none** |
-
-The function table holds **PPU functions only**, so SPU-lifted and runtime code sit in the gaps
-and an extent span blames the preceding PPU function --- the "busy" threads were the raw-SPU
-workers. That the answer shifted from 5 threads to 4 when I adjusted an unrelated bound should
-itself have been the tell. And the exact mode is no better: a startup self-check reports
-`NO .pdata entry` for the lifted bodies, so it cannot see guest code at all and its `0` is a
-silent failure, not a measurement.
-
-**What survives** is the module split, which neither mode affects:
+The fix was merging `spu_channels.c`'s SPU registry into the map, so the gaps become real
+entries:
 
 ```
-[samp] host  89.2%  ntdll.dll     (4399)   <- threads parked in kernel waits
-[samp] host  10.5%  tmpsn.exe     (518)    <- runtime: RSX backend, SPU emulation
+[samp] map: 3530 PPU + 2066 SPU entries
+[samp] 4964 samples, 428 in guest code (8.6%)
+[samp]    47.7%  spu_LS_00001268  (204)
+[samp]    26.2%  spu_LS_00000100  (112)
+[samp]     6.1%  spu_LS_0000893C  (26)
+[samp]     0.7%  func_00013040    (3)      <- the ONLY PPU code in the profile
+[samp] host  89.1%  ntdll.dll     (4423)
 ```
 
-The process is **~89% idle**, and what work exists is host-side. Consistent with everything
-else measured, and the first quantified version of it.
+**Essentially all guest execution is SPU code; the PPU is idle** --- three samples out of 4,964.
+Consistent with every independent measurement (R3000 <50k instructions, packets at 6, main
+thread in a fence wait), and the exact opposite of what the broken tool said.
 
-**To make the sampler work**, merge `spu_channels.c`'s `s_registry` into the map so the gaps
-become real entries and extents mean something. Detail, and the full list of readings this
-session corrects, in [`docs/ps1-core.md`](docs/ps1-core.md).
+`0x100` is image 1's entry point. The dominant hot spot, LS `0x1268`, is a spin on **local-store
+state**:
+
+```
+0126C  lqr   $r8, 0x15010        ; load a quadword from LS 0x15010
+01274  ceq   $r19, $r84, $r8     ; compare against r84
+01294  cgti  $r35, $r85, 0
+0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
+```
+
+So the four image-1 SPUs --- the GPU cores --- sit at their entry and in this loop, polling
+memory nothing updates. On hardware the PPU writes that through the raw-SPU LS window
+(`0xE0000000 + n*0x100000`). **What should write LS `0x15010` on these SPUs, and why it never
+does, is the next question** --- and the first concrete one this project has had.
+Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
