@@ -2044,3 +2044,91 @@ The tool for that now exists and did not before: `PS3_SAMPLE` with the merged PP
 profile taken **during the first second**, rather than in the steady state, would show whether
 the interpreter is still executing when it stops dispatching --- which is the one thing every
 probe so far has been too late to catch.
+
+### ROOT CAUSE: the R3000 is idling in its wait loop, and nothing ever wakes it
+
+Sampling per-thread and then reading the guest `lr` on the main thread's last syscalls closes
+this completely. Every step below is measured except the last, which is read from the image.
+
+**1. The main thread is blocked, not spinning.** Per-thread module breakdown:
+
+```
+[samp] tid 20596  guest=4  ntdll=430  other=0        <- the MAIN guest thread
+[samp] tid 22272  guest=325 ntdll=0   other=...      <- an SPU worker, busy
+[samp] tid 11040  guest=0   ntdll=430 other=0        <- an idle PPU thread
+```
+
+Four guest samples across the whole run --- the brief BIOS execution --- and everything else
+parked in a kernel wait.
+
+**2. Its last syscalls are yields from inside the interpreter.** With the guest `lr` now on the
+syscall trace:
+
+```
+[sc] 43(...) tid=1 glr=0x001068F4   <- just after `bl 0x105FA8` at 0x1068F0
+[sc] 43(...) tid=1 glr=0x00106824   <- just after `bl 0x105FA8` at 0x106820
+[sc] 43(...) tid=1 glr=0x00106360   <- just after `bl 0x105FA8` at 0x10635C
+```
+
+Syscall 43 is `sys_ppu_thread_yield`, and all three return addresses are **inside
+`func_001066A8`/`func_0010621C`** --- the R3000 interpreter and its helper.
+
+**3. That third site is an idle loop.** In `func_0010621C`:
+
+```
+0010631C  stw r5, 0x120(r28)     ; store the scheduler's return into the CYCLE BUDGET
+00106328  bl  0xC2778            ; yield
+0010635C  bl  0x105FA8           ; event scheduler -> new budget in r3
+00106360  lwz r0, 0x138(r28)     ; the exit-reason field
+00106368  cmpwi cr7, r0, -1
+0010636C  beq cr7, 0x10631C      ; still -1 -> go round again
+```
+
+The interpreter runs its ~42,000 BIOS instructions, enters this loop, and stays: schedule,
+yield, check the reason, repeat. It is **waiting to be woken**, which is exactly why it stops
+dispatching, why it never returns, and why the profiler finds it in `ntdll` rather than burning
+CPU. Every symptom this investigation chased follows from this one state.
+
+**4. Only one thing can wake it, and it is never called.** `+0x138` is written from one place
+that stores a real reason --- `func_001058AC`:
+
+```
+001058B0  r0  = *(r11+0x138)     ; r11 = the R3000 state block
+001058B8  cmpwi r0, -1
+001058BC  bne -> skip            ; only set it if still unset
+001058C0  stw r3, 0x138(r11)     ; reason = the argument
+001058C4  ... then truncates the cycle accounting so the interpreter returns promptly
+```
+
+and it has **exactly one caller**, at `0x000C2730`, with `r3 = 7`:
+
+```
+000C2710  sld    r0, r0, r11     ; r0 = 1 << event_index
+000C270C  ori    r9, r9, 0x1111  ; the "does not wake" mask
+000C2718  and    r0, r0, r9
+000C271C  li     r3, 7
+000C2724  bgt    cr7, 0xC2730    ; index > 0x20 -> wake
+000C272C  bne    cr6, 0xC2750    ; bit in the mask -> just record it, do NOT wake
+000C2730  bl     0x1058AC        ; ** wake the R3000, reason 7 **
+```
+
+So the emulator wakes the R3000 only for events whose bit falls **outside** mask `0x1111`
+(bits 0, 4, 8, 12). Events inside the mask are recorded and the R3000 keeps sleeping.
+
+**The chain, complete:**
+
+```
+the emulator never delivers a waking event
+  -> func_001058AC(7) is never called, +0x138 stays -1
+     -> the R3000 idles in func_0010621C's loop, yielding forever
+        -> no game code runs, so GP0 is never written
+           -> the GP0 handler func_0010C48C never fires
+              -> the GPU SPUs get no command packets and spin
+                 -> no PS1 GPU output; the packet count stays at 6
+```
+
+**The next step is now specific**: instrument `0x000C2730`'s function to log every event index
+it is called with, and see which arrive and which the `0x1111` mask suppresses. The BIOS at
+this point is almost certainly waiting on the PS1 **vblank**, so if vblank's index is inside
+that mask --- or if no event of any kind reaches this function --- that is the bug, and it sits
+in the emulator's own timing/event plumbing rather than anywhere downstream.
