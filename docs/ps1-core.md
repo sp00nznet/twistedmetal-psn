@@ -836,3 +836,46 @@ So the next probe is not another interpreter dissection --- it is to log **every
 syscall made by guest thread 1** (semaphores, event queues, lwmutex, timers) with its guest
 `lr`, and read off the second wait the way the first one was read off. `[WAIT] semaphore_wait`
 already carries `cia`/`lr`; the event-queue and lwmutex paths would need the same treatment.
+
+### Correction: bit `0x04` is the GRAPHICS ERROR handler, not flip
+
+Driving `0x04` was wrong, and the guest said so plainly once its own stdout was reconstructed
+(it prints one character per line, so the text has to be reassembled):
+
+```
+[RSX dump analysis] unsupported error
+graphics error 0 : 00000000 00000000 ...
+undefined error message 00000000
+```
+
+followed by a full RSX state dump --- surfaces, textures, Z-cull --- **60 times a second**.
+Slot `r14+0x04` is the graphics-error handler. RPCS3's header has
+`SYS_RSX_EVENT_GRAPHICS_ERROR` commented out at `1 << 0`, which is what led me to assume bit 2
+had to be something else; it does not follow that numbering.
+
+So the mask `0x84` means this firmware registers a **graphics-error** handler and a
+**user-command** handler --- and **no vblank and no flip handler at all**. That breaks the
+chain I had drawn one link earlier than I thought: the flip semaphore is *not* posted by a gcm
+handler, so "publish the queue, tick it, the flip completes" was wrong reasoning even though
+the first half of it was right.
+
+The ticker is removed. There is nothing a timer can legitimately send here.
+
+**What survives, and is still correct:** publishing the queue id at `+0x12D0`. Without it the
+ISR thread received on queue 0 and *exited outright*; with it the thread stays alive and
+blocked on real events, which is what it should do. That is verified by its own metrics, and
+they hold with the ticker gone:
+
+| | no queue | queue published (no ticker) |
+|---|---|---|
+| `_gcm_intr_thread` | exits immediately | stays alive, blocked |
+| `semaphore_post(sem=1)` | 0 | 24 |
+| guest "graphics error" dumps | 0 | **0** (were flooding with the ticker) |
+
+`rsx_send_event` stays, with its handler-mask filter, for whoever wires up a genuine flip or
+user command.
+
+**Still not rendering.** GPU packets remain at 6. The open question is unchanged and now
+better posed: the main thread spins on `sys_ppu_thread_yield` (syscall 43) from inside the
+interpreter rather than blocking on a wait, so it is polling a memory location, not sleeping
+on a primitive. Finding *which* location is the next step.

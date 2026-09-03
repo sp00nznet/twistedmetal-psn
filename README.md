@@ -209,24 +209,29 @@ the R3000 still does not pass **50,000** dispatches, essentially where it stoppe
 the flip semaphore was a real deadlock and is genuinely cleared, but a second stall sits
 behind it that has not been found yet.
 
-**The lead paid off: the flip bit is `0x04`, not `0x02`.** The mask the guest publishes is
-`0x84`, and `rsx_send_event` filters by it, so a `SYS_RSX_EVENT_VBLANK` (`0x02`) tick was
-discarded outright. Reading `ps1_netemu`'s ISR --- it is a bit -> handler-slot table --- the
-only two handlers it ever registers are user-cmd (`0x80` -> `r14+0x2C`) and **`0x04`**
-(-> `r14+0x04`), so this firmware's libgcm hangs its flip callback off **bit 2**, not RPCS3's
-`SYS_RSX_EVENT_FLIP_BASE` (`1 << 3`). Sending `0x04` takes the ISR thread from **2** queue
-interactions to **333** --- it receives and cycles instead of blocking forever.
+**A correction: bit `0x04` is the GRAPHICS ERROR handler, not flip.** I drove it for a while
+on the assumption it was the flip callback. The guest said otherwise once its own stdout was
+reconstructed (it prints one character at a time):
 
-**The PS1 still does not render.** GPU packets stay at 6, and the R3000 still does not reach
-50,000 dispatches. The decisive measurement: `func_001066A8` is entered **exactly once** and
-never returns, so the main loop is not failing to call it --- the core blocks *inside* the
-interpreter after ~42,000 instructions, as it did before. Since all 11 of its `bl` targets
-return cleanly, the path is almost certainly one of its **51 `DRAIN_TRAMPOLINE` sites** ---
-the same route that reached the flip wait. Satisfying that wait just moved the thread to a
-second one. The next probe is to log every blocking syscall made by guest thread 1 with its
-guest `lr`, and read the second wait off the way the first one was read off.
-Three deadlocks are now cleared and the ISR mechanism is correct, but something after it still
-holds the core, and I have not found it.
+```
+[RSX dump analysis] unsupported error
+graphics error 0 : 00000000 ...
+```
+
+plus a full RSX state dump, 60 times a second. The mask `0x84` means this firmware registers a
+graphics-error handler and a user-command handler and **no vblank or flip handler at all** ---
+so the flip semaphore is not posted by a gcm handler, and that link of my chain was wrong. The
+ticker is removed; there is nothing a timer can legitimately send.
+
+**What survives and is correct:** publishing the queue id at `+0x12D0`. Without it the ISR
+thread received on queue 0 and exited outright; with it the thread stays alive and blocked on
+real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
+graphics-error dumps.
+
+**Still not rendering**, GPU packets at 6. But the question is better posed now: the main
+thread spins on `sys_ppu_thread_yield` (syscall 43) from inside the interpreter rather than
+blocking on a wait --- so it is **polling a memory location**, not sleeping on a primitive.
+Finding which location is the next step, and a store/read watch is the tool for it.
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
