@@ -176,3 +176,69 @@ not.
 That is the thread to pull next, and it wants the ring extended into `SPU_DRAIN` so the
 immediate predecessor of the bad branch is visible rather than the last dispatcher-resolved
 one.
+
+## It was never a runaway: the GPU core exits cleanly
+
+Extending the PC ring into `SPU_DRAIN` (so trampoline hops are recorded, not just
+dispatcher-resolved indirect branches) gave the immediate predecessor:
+
+```
+last dispatched PCs (oldest first): 0x0C42C 0x09CD8 0x09CDC 0x0CD3C 0x0CD50 0x0CFE0 0x000D0 0x3FFB0
+```
+
+`0x000D0` is inside the CRT, and the whole block reads as one thing:
+
+```
+000C0: ori  $r80, $r3, 0        ; r80 = exit status
+000C4: brsl $r0, 0xD050         ; atexit/cleanup
+000C8: andi $r80, $r80, 255     ; status & 0xFF
+000CC: iohl $r80, 0x2000        ; r80 = 0x2000 | status  -- a `stop` OPCODE
+000D0: stqd $r80, 0x10($r1)     ; assemble it onto the stack
+000D4: sync
+000D8: ai   $r3, $r1, 16        ; r3 = &that word
+000DC: bi   $r3                 ; branch to it, and execute it
+```
+
+**This is the standard SPU `exit()`**: build a `stop <status>` instruction in memory and jump
+to it. So `0x00002000` at `0x3FFB0` was never corruption -- it is the instruction the CRT had
+just written -- and branching to a stack address with no lifted code is exactly what a correct
+exit looks like from the dispatcher's point of view.
+
+The guard reported it as `branched into unlifted LS 0x3FFB0 -- ending the job` with
+`stop_code=0x0`, which reads as a runaway. That sent a long chase after phantom memory
+corruption: three separate measurements (PPU stores, SPU quadword stores, image-2 DMA) all
+correctly found nothing, because there was nothing to find.
+
+`spu_channels.c` now decodes the target word before blaming the branch. A `stop` is opcode 0
+in the top 11 bits, so it is unambiguous:
+
+```
+[spu] img=2 exit: synthesised stop 0x2000 at LS 0x3FFB0
+[spu-raw] spu4 stopped: halted=1 pc=0x3FFB0 steps=8288 stop_code=0x2000
+```
+
+`stop_code` is now `0x2000` rather than `0x0`, and since the low byte carries the status,
+**SPU 4 exits with status 0** -- a clean, deliberate exit. This idiom is universal SPU CRT
+behaviour, so every port gets a truthful log line out of it.
+
+## The actual question
+
+The GPU core is not crashing; it is *finishing*. `0x0CFE0` is `il $r3, 0` followed by a frame
+teardown and `bi $r0` -- a function returning 0 -- and that return lands in the CRT exit stub.
+Its `main` returned.
+
+So the open question is no longer "what corrupted the stack" but **why the GPU core's main
+loop terminates after ~8,288 instructions, and what is supposed to restart it**. The PPU
+starts SPU 4 exactly once (one `spu4 START` per run) and never writes `RUNCNTL_RUN` again.
+`raw_spu_start()` clears `started` on stop, so a restart would be honoured if the PPU asked
+for one.
+
+Two directions from here, in order:
+
+1. Follow the return chain `0x0C42C -> 0x09CD8/0x09CDC -> 0x0CD3C -> 0x0CD50 -> 0x0CFE0` and
+   find the condition that ends the loop. A GPU core that exits with status 0 after a fixed
+   amount of work is usually waiting on something it decided it would never get.
+2. Check whether the PPU is meant to see the stop and restart the core. The runtime sets
+   `SPU_STATUS_STOPPED_BY_STOP | (stop_code << 16)`, so the status register reads correctly;
+   what is not yet established is whether `gpuio.cc: gpuCmdInterruptHandlerThread` (tid=5)
+   ever polls it.
