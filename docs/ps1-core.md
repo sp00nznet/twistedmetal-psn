@@ -1245,3 +1245,48 @@ note to end on, given how many inferences in this file turned out wrong. Sample 
 thread's host PC periodically and bucket it by lifted function (the runtime already has a
 `[BLOCK]` profiler that does exactly this kind of attribution), and read off where the 2
 seconds actually go. Do not reason forward from the fence again.
+
+### The missing tool, and the first answer it gave
+
+Every probe in this project reports where a thread **blocks** --- `[BLOCK]` times blocked
+syscalls, `[WAIT]` names waits, `ch-wait` names SPU stalls. None of them can say where a
+thread spends time while it is **running**, which is exactly the gap this session kept falling
+into: the main guest thread burns ~2 s of wall clock between gcm fences while the R3000
+executes <50k instructions and its `usleep` calls account for ~0.3 s. That missing time is
+*busy* time, and no blocking probe can attribute it.
+
+So `PS3_SAMPLE=<ms>` now exists in `ppu_loader.cpp`: a sampling profiler that suspends each
+thread briefly, reads `RIP`, maps it to a lifted function **by extent** (the sorted
+`[entry, next_entry)` table --- the same correction that made `sc_trace`'s backtrace
+trustworthy), and buckets. First run:
+
+```
+[samp] sampling every 3 ms
+[samp] 4960 samples, 446 in guest code (9.0%)
+[samp]    99.1%  func_00022F28  (442)
+[samp]     0.7%  func_0014E75C  (3)
+[samp]     0.2%  func_00080304  (1)
+```
+
+Two things fall out immediately, neither of which any amount of reasoning had produced:
+
+1. **Only 9% of process CPU is in guest code at all.** The other 91% is runtime/host --- the
+   RSX backend and its D3D12 work. Whatever is slow, most of the machine's time is not being
+   spent running the recompiled PPU.
+2. **Of the guest time, 99.1% is in one function**, the body at `0x00022F3C` (the sampler
+   attributes it to the preceding table entry `func_00022F28`). It ends `li r3,0; blr`, and
+   has at least five callers clustered at `0x243EC`, `0x24590`, `0x24724`, `0x248A8`,
+   `0x24A0C`.
+
+Its inner loop is worth a look by whoever picks this up: it walks an index from 6668 to 7148
+in steps of 32, calling `func_00022F30` --- which is literally `li r3,-1; rldicl; blr`, an
+unconditional `0xFFFFFFFF` return --- and branches on `r3 != -1`, so that arm never runs. That
+may be perfectly normal firmware (a lookup whose fast path is "absent"), or it may be a lifting
+artefact worth checking against the ELF. It is the single highest-value thing to look at next,
+and it was invisible for this entire session.
+
+**The lesson worth keeping.** Ten-plus conclusions in this file were wrong, and every one came
+from reasoning forward off a partial signal --- a stale `lr`, a mixed stdout/stderr ordering, a
+count divided by the wrong denominator. The two things that actually produced answers were
+both *measurements built for the question*: `ps3_qpc_us()` for comparable timing, and this
+sampler for busy time. Build the instrument first.

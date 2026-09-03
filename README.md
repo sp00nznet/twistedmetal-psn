@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — main thread burns ~2 s between fences, unattributed |
+| R3000 runs continuously | ⬜ **blocker** — 99% of guest CPU in `func_00022F3C`; 91% of CPU is host-side |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -228,29 +228,33 @@ thread received on queue 0 and exited outright; with it the thread stays alive a
 real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
 graphics-error dumps.
 
-**Quantified, with both probes on one QPC origin:**
+**Quantified, with both probes on one QPC origin:** the first fence-spin `usleep` at
+`t=223,341,983,195us`, `[refpub] #1` at `+0.41 s`, `[refpub] #2` at `+2.0 s`. Consecutive
+spin polls are 43 us apart and `GCM_RATE=1` shows a steady **270 FIFO walks/sec**, so neither
+the poll loop nor the walk is starved --- the ~2 s is the guest's own work between fences, and
+the fence wait is a symptom.
 
-| event | t (us) | delta |
-|---|---|---|
-| first fence-spin `usleep` | 223,341,983,195 | --- |
-| `[refpub] #1` wrote `0xFFFFFFFF` | 223,342,388,746 | **+0.41 s** |
-| `[refpub] #2` wrote `0x0` | 223,344,394,122 | **+2.0 s** |
+**Then the tool that was missing all along.** Every probe here reports where a thread
+*blocks*; none could say where one spends time while *running*, which is precisely the gap.
+`PS3_SAMPLE=<ms>` now suspends each thread, reads `RIP`, and maps it to a lifted function by
+extent:
 
-Two supporting rates, both healthy: consecutive spin `usleep` calls are **43 us** apart, and
-`GCM_RATE=1` reports a steady **270 FIFO walks/sec**. So neither the poll loop nor the walk is
-starved, and publication can run far faster than one per 2 s.
+```
+[samp] 4960 samples, 446 in guest code (9.0%)
+[samp]    99.1%  func_00022F28  (442)
+```
 
-A fence only appears once the guest has written and flushed it --- so **the ~2 s is the
-guest's own work between fences**, and the fence wait is a symptom, not the cause. Which lands
-somewhere genuinely unexplained: the main guest thread burns ~2 s of wall clock between
-consecutive fences while the R3000 executes fewer than 50,000 instructions in 150 s and its
-~7,000 `usleep` calls account for only ~0.3 s. None of the instrumentation used so far
-attributes that time.
+Two results, neither of which any amount of reasoning had produced:
 
-**So the next step is profiling, not inference** --- sample the main guest thread's host PC and
-bucket it by lifted function (the runtime already has a `[BLOCK]` profiler that does this), and
-read off where the 2 seconds go. Detail, and the list of readings this corrects, in
-[`docs/ps1-core.md`](docs/ps1-core.md).
+1. **Only 9% of process CPU is in guest code.** The other 91% is runtime/host --- the RSX
+   backend and its D3D12 work.
+2. **99.1% of the guest time is one function**, the body at `0x00022F3C`, with five callers
+   clustered at `0x243EC`-`0x24A0C`. Its inner loop walks an index 6668 -> 7148 by 32 calling
+   `func_00022F30`, which is literally `li r3,-1; blr` --- so the arm that branches on
+   `r3 != -1` never runs. Normal firmware or a lifting artefact, that is the highest-value
+   thing to check next, and it was invisible for this whole session.
+
+Detail, and the list of readings this corrects, in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
