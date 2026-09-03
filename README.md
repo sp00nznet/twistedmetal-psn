@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker (root)** — stalls in BIOS; everything else is downstream |
+| R3000 runs continuously | ⬜ **ROOT CAUSE FOUND** — it idles waiting to be woken; nothing wakes it |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -270,45 +270,52 @@ state**:
 0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
 ```
 
-So the four image-1 SPUs --- the GPU cores --- sit at their entry and in that loop. Following
-the feed path to its origin closes the loop, and reorganises the problem.
+### Root cause: the R3000 idles waiting to be woken, and nothing wakes it
 
-The command-packet sender `func_0010F658` is called **exactly once**, and the probe names the
-caller: `lr=0x00108588`, the init path. The other two call sites both live in
-`func_0010C48C`, which never runs --- no direct callers, no switch arm, its address only in an
-OPD at `0x001B6158` reachable from one TOC slot. And the code that loads that slot says what it
-is:
+Per-thread sampling plus the guest `lr` on the main thread's last syscalls closes this.
 
-```
-00108518  lwz  r6, -0x79BC(r2)     ; r6 = OPD of func_0010C48C
-0010852C  ori  r3, r3, 0x1810      ; r3 = 0x1F801810 -- PS1 GP0, the GPU command port
-0010853C  bl   0xC23E0             ; register the handler
-```
+**The main thread is blocked, not spinning** --- `tid 20596: guest=4 ntdll=430`. Four guest
+samples in a whole run (the brief BIOS execution); everything else parked in a kernel wait.
 
-**`func_0010C48C` is the PS1 GPU register-write handler.** It never runs because the R3000
-never writes GP0 --- because the R3000 is stuck in the BIOS. So the chain runs the opposite way
-from how the last stretch of this investigation read it:
+**Its last syscalls are `sys_ppu_thread_yield`, from inside the interpreter** ---
+`glr=0x001068F4`, `0x00106824`, `0x00106360`, each just after a `bl 0x105FA8` (the event
+scheduler). The third is an **idle loop** in `func_0010621C`:
 
 ```
-R3000 stalls in the BIOS
-  -> never reaches game code, never writes GP0
-     -> the GP0 handler never fires
-        -> no command packets after the single init one
-           -> the four GPU SPUs spin on buffers that never change
-              -> no PS1 GPU packets, so the count stays at 6
+0010631C  stw r5, 0x120(r28)   ; store the scheduler's return into the CYCLE BUDGET
+00106328  bl  0xC2778          ; yield
+0010635C  bl  0x105FA8         ; event scheduler -> new budget
+00106360  lwz r0, 0x138(r28)   ; the exit-reason field
+0010636C  beq -> 0x10631C      ; still -1 -> go round again
 ```
 
-Everything after "the R3000 stalls" --- the fence wait, the mailbox handshake, the LS feed, the
-SPU spin --- is **downstream** of that one stall. That work produced two real fixes
-(`rchcnt SPU_RdEventStat`, the RSX handler queue), but none of it could have started the game.
+The interpreter runs its ~42,000 BIOS instructions, enters this loop, and stays: schedule,
+yield, check, repeat. That single state explains every symptom this investigation chased ---
+why it stops dispatching, why it never returns, why the profiler finds it in `ntdll` rather
+than burning CPU.
 
-**The root question is the original one, unchanged:** why does the R3000 stop after ~42,000
-instructions of BIOS? Known: the interpreter is entered once and never returns, stops
-dispatching, all eleven of its `bl` targets return cleanly (1553/1553), its opcode table is
-fully lifted, and the main thread afterwards sits in a fence wait that does complete. Unknown:
-what it does between the last dispatch and that wait. `PS3_SAMPLE` with the merged map can
-answer that if pointed at the **first second** rather than the steady state --- every probe so
-far has been too late to catch it. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+**Only one thing can wake it.** `+0x138` gets a real value from `func_001058AC` alone, and that
+has exactly one caller, at `0x000C2730` with `r3 = 7`:
+
+```
+000C2710  sld r0, r0, r11      ; r0 = 1 << event_index
+000C270C  ori r9, r9, 0x1111   ; the "does not wake" mask
+000C272C  bne cr6, 0xC2750     ; bit in the mask -> record it, do NOT wake
+000C2730  bl  0x1058AC         ; ** wake the R3000, reason 7 **
+```
+
+The emulator wakes the R3000 only for events whose bit falls **outside** `0x1111`.
+
+**The chain, complete:** no waking event -> `+0x138` stays `-1` -> the R3000 idles forever ->
+no game code -> GP0 never written -> the GP0 handler never fires -> the GPU SPUs get no
+packets and spin -> no PS1 output, packet count stuck at 6. Everything this investigation
+chased after "the R3000 stalls" was downstream of this one state.
+
+**Next step, specific:** log every event index reaching `0x000C2730`'s function and see which
+the `0x1111` mask suppresses. The BIOS here is almost certainly waiting on the PS1 **vblank**;
+if vblank's index is inside that mask --- or if no event reaches this function at all --- that
+is the bug, and it lives in the emulator's own timing/event plumbing, not anywhere downstream.
+Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
