@@ -1885,3 +1885,53 @@ does.
 This is the first point in the whole investigation where the two sides of a handshake are both
 identified, with the exact address they communicate through and a count of how many times it
 actually happens.
+
+### Located: only SPU 0's startup message is ever read
+
+Two measurements close this, and they agree exactly.
+
+**1. The guest never enables the plain-mailbox interrupt.** Logging what it passes to
+`sys_raw_spu_set_int_mask`:
+
+```
+[spu-mask] spu0 class=2 mask=0x3
+[spu-mask] spu4 class=2 mask=0x3
+```
+
+Mask `0x3` is interrupt-mailbox (`0x1`) | stop-and-signal (`0x2`). It does **not** include
+`0x10`, the plain-mailbox threshold. The image-1 SPUs signal with a plain
+`wrch SPU_WrOutMbox` at LS `0x11D4`, so that write raises no class-2 interrupt by design ---
+the PPU is expected to **poll** the outbound mailboxes. And only spu0 and spu4 get a mask at
+all; spu1/2/3 have no interrupt tag, so for them polling is the only mechanism there is.
+
+**2. The PPU polls exactly one of them.** Logging the outbound-mailbox depth after each SPU
+publishes its buffer address:
+
+```
+[spu-outmbox] spu=0 wrote 0x00015010 depth=0   <- consumed
+[spu-outmbox] spu=1 wrote 0x00015010 depth=1   <- never read
+[spu-outmbox] spu=2 wrote 0x00015010 depth=1   <- never read
+[spu-outmbox] spu=3 wrote 0x00015010 depth=1   <- never read
+[spu-outmbox] spu=4 wrote 0x0000E500 depth=1   <- never read
+```
+
+All five publish. **Only SPU 0's message is consumed**; the other four sit at depth 1 for the
+rest of the run. That is exactly consistent with the store watch, which saw precisely one write
+into a raw-SPU local store --- SPU 0's, at `0xE0015010` --- and none to the others.
+
+So the chain is complete and every link is measured:
+
+1. each image-1 SPU publishes its LS work buffer via the plain outbound mailbox and polls that
+   buffer (the 47.7% + 26.2% hot spots);
+2. the guest's class-2 mask excludes the plain-mailbox bit, so nothing interrupts the PPU ---
+   by design; polling is the contract;
+3. our PPU consumes SPU 0's message and never reads SPU 1-4's;
+4. so SPU 0 gets its one buffer write and SPUs 1-3 get nothing, and all four spin forever;
+5. with the GPU cores stalled, no PS1 GPU packets are produced, which is why the count has been
+   pinned at 6 all along.
+
+**The fix is in the PPU-side polling, not in the SPU emulation.** What to check first: whether
+the guest's poll loop walks all five raw SPUs or stops after the first, and whether our
+MMIO read of `SPU_Out_Mbox` (window `+0x4004`) is reachable for SPUs 1-4 at all --- note the
+runtime only ever created interrupt tags for spu0 and spu4, so anything keyed off a tag will
+skip 1-3 by construction.
