@@ -2516,3 +2516,57 @@ x >= 640. Two questions, in order:
 
 Neither needs any more work on the PS1 side. Everything from the R3000 through the GPU SPUs to
 VRAM is verified, and the game's own art is in memory.
+
+## The display path, narrowed to one question
+
+Two candidates ruled out by measurement, and one concrete bug of my own found and fixed.
+
+### Ruled out: we are not presenting an empty or premature buffer
+
+`LD_PRESENT_DBG=1` counts presents whose surface was cleared *after* its last draw --- the
+signature of showing a wiped buffer:
+
+```
+[present] 0/1024 presents showed a surface cleared after its last draw (0.0%);
+          target=6 0:0x310000 1280x720 draw_gen=3760 clear_gen=3759
+```
+
+**0% over 1024 presents**, draw generation always one ahead of clear. The presented surface
+(slot 6, offset `0x310000`, 1280x720) is drawn every frame. So neither "wrong buffer, it is
+empty" nor "right buffer, too early" is the explanation.
+
+### Found and fixed: an ambiguity I introduced
+
+Keying surfaces on size stopped 9,573 content drops per run, but the *sampling* side still
+matched on `(location, offset)` alone and took the first hit. With several surfaces per offset
+that is arbitrary, and `LD_ALIAS_DBG=1` showed the ambiguity directly:
+
+```
+[alias-miss] tex 1:0x00400000 fmt=0xE2 1024x512 target=1
+  surf: [0]0:0x00000000 1280x720  [1]0:0x00000000 720x512  [2]0:0x00A20000 720x512 ...
+```
+
+Two surfaces at offset `0x0`. ps1_netemu composites the PS1 framebuffer into the 720x512 one and
+upscales to a 1280x720 output; a pass sampling offset `0x0` was getting whichever sat earlier in
+the table. Now it prefers the surface whose dimensions match the texture descriptor, and
+otherwise the most recently drawn one.
+
+**This did not change the visible output.** It is in because the choice it replaces is
+indefensible once multiple surfaces per offset exist, not because it fixed anything observable.
+Saying so explicitly, because this port has a history of me writing up a change as a fix on the
+strength of a plausible mechanism rather than a measured effect.
+
+### What that leaves
+
+The `[alias-miss]` line above is itself the remaining clue: the PS1 VRAM texture
+(`1:0x00400000`, 1024x512) is bound while rendering into **targets 1 and 7** --- the 720x512
+surfaces at offsets `0x0` and `0x168000`. So the composite pass exists and runs; PS1 VRAM is
+being sampled into a 720x512 buffer, which is then upscaled into the presented 1280x720 surface.
+
+Every stage is therefore accounted for, and all of them run. The one thing still unmeasured is
+**which part of that 1024x512 texture the composite quad samples** --- and the framebuffer dump
+already showed that every drawn pixel lives at x >= 640 while columns 0..639 are black. If the
+quad samples from x = 0, that is the whole story, and it is a texture-coordinate question, not a
+pipeline one.
+
+The next step is one log line: the vertex UVs of the draw that binds `1:0x00400000`.
