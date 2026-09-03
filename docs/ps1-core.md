@@ -129,3 +129,50 @@ real call site (`0x12A24` in `func_0001299C`, which rejects an index of -1 with
 
 This is not what stops the game -- graphics run at 58 fps regardless -- so it is filed rather
 than chased.
+
+## Narrowing the GPU-core halt
+
+`SPU_DUMP_MISS=1` names the destination of a bad branch but not its origin, and with a
+trampoline dispatcher there is no host frame left to walk back to. `spu_channels.c` now keeps
+a per-thread ring of the last eight PCs it actually dispatched and prints it with the miss --
+one store per dispatch, no allocation.
+
+```
+[spu] img=2 branched into unlifted LS 0x3FFB0 (lr=0x000C8) -- ending the job
+      last dispatched PCs (oldest first): 0x00000 0x00000 0x0A200 0x09E10 0x09FD4 0x09FD4 0x09DD4 0x09E00
+      LS[0x3FFB0]: 00002000 00002000 00002000 00002000 00000000 00000000 00000000 00000000
+```
+
+Three things follow, and the first corrects the note above.
+
+- **`0x3FFB0` is inside the stack, not past the image.** The CRT entry at LS `0xE0` is
+  `ila $r8, 0x3FFD0` and builds the stack pointer from it, so `0x3FFB0` is an ordinary stack
+  slot `0x20` below the initial frame. Calling it "far past the end of local store" was wrong.
+- **The word there is `stop 0x2000`**, four times over, which is exactly why branching to it
+  ends the job. Those bytes are **zero in the static image**, so the value appears at runtime.
+- **The last dispatched function is `0x09E00`**, whose lifted body is seven lines with two
+  exits, both to valid lifted functions -- so it is not the one that computed the target.
+  Trampoline hops bypass the dispatcher, so the ring only records indirect branches and the
+  immediate predecessor is still invisible.
+
+Three ways that word could have been written, all measured, all ruled out:
+
+| candidate | measurement | result |
+|---|---|---|
+| PPU store into the LS window | `LBP_WW=0xE043FFA0 LBP_WW_LEN=0x60` | 0 writes |
+| SPU quadword store | `LBP_SPU_WATCH=0x3FFB0` | 21 accesses, all zeros, from `pc=0x100`/`0x16C` |
+| MFC DMA from the GPU core | `SPU_DMATRACE=2` | 17 transfers, none above `0x1ED80` |
+
+One trap worth writing down: **`SPU_DMATRACE` takes an image number, not a boolean.**
+`SPU_DMATRACE=1` traces image 1 and says nothing at all about image 2, which cost a round of
+"DMA is ruled out" before the flag was read properly.
+
+So either a lifted store path writes local store without going through `spu_ls_write128`
+(which is what the watch hooks), or -- more likely on this evidence -- **the memory is fine
+and the branch is wrong**: `0x2000` at `0x3FFB0` is a legitimately spilled register, and the
+fault is an indirect branch taken through a register that should hold a code address and does
+not.
+
+That is the thread to pull next, and it wants the ring extended into `SPU_DRAIN` so the
+immediate predecessor of the bad branch is visible rather than the last dispatcher-resolved
+one.
