@@ -1169,3 +1169,79 @@ FIFO walk so late? The walk runs on the present thread's 60 Hz tick and the kick
 Either that kick is not wired on this path or the present thread is not yet running when the
 first wait begins. That is a startup-ordering question, and it is measurable the same way:
 timestamp the first walk against the first spin.
+
+### Calibration: what is measured here, and what was inference
+
+I have corrected my own conclusion on this blocker five times in one session. That is itself
+the most useful thing to record, so the next reader knows which lines to trust.
+
+**Measured, reproducible, and safe to build on:**
+
+* the fence-wait loop is `func_000198F4`, entered **once**, polling `*(0x20002000 + 8)` ---
+  i.e. `CellGcmControl::ref` --- for `0xFFFFFFFF`, with `usleep(30us)` between reads;
+* every sampled read returns `0x00000000` (9 samples, `#1`-`#6`, `#3000`, `#6000`, `#9000`);
+* the probe stops at `#9000` and never reaches `#12000`, so the loop ends between those;
+* the publisher writes correctly --- `[refpub] #1 wrote 0xFFFFFFFF -> readback 0xFFFFFFFF` ---
+  and its first write appears at log line 229, after the spin samples at line 173;
+* the flush is `func_0001989C`, which converts `ctx->current` via `func_00015ECC`
+  (`cellGcmAddressToOffset`-shaped: it returns `0x802100FF` on failure) and stores the result
+  to `put` at `0x000198DC`;
+* the generic boot harness *does* walk the FIFO on a ~4 ms outer cadence and a 16 ms tick;
+* `cellGcm_fifo_kick_event()` is called **only** from `lbp/main.cpp:269`. Nothing in the
+  generic harness calls it, so `s_gcm_kick_ev` stays NULL for this port and the
+  `if (dry && s_gcm_kick_ev) SetEvent(...)` kick in `cellGcm_ref_on_poll` never fires. That
+  is a real gap between the two hosts, whatever its effect turns out to be.
+
+**Inference I made and could not sustain**, listed so nobody re-derives them:
+
+* that `put = 0x1000` at the wait's entry meant the guest had not flushed --- wrong: the flush
+  (`bl 0x1989C`) runs at `0x19920`, *after* the probe point at function entry, so that reading
+  proves nothing;
+* that the wait "costs seconds" --- **never timestamped**. 9,000 iterations of a 30us QPC
+  busy-wait is ~0.27 s, so the wait may well be sub-second and the "one fence per several
+  seconds" framing in the entry above is unverified;
+* earlier: that the value is skipped, that the poll site was elsewhere, that two threads saw
+  different memory, that the hook was not firing. All wrong, each for a different reason.
+
+**What an honest next step looks like.** Stop inferring from counts and orderings and put a
+timestamp on both events in one stream: `QueryPerformanceCounter` at the first spin iteration
+and at `[refpub] #1`, printed as microseconds since process start. That single number decides
+whether there is a latency problem at all --- and until it exists, the "latency, not deadlock"
+heading above should be read as a hypothesis, not a result.
+
+### Quantified at last: the guest is slow between fences, not blocked by them
+
+Timestamping both probes from the **same QPC origin** (`ps3_qpc_us()`, callable from any
+translation unit, so two files can be compared directly) finally puts numbers on this:
+
+| event | t (us) | delta |
+|---|---|---|
+| first fence-spin `usleep` | 223,341,983,195 | --- |
+| `[refpub] #1` wrote `0xFFFFFFFF` | 223,342,388,746 | **+0.41 s** |
+| `[refpub] #2` wrote `0x0` | 223,344,394,122 | **+2.0 s** |
+
+And two supporting rates, both healthy:
+
+* consecutive fence-spin `usleep` calls are **43 us** apart, so the poll loop is fine. (My
+  earlier "~12 ms per usleep" was bad arithmetic --- dividing total run time by usleep count,
+  which assumes the loop runs for the whole run. It does not.)
+* `GCM_RATE=1` reports **270 FIFO walks/sec**, steady. The walk is not starved, and the
+  missing `cellGcm_fifo_kick_event()` wiring noted above therefore costs far less than it
+  looked like it might.
+
+So the shape is: the *first* fence takes 0.41 s to appear, and each subsequent one about
+**2 seconds** --- but not because publication is slow. Publication can run at up to one per
+200 us read-driven and 60/s from the ticker, and the walk that feeds it runs 270 times a
+second. A fence appears only once the guest has written and flushed it, so **the ~2 s is the
+guest's own work between fences**, and the fence wait is a symptom of that, not its cause.
+
+Which lands somewhere genuinely unexplained: the main guest thread spends ~2 s of wall clock
+between consecutive fences, while the R3000 interpreter executes fewer than 50,000
+instructions in 150 s and its ~7,000 `usleep` calls account for only ~0.3 s. The time is going
+somewhere on that thread that none of the instrumentation used so far attributes.
+
+**That makes the next step a profiling question, not an inference one** --- which is the right
+note to end on, given how many inferences in this file turned out wrong. Sample the main guest
+thread's host PC periodically and bucket it by lifted function (the runtime already has a
+`[BLOCK]` profiler that does exactly this kind of attribution), and read off where the 2
+seconds actually go. Do not reason forward from the fence again.

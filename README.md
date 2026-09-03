@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — not a deadlock: every gcm fence wait costs seconds |
+| R3000 runs continuously | ⬜ **blocker** — main thread burns ~2 s between fences, unattributed |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -228,32 +228,28 @@ thread received on queue 0 and exited outright; with it the thread stays alive a
 real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
 graphics-error dumps.
 
-**It is latency, not a deadlock.** Putting the fence publisher on **stderr** --- the same
-stream as an in-loop probe, so the ordering is real rather than an artefact of mixing
-`printf`/stdout with `fprintf`/stderr --- settles it in one run:
+**Quantified, with both probes on one QPC origin:**
 
-```
-line  94  [dbg] spin #1     expected=0xFFFFFFFF  *(obj+8)=0x00000000
-line 173  [dbg] spin #9000  expected=0xFFFFFFFF  *(obj+8)=0x00000000
-line 229  [refpub] #1 wrote 0xFFFFFFFF -> readback 0xFFFFFFFF
-```
+| event | t (us) | delta |
+|---|---|---|
+| first fence-spin `usleep` | 223,341,983,195 | --- |
+| `[refpub] #1` wrote `0xFFFFFFFF` | 223,342,388,746 | **+0.41 s** |
+| `[refpub] #2` wrote `0x0` | 223,344,394,122 | **+2.0 s** |
 
-The guest polls **9,000+ times before the first fence is ever published**, and the write is
-fine --- the publisher reads back exactly what it wrote. The probe then stops at `#9000`
-instead of reaching `#12000`, which is what it would do if the loop exited shortly after that
-publish. **The wait completes**; it just costs seconds.
+Two supporting rates, both healthy: consecutive spin `usleep` calls are **43 us** apart, and
+`GCM_RATE=1` reports a steady **270 FIFO walks/sec**. So neither the poll loop nor the walk is
+starved, and publication can run far faster than one per 2 s.
 
-That one fact explains everything measured earlier: ~7,000 `usleep(30us)` on the main thread
-per 90 s, GPU packets stuck at 6 even over a 300 s run, and the R3000 never getting past
-~42,000 instructions. The emulator is not deadlocked anywhere --- it is advancing at roughly
-one gcm fence per several seconds.
+A fence only appears once the guest has written and flushed it --- so **the ~2 s is the
+guest's own work between fences**, and the fence wait is a symptom, not the cause. Which lands
+somewhere genuinely unexplained: the main guest thread burns ~2 s of wall clock between
+consecutive fences while the R3000 executes fewer than 50,000 instructions in 150 s and its
+~7,000 `usleep` calls account for only ~0.3 s. None of the instrumentation used so far
+attributes that time.
 
-**Next**, and it is a different question from the one I spent this session on: why is the
-first FIFO walk so late? The walk runs on the present thread's 60 Hz tick, and a kick event
-(`cellGcm_fifo_kick_event`) exists precisely so a dry fence wait can demand one immediately.
-Either that kick is not wired on this path, or the present thread is not yet running when the
-first wait begins. Measurable the same way --- timestamp the first walk against the first spin.
-Detail, including the three readings this corrects, in
+**So the next step is profiling, not inference** --- sample the main guest thread's host PC and
+bucket it by lifted function (the runtime already has a `[BLOCK]` profiler that does this), and
+read off where the 2 seconds go. Detail, and the list of readings this corrects, in
 [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
