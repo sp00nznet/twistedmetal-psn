@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, user-command handler reached |
-| R3000 runs continuously | ✅ Done — **~1 billion instructions in 100 s (~17 MIPS)**, no stall, no crash |
+| R3000 runs continuously | 🟨 Partly — up to **~1 billion instructions (~17 MIPS)**, then freezes on a zero budget |
 | Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |
 | RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
 | Intro video → menu → attract mode | ⬜ **BLOCKED** — the PS1 GPU SPUs block on `SPU_RdInMbox`; nothing writes it |
@@ -407,8 +407,19 @@ mailbox message, and nothing does — so the PS1 framebuffer stays empty, 15,961
 RSX groups are clears, and the window is black.
 
 The next question is the mirror of the semaphore one: **what is supposed to write those SPUs'
-inbound mailboxes?** `func_0010F658` is the SPU command-packet sender; `func_0010C48C` is the
-PS1 GP0 handler (OPD `0x1B6158`, registered at `0x108518`).
+inbound mailboxes after startup?** The complete history for a whole run is three words per SPU,
+all at init (`RUNCNTL=1`, then `0x40600000` and the ring base `0x00D70E80`), plus one zero ---
+against 5,695 `SIG_NOTIFY2` writes to SPU 4 in the same run. The notification machinery works;
+it is never used for the four GPU cores again.
+
+And the R3000 stops by **spinning, not blocking**: 385 of the last 400 syscalls before the
+freeze are `sys_ppu_thread_yield` from `lr=0x001068F4`, inside the interpreter's own outer loop,
+where `func_00105FA8` keeps returning an instruction budget of zero. Instructions retired
+(`+0x124`) and the GPU ring offset (33 packets) freeze on the same sample.
+
+That is the same budget-0 condition at `+0x120` that once stopped this port at boot --- moved,
+not gone. Full measurements, and an explicit note on which single link is still inference rather
+than measurement, in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 ### What unblocked the core: the opcode dispatch table was never lifted
 

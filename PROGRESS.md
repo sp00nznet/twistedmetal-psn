@@ -2566,3 +2566,137 @@ the R3000 reaches GP0 at all, and if it does, why the packet never leaves the PP
 Note also that boot is racy: of five identical 100-second runs, one reached nothing at all while
 the others reached `DecodeAu`. Worth pinning down before any timing-sensitive conclusion is
 drawn from a single run.
+
+## Where it stops now: the PS1 GPU handshake, measured end to end
+
+The port no longer stalls at boot, and it no longer crashes. It runs, decodes audio, and feeds
+the RSX cleanly --- and then wedges. This is the chain, every link measured.
+
+### 1. The R3000 stops by spinning, not by blocking
+
+`PS3_SCENTER=1`, last 400 syscalls before the freeze:
+
+```
+385  num=43  tid=1   lr=0x001068F4
+  8  num=130 tid=6   lr=0x00113444     (flip thread, normal)
+  6  num=130 tid=9   lr=0x000EBAF8     (normal)
+```
+
+Syscall 43 is `sys_ppu_thread_yield`, and `0x001068F4` is **inside the R3000 interpreter**
+(`func_001066A8`, 0x1066A8..0x108348). The main thread is not blocked in a syscall at all --- it
+is busy-waiting in the interpreter's own outer loop:
+
+```
+001068DC  bgt  cr7, 0x106890      ; budget > 0 -> go execute instructions
+001068E0  li   r27, 4
+001068E8  extsw r4, r28
+001068F0  bl   0x105fa8           ; the event scheduler
+001068F4  lwz  r4, 0x138(r23)     ; the reason field
+001068FC  cmpwi cr7, r4, -1
+00106900  beq+ cr7, 0x106834      ; still -1 -> loop
+```
+
+`func_00105FA8` returns the next instruction budget in r3. The interpreter takes it, finds it is
+not greater than zero, calls the scheduler again, and yields --- forever. Meanwhile `+0x124`,
+instructions retired, is frozen. So the loop is spinning *without executing any R3000
+instructions*: the scheduler is returning a budget of zero permanently.
+
+That is the same **budget-0 condition at +0x120** that once stopped this port at boot. It has
+moved, not gone: it now happens after 18 million to a billion instructions rather than after
+zero.
+
+### 2. The GPU command ring stops at the same moment
+
+`PS1_PC=1` reports the ring `func_0010F658` writes:
+
+```
+[ps1] ... total=18640128 ring[base=0x00D70E80 off=0x00002100]
+[ps1] ... total=18640128 ring[base=0x00D70E80 off=0x00002100]     (x14, frozen)
+```
+
+`0x2100 / 0x100` = **33 packets produced, then nothing**, frozen on the same sample as the
+instruction count. The base, `0x00D70E80`, is exactly the second word the PPU hands every GPU
+SPU at startup --- which is what confirms this is the right ring rather than a plausible one.
+
+### 3. The GPU SPUs are parked on their inbound mailbox
+
+```
+[ch-block] spu=2 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
+[ch-block] spu=3 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
+[ch-block] spu=4 pc=0x0CC88 op=rdch ch=29 evstat=0x0 evmask=0x0
+```
+
+Channel 29 is `SPU_RdInMbox`. And the complete inbound-mailbox history for the whole run is
+three words per SPU, all at init:
+
+```
+W spu0 +0x4401C = 0x00000001    ; RUNCNTL: run
+W spu0 +0x4400C = 0x40600000
+W spu0 +0x4400C = 0x00D70E80    ; the ring base
+W spu1 +0x4401C = 0x00000001
+W spu1 +0x4400C = 0x40600000
+W spu1 +0x4400C = 0x00D70E80
+...                              ; the same for spu2, spu3
+W spu0 +0x4400C = 0x00000000     ; one zero each, and then nothing at all
+```
+
+Against 5,695 writes to `spu4 +0x5C00C` (`SIG_NOTIFY2`) in the same run --- so the notification
+machinery works; it is simply never used for the four GPU cores after startup.
+
+### 4. And the kick that does happen is not a mailbox
+
+`func_0010F658`'s tail, after it advances the write offset:
+
+```
+0010F6B0  sync
+0010F6B4  lwz  r9, -0x7948(r2)    ; a table of four pointers
+0010F6B8  stw  r0, 0(r6)          ; publish the new ring offset
+0010F6BC  lwz  r7, 0xc(r9)
+0010F6C0  lwz  r11, 0(r9)
+0010F6C4  lwz  r10, 4(r9)
+0010F6C8  lwz  r8, 8(r9)
+0010F6CC  stw  r0, 0(r11)         ; mirror it to four addresses, one per SPU
+0010F6D0  stw  r0, 0(r10)
+0010F6D4  stw  r0, 0(r8)
+0010F6D8  stw  r0, 0(r7)
+```
+
+Four plain stores into guest RAM, no mailbox and no signal. They are guest RAM rather than
+mapped local store, and the SPU MMIO trace proves it: those stores executed 33 times and the
+trace logged **no** local-store writes in the whole run, only the problem-state registers above.
+So the SPUs are expected to DMA that word in themselves.
+
+### The chain
+
+```
+33 GP0 batches reach func_0010F658 -> ring offset advances to 0x2100
+  -> the four GPU SPUs are never sent a 4th inbound mailbox word
+     -> they stay blocked in rdch ch=29 and consume nothing
+        -> whatever PS1-side completion the scheduler is waiting on never arrives
+           -> func_00105FA8 returns budget 0 forever
+              -> the interpreter spins sys_ppu_thread_yield at 0x1068F0
+                 -> +0x124 freezes; the PS1 framebuffer stays empty
+                    -> 15,961 of 22,029 RSX groups are clears; the window is black
+```
+
+### What is worth being careful about here
+
+The last link is inference, not measurement. "Whatever completion the scheduler is waiting on"
+is exactly the kind of gap that produced three wrong conclusions earlier in this port, so it is
+named as unmeasured rather than asserted. What *is* measured: the yield site, the frozen
+instruction count, the frozen ring offset, the 33 packets, the complete mailbox history, and the
+absence of any local-store write.
+
+The next step is therefore narrow and does not depend on that inference: **find what writes a
+GPU SPU's inbound mailbox after startup.** The init writes cannot be attributed from their `lr`
+--- both reported values (`0x0010EF90`, `0x0010F25C`) are stale, because `lr` is only written by
+`bl` and these are call-free store sequences, the same trap that once misattributed the flip
+wait. They have to be found by their addressing pattern: the guest computes the full MMIO
+address, so there is no store in the image with displacement `0x400C`, `0x4004`, `0x4014` or
+`0x401C`.
+
+One more thing to fix before drawing timing conclusions: **boot is racy.** Across identical
+100-second runs the freeze point ranged from 18.6 million to 1.03 billion instructions, and one
+run reached no cellAdec activity at all. Every run does eventually freeze, so the variance is in
+*when*, not *whether* --- but any measurement taken from a single run needs that caveat
+attached.
