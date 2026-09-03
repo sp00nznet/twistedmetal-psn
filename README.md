@@ -209,9 +209,17 @@ the R3000 still does not pass **50,000** dispatches, essentially where it stoppe
 the flip semaphore was a real deadlock and is genuinely cleared, but a second stall sits
 behind it that has not been found yet.
 
-One lead for whoever picks this up: `_gcm_intr_thread` receives on its queue only **once** and
-then blocks again, so the vblank tick is likely being filtered out by the handler mask at
-`+0x12C0` after the first event. That mask is the first thing to check.
+**The lead paid off: the flip bit is `0x04`, not `0x02`.** The mask the guest publishes is
+`0x84`, and `rsx_send_event` filters by it, so a `SYS_RSX_EVENT_VBLANK` (`0x02`) tick was
+discarded outright. Reading `ps1_netemu`'s ISR --- it is a bit -> handler-slot table --- the
+only two handlers it ever registers are user-cmd (`0x80` -> `r14+0x2C`) and **`0x04`**
+(-> `r14+0x04`), so this firmware's libgcm hangs its flip callback off **bit 2**, not RPCS3's
+`SYS_RSX_EVENT_FLIP_BASE` (`1 << 3`). Sending `0x04` takes the ISR thread from **2** queue
+interactions to **333** --- it receives and cycles instead of blocking forever.
+
+**The PS1 still does not render.** GPU packets stay at 6, no new attribute packets appear.
+Three deadlocks are now cleared and the ISR mechanism is correct, but something after it still
+holds the core, and I have not found it.
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
@@ -270,7 +278,7 @@ Historical detail on the disc chain --- the two-file design, the byte-exact SHA-
 recovered curve and the ECDSA lifter bug that used to sit here --- is in
 [`docs/disc-body.md`](docs/disc-body.md).
 
-## 🔧 Toolchain changes upstreamed to ps3recomp
+## 🔧 Toolchain changes upstreamed to ps3recomp
 
 - **`libs/video/sys_rsx.c` --- the RSX interrupt queue was never published, and it deadlocked
   the guest.** `RsxDriverInfo::handler_queue` at `+0x12D0` is the event queue id libgcm's

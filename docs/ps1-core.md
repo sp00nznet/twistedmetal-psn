@@ -764,3 +764,38 @@ Whether the R3000 now runs to the intro video, and whether the PS1 GPU starts is
 packets (still 6, all from the emulator front-end). The vblank tick is a plain 60 Hz timer
 rather than a real vblank off the present loop --- fine for breaking the deadlock, worth tying
 to the swap if timing ever matters.
+
+### The flip bit: `0x04`, not `0x02`
+
+Publishing the queue was necessary but not sufficient --- the ISR thread still blocked, because
+the events being sent were ones the guest never asked for. Watching the mask settled it:
+
+```
+[ww] 0x200322C0 <- 0x4   guest-fn=0x0001A330
+[ww] 0x200322C0 <- 0x84  guest-fn=0x00019D88
+```
+
+`0x84`, and `rsx_send_event` filters by that mask (deliberately --- gcm's ISR dispatches on
+the flag bits). A tick of `SYS_RSX_EVENT_VBLANK` (`0x02`) was filtered out entirely.
+
+The ISR is a bit -> handler-slot table; reading it out of `ps1_netemu` directly (handler object
+= `*(TOC-0x6AB4)`):
+
+| bit | handler slot | |
+|---|---|---|
+| `0x0001` | `r14+0x0C` | |
+| `0x0002` | `r14+0x10` | vblank |
+| **`0x0004`** | **`r14+0x04`** | **registered** |
+| `0x0008` / `0x0010` | dispatched inline | |
+| `0x0020` / `0x0040` | `r14+0x24` / `r14+0x28` | |
+| **`0x0080`** | **`r14+0x2C`** | **registered** --- user cmd, arg `driver_info+0x12CC` |
+| `0x0400` / `0x0800` | `r14+0x14` / `r14+0x18` | |
+
+So this firmware's libgcm hangs its flip callback off **bit 2**, not RPCS3's
+`SYS_RSX_EVENT_FLIP_BASE` (`1 << 3`), and the only two handlers it ever registers are that and
+user-cmd. Sending `0x04` alongside the vblank bit takes the ISR thread from **2** queue
+interactions to **333**: it now receives and cycles instead of blocking forever.
+
+**The PS1 still does not render.** GPU packets remain at 6, no new attribute packets appear,
+and `sem 1` posts stay at 24. So the ISR mechanism is now correct and a third deadlock is
+cleared, but something after it still holds the core. Where that is has not been found.
