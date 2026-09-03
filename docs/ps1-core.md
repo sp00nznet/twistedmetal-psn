@@ -312,3 +312,69 @@ cores have no way to be given work, and nothing the disc path does can reach the
 Worth saying plainly: this is the *third* time on this title that a "stub that returns
 CELL_OK" has been the whole blocker -- after `_sys_malloc` and `sys_usbd_receive_event`. A
 syscall that succeeds without doing anything is much harder to find than one that fails.
+
+## Implementing raw-SPU interrupts
+
+`runtime/spu/spu_intr.inc` (included by `spu_raw.c`, where the tags live) implements the three
+missing pieces:
+
+- **`sys_interrupt_thread_establish` (84)** binds a tag to the PPU thread that services it.
+- **Delivery** is **level-triggered**: `int_stat & int_mask` for the SPU the tag encodes
+  (`0x52000000 | id<<8 | class`). An edge-triggered flag was tried first and lost every
+  interrupt, because all five SPUs write their ready mailbox during init and the two handlers
+  are established *afterwards* -- the edge fires with nothing bound. Reading the level cannot
+  lose that, and it matches the hardware, where the PPU clears the condition explicitly with
+  `sys_raw_spu_set_int_stat` (153, write-1-to-clear).
+- **`sys_interrupt_thread_eoi` (88)** returns, and `ppu_host_thread_proc` re-invokes the
+  handler's entry on the next interrupt. lv2's own eoi does not return -- it re-enters the
+  thread at its entry -- and both of ps1_netemu's handlers end in `blr` immediately after
+  their `sc 88`, so a return *is* the end of one pass. Without the re-entry loop each handler
+  ran exactly once.
+
+Getting the class-2 bit meanings right mattered. Per CBEA, `0x1` is the SPU **interrupt**
+mailbox (`SPU_WrOutIntrMbox`), `0x2` is **stop-and-signal**, and `0x10` is the plain outbound
+mailbox threshold. ps1_netemu unmasks `0x3`. Briefly mapping a plain `WrOutMbox` onto `0x1`
+made the handler run and then call `sys_raw_spu_read_puint_mb` (163) for a message that was
+never in the privileged mailbox -- the plain mailbox is deliberately *not* an interrupt source
+here, and the PPU polls it instead.
+
+**`stop`-and-signal is what actually matters.** A raw SPU asks the PPU for something by
+stopping with a code: the PPU takes the class-2 interrupt, reads the code, services it and
+restarts the SPU. `spu_raw.c` now raises `0x2` when a raw SPU stops.
+
+## What that changed
+
+The init handshake was already working and visible:
+
+```
+[spu-raw] spu0 out mbox = 0x00015010    [spu-raw] R spu0 OUT_MBOX -> 0x00015010
+... x4 (the R3000/GTE cores) ...
+[spu-raw] spu4 out mbox = 0x0000E500    [spu-raw] R spu4 OUT_MBOX -> 0x0000E500
+```
+
+What was missing is what happens next. With stop-and-signal delivered:
+
+```
+918  save config file: /USRDIR/CONFIG
+1118 [spu-raw] spu4 stopped: stop_code=0x2000
+1462 [intr] deliver tag 0x52000402 -> thread 7
+1488 R3000Exit(): PS1_EXIT_STOP
+```
+
+**The emulator now reaches the R3000 lifecycle**, which it never did before. It is told the
+core stopped, and it responds -- correctly -- by shutting the R3000 down. So the interrupt
+path works end to end; what is wrong is that SPU 4 stops at all.
+
+## Where it stands
+
+The remaining question is the one from before, now with the notification path proven: SPU 4
+writes its ready message, the PPU reads it, and then the core still takes the teardown branch
+at `0x0CD2C` (`brnz $r80` with `r80 == 0`), zeroes `0x1D580..0x2F700` and stops with
+`0x2000`. `r80` is a callee-saved register set by a caller -- nothing in `0x0C800..0x0CD20`
+writes it -- so the next step is to find which caller supplies it and what it is supposed to
+contain.
+
+Also still open, and cosmetic: two `sys_interrupt_thread_disestablish() failed` lines during
+teardown. Syscall 89 (`_sys_interrupt_thread_disestablish`, per RPCS3's table) is now
+implemented and unbinds the tag, but the guest evidently reaches it by another number, so the
+stub still answers. Harmless -- it happens after `R3000Exit` -- but worth pinning down.
