@@ -217,7 +217,14 @@ only two handlers it ever registers are user-cmd (`0x80` -> `r14+0x2C`) and **`0
 `SYS_RSX_EVENT_FLIP_BASE` (`1 << 3`). Sending `0x04` takes the ISR thread from **2** queue
 interactions to **333** --- it receives and cycles instead of blocking forever.
 
-**The PS1 still does not render.** GPU packets stay at 6, no new attribute packets appear.
+**The PS1 still does not render.** GPU packets stay at 6, and the R3000 still does not reach
+50,000 dispatches. The decisive measurement: `func_001066A8` is entered **exactly once** and
+never returns, so the main loop is not failing to call it --- the core blocks *inside* the
+interpreter after ~42,000 instructions, as it did before. Since all 11 of its `bl` targets
+return cleanly, the path is almost certainly one of its **51 `DRAIN_TRAMPOLINE` sites** ---
+the same route that reached the flip wait. Satisfying that wait just moved the thread to a
+second one. The next probe is to log every blocking syscall made by guest thread 1 with its
+guest `lr`, and read the second wait off the way the first one was read off.
 Three deadlocks are now cleared and the ISR mechanism is correct, but something after it still
 holds the core, and I have not found it.
 

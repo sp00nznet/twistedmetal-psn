@@ -1213,3 +1213,40 @@ interactions to **333**: it now receives and cycles instead of blocking forever.
 **The PS1 still does not render.** GPU packets remain at 6, no new attribute packets appear,
 and `sem 1` posts stay at 24. So the ISR mechanism is now correct and a third deadlock is
 cleared, but something after it still holds the core. Where that is has not been found.
+
+Measured after the flip-bit fix, same 50,000-dispatch probe: the R3000 still does **not**
+reach 50,000 dispatches. So all three deadlocks cleared this session were real -- each is
+verified by its own metric -- and none of them was what stops the core. What holds it is still
+unknown.
+
+What is now known to be *not* the cause, so the next reader does not re-run it:
+
+* the interpreter itself --- entered once and looping internally, event scheduler healthy over
+  ~2,100 rounds, all 11 helper calls traced at 1553 enters / 1553 exits;
+* the opcode dispatch (the table is lifted, 127 targets, one `bctr`, fully covered);
+* the audio SPU (`ch-wait` stalls are 0);
+* the flip semaphore (`sem 1` is posted, the wait is satisfied, the main thread runs on);
+* the gcm ISR thread (alive and cycling, 333 queue interactions);
+* `sys_storage_send_device_command` (604) --- 10 calls early, then quiet; a BD-drive query
+  that a PBP-backed title should not depend on.
+
+The obvious next measurement is whether `func_001066A8` is *re-entered* after the main thread
+passes the flip wait. It was entered exactly once before; if it is still once, the emulator's
+main loop at `0xB3E58` has stopped calling it and the question moves up into that loop rather
+than into the interpreter.
+
+**And the decisive measurement.** With all three deadlocks cleared, `func_001066A8` is still
+entered **exactly once** (`interp ENTER #1 pc=BFC00000`) and never returns. So the emulator's
+main loop at `0xB3E58` is not failing to call it --- the call never comes back. The core runs
+its ~42,000 instructions and then blocks *inside* the interpreter, exactly as before.
+
+That reframes the remaining work. The block cannot be one of the 11 `bl` targets (all traced,
+1553 enters / 1553 exits), and it is not the dispatch, so the likely path is the same one that
+reached `sys_semaphore_wait` in the first place: one of the interpreter's **51
+`DRAIN_TRAMPOLINE` sites**, which run deferred guest work on the calling thread. The flip wait
+was the *first* such block; satisfying it evidently just moves the thread to a second one.
+
+So the next probe is not another interpreter dissection --- it is to log **every blocking
+syscall made by guest thread 1** (semaphores, event queues, lwmutex, timers) with its guest
+`lr`, and read off the second wait the way the first one was read off. `[WAIT] semaphore_wait`
+already carries `cia`/`lr`; the event-queue and lwmutex paths would need the same treatment.
