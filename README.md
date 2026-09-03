@@ -166,7 +166,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | PS1 title boots | ✅ Done — `North American Title detected!`, `boot from /dev_hdd0/game/NPUI94304` |
 | SPU cores run (no stalls) | ✅ Done — lost-reservation event + `sys_usbd_receive_event` |
 | Raw-SPU interrupts delivered | ✅ Done — establish/eoi/stop-and-signal, level-triggered |
-| PS1 core runs (R3000) | ⬜ **blocker** — `EBOOT.PBP` opens but is never read, so the R3000 has no code |
+| BIOS loaded, R3000 at reset vector | ✅ Done — `mfc0 $k0,$15` at `0xBFC00000` |
+| PS1 core runs (R3000) | ⬜ **blocker** — cycle budget `+0x120` is 0, so the interpreter runs 0 instructions |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

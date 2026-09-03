@@ -448,3 +448,78 @@ existing miss dump should settle it in one run.
 Worth carrying forward: the PS1 RAM base is `*(TOC-0x79D4)` and the R3000 PC is at
 `+0x108` of `*(TOC-0x79FC)`. Watching those two directly is the fastest way to confirm
 "nothing was ever loaded" independently of the disc path.
+
+## The R3000 never executes an instruction, and why
+
+Three earlier conclusions in this file were wrong and are corrected here. The disc path, the
+BIOS load and the core setup are all **fine**; the emulator stops for a much narrower reason.
+
+### Corrections
+
+- **`EBOOT.PBP` is not closed early.** Ordering the `+0x70A0` (open-file size) writes against
+  the log shows `0x100028` (the EDAT) -> `0x418B2D5` (the PBP, 68,727,509) at line 845, and
+  the close at line 1123 -- *after* the config save at line 1109. The PBP stays open right up
+  to shutdown; the close is teardown.
+- **`func_000F1CE0` clearing the track count is also teardown.** It is reached from `0x110DDC`,
+  which unmounts and then calls `sc 601` (`sys_storage_close`) -- the disc-eject path.
+- **The BIOS is loaded.** A store watch showed only zeros there, but that watch only sees
+  `vm_write*`, and a file read lands via `memcpy` into `vm_base` -- invisible to it. Reading
+  the buffer directly at the moment the emulator polls:
+
+```
+BIOS[0x970B80] = 00781A40 ...        R3000pc = BFC00000
+```
+
+  `0x00781A40` byte-reversed is `0x401A7800` = `mfc0 $k0, $15`, which is exactly the first
+  instruction of the PS1 BIOS. The BIOS is in place and the PC is at the reset vector.
+
+### What actually happens
+
+The emulator's main loop at `0xB3E60` polls `func_000B66E0`, keeps running on status 5, and
+otherwise saves the config and tears down. Instrumenting that call site:
+
+```
+[dbg] emu poll #1 -> status 0   BIOS[0x970B80]=00781A40 ...  R3000pc=BFC00000
+[dbg]   reason(+0x138)=-1  exited(+0x110)=0  +0x10C=00000004 +0x120=00000000
+```
+
+**The loop runs exactly once.** The PC is unchanged at `0xBFC00000` afterwards, so the
+interpreter executed **zero** instructions, and `+0x138` is still the `-1` it is initialised to
+at entry, so it never reached any of its exit-reason paths.
+
+The reason is `+0x120 = 0`. `func_001066A8` loads `r28 = *(r23+0x120)` and decrements it per
+instruction (`subf r28, r7, r28`), so it is the budget of cycles until the next scheduled
+event. At zero the loop ends before it starts.
+
+### Where the zero comes from
+
+`func_00105E68(delay, callback, arg)` is the event scheduler: it takes the running cycle count
+from `+0x124`, the remaining budget from `+0x120`, and schedules a callback `delay` cycles
+ahead, shortening `+0x120` when the new event is sooner. Watching `+0x120` with call sites:
+
+```
+0x76C1A0 <- 0x100   func_00105E68  lr=0x000C29E0
+0x76C1A0 <- 0x40    func_00105E68  lr=0x0010ED78
+0x76C1A0 <- 0x0     func_00105E68  lr=0x0010ED98   <- last
+```
+
+The last one is `func_0010EA58` at `0x10ED94`, which schedules two events back to back --
+`func_00105E68(64, *(TOC-0x7974), 0)` then `func_00105E68(0, *(TOC-0x797C), 0)` -- storing the
+handles at `+0x13C` and `+0x234`. The second schedules an event **due immediately**, which
+pins the budget at zero.
+
+### Next
+
+Two readings, and they need separating before writing any code:
+
+1. A delay of 0 is legitimate ("fire on the next poll") and the interpreter is supposed to
+   *service* the due event and carry on -- in which case something in the event dispatch is
+   not running, and the interpreter returns 0 rather than 5.
+2. The delay of 0 is itself wrong, because one of the two events at `0x10ED74`/`0x10ED94` is
+   being handed a bad parameter -- `func_0010EA58` is reached during init and its inputs have
+   not been checked.
+
+The cheapest discriminator is to watch `+0x124` (the cycle counter) and `+0x13C`/`+0x234` (the
+two event handles) across the single poll, and to read `func_0010EA58`'s callers to see what
+decides those two delays. `func_00105E68` is small and its semantics are now known, so either
+answer should fall out quickly.
