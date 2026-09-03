@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **ROOT CAUSE** — an always-due event throttles it to ~400 instr/sec |
+| R3000 runs continuously | ⬜ **ROOT CAUSE** — blocks on `sys_semaphore_wait(sem=1)`; nothing posts it |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -270,41 +270,48 @@ state**:
 0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
 ```
 
-### Root cause: an always-due event throttles the R3000 to a crawl
+### Root cause: the R3000 blocks on a semaphore nothing ever posts
 
-The main thread is blocked in a kernel wait (`tid 20596: guest=4 ntdll=430`), and its last
-syscalls are `sys_ppu_thread_yield` with guest `lr`s inside the interpreter --- `0x001068F4`,
-`0x00106824`, `0x00106360`, each just after a `bl 0x105FA8` (the event scheduler). The third
-sits in a loop in `func_0010621C` that schedules, yields, checks the exit reason, and repeats.
-
-That much reads like an idle wait, and I first wrote it up as one. Instrumenting the
-scheduler's queue shows otherwise:
+**It is a stop, not a crawl.** Timestamping dispatch and the scheduler from one clock:
 
 ```
-[dbg] sched #1     has-events  due=0x00000000 total=0x00000000
-[dbg] sched #1800  has-events  due=0x00070500 total=0x00070500
-[dbg] sched #2000  has-events  due=0x0007CD00 total=0x0007CD00
+[dbg] disp 10000 t=227640948860us
+[dbg] disp 40000 t=227640971137us      <- 40,000 instructions in ~22 ms
+[dbg] sched #2000 t=227640971108us     <- 2,000 rounds in ~30 ms
 ```
 
-The queue is **never empty**, and **`due == total` every time** --- an event is always due
-*right now*, and the head cycles between a few slots that are fired and immediately re-armed.
+The R3000 runs at a healthy **~1.8 MIPS for ~30 ms**, executes its ~42,000 BIOS instructions,
+and stops dead. (An earlier draft here said "~400 instr/sec" --- that came from dividing the
+instruction count by the whole run length, which assumes it ran throughout. It did not.)
 
-So the core is not parked waiting for a wake. It is **thrashing**: the scheduler computes the
-new budget as `next_due - now`, which is ~0 because something is always due; the interpreter
-gets ~20 instructions; it calls `func_0010621C` to refill, yields, and repeats. Measured:
-~4,799 refill calls and ~2,000 scheduler rounds for ~42,000 instructions. **The R3000 was never
-stopped --- it runs about five orders of magnitude too slowly**, which is why every probe read
-as a stall.
+**The blocking call names itself.** `sc_trace` logs *after* a syscall returns, so a call that
+never returns leaves no trace --- which is why this stayed invisible. Logging syscall **entry**
+gives the main thread's last action:
 
-This vindicates the first diagnosis of the investigation, which I discarded. It opened on "the
-cycle budget at `+0x120` is 0"; I demoted that to a symptom because a zero budget is normal and
-the scheduler tops it up. Both halves were true and the conclusion was still wrong --- it is
-topped up *to ~0*, every time.
+```
+[sc-enter] #9863 num=43 tid=1 lr=0x00106360      ; yield, returns
+[sc-enter] #9864 num=92 tid=1 a3=0x1 lr=0x00113EB4
+```
 
-**Next step:** `func_0010EA58` schedules two events back to back at `0x10ED74` (delay 64) and
-`0x10ED94` (**delay 0**). A delay-0 event re-armed on each fire produces exactly this
-signature. Log the delay argument to `func_00105E68` per call, find which event re-arms at 0,
-and why. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+Syscall **92 is `sys_semaphore_wait`**, on **semaphore 1**, from `0x113EB0` --- the
+double-buffer flip wait. No matching exit line: it never returns.
+
+**And semaphore 1 is never posted** --- counted correctly across three runs, `sem=1 posts: 0`.
+The posts that happen go to semaphores 4, 5, 6, 7, 9, 10.
+
+An earlier claim here that this wait "completes" rested on `grep -c "semaphore_post(sem=1"`,
+which also matches **`sem=10`** (~104 per run). That missing character class turned "never
+posted" into "posted 24 times" and sent the investigation downstream for hours.
+
+**The chain, every link measured:** the R3000 runs ~42,000 BIOS instructions in ~30 ms ->
+reaches the flip wait and calls `sys_semaphore_wait(sem=1)` -> nothing posts it, so the call
+never returns -> the main thread parks in `ntdll` -> GP0 is never written -> the GP0 handler
+never fires -> the GPU SPUs starve and spin -> packets stay at 6.
+
+**Next question, narrow:** what should post semaphore 1? It is created `init=0 max=1` --- a
+one-shot completion latch --- and waited on once. A store watch on the field holding its id
+will name the intended poster. Given the flip context, the likeliest answer is a completion
+callback the runtime never invokes. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

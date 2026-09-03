@@ -2174,3 +2174,71 @@ re-armed each time it fires produces exactly this signature. Log the delay argum
 `func_00105E68` per call and find which event re-arms at 0 --- then why. The scheduler and its
 callers are small and now well understood, and the queue instrumentation to confirm a fix
 already exists.
+
+### ROOT CAUSE, measured end to end: semaphore 1 is never posted
+
+Two corrections first, because both of my previous readings of this were wrong and for
+instructive reasons.
+
+**It is a stop, not a crawl.** Timestamping dispatch and the scheduler from one clock:
+
+```
+[dbg] disp 10000 t=227640948860us
+[dbg] disp 40000 t=227640971137us      <- 40,000 instructions in ~22 ms
+[dbg] sched #1    t=227640941404us
+[dbg] sched #2000 t=227640971108us     <- 2,000 rounds in ~30 ms
+```
+
+The R3000 runs at a healthy **~1.8 MIPS for about 30 ms**, executes its ~42,000 BIOS
+instructions, and then stops dead. The "always-due event throttles it to ~400 instr/sec"
+entry above is **wrong** --- that rate came from dividing the instruction count by the whole
+run length, which assumes it ran throughout. It did not.
+
+**And the blocking call names itself.** `sc_trace` logs *after* a syscall returns, so a call
+that never returns leaves no trace at all --- which is why the blocker stayed invisible.
+Logging syscall **entry** (`PS3_SCENTER=1`) gives the last thing the main thread ever did:
+
+```
+[sc-enter] #9863 num=43 tid=1 lr=0x00106360     ; yield, returns
+[sc-enter] #9864 num=92 tid=1 a3=0x1 lr=0x00113EB4
+```
+
+Syscall **92 is `sys_semaphore_wait`**, on **semaphore 1**, from `0x113EB0` --- the
+double-buffer flip wait. There is no matching exit line. It never returns.
+
+**And semaphore 1 is never posted.** Counted correctly across three independent runs:
+
+```
+scratch/sem2.log      sem=1 posts: 0
+scratch/nogfxerr.log  sem=1 posts: 0
+scratch/isr.log       sem=1 posts: 0
+```
+
+The posts that do happen go to semaphores 4, 5, 6, 7, 9 and 10 --- never 1.
+
+**This also corrects an earlier claim in this file that the fence wait "completes".** That
+rested on two mistakes: an unchecked assumption that the guest was single-threaded through
+that path, and `grep -c "semaphore_post(sem=1"` --- which also matches **`sem=10`**, of which
+there are ~104 per run. The "24 posts to sem 1" figure quoted earlier was that artifact. A
+missing character class turned "never posted" into "posted 24 times" and sent the
+investigation downstream for hours.
+
+**The complete chain, every link measured:**
+
+```
+the R3000 runs ~42,000 BIOS instructions in ~30 ms at ~1.8 MIPS
+  -> reaches the flip wait at 0x113EB0 and calls sys_semaphore_wait(sem=1)
+     -> nothing ever posts semaphore 1, so the call never returns
+        -> the main guest thread parks in ntdll for the rest of the run
+           -> the R3000 executes nothing further, so GP0 is never written
+              -> the GP0 handler func_0010C48C never fires
+                 -> the GPU SPUs get no command packets and spin at LS 0x1268
+                    -> no PS1 GPU output; the packet count stays at 6
+```
+
+**The next question is narrow and concrete:** what is supposed to post semaphore 1? It is
+created `init=0 max=1` (a one-shot completion latch) and waited on exactly once. Find the
+guest code that would post it --- the semaphore id is stored in some object, so a store watch
+on that field will name the writer and the intended poster --- and determine why that path
+never runs. Given the flip context, the likeliest answer is a completion callback the runtime
+never invokes.
