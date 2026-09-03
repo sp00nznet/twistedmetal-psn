@@ -228,10 +228,20 @@ thread received on queue 0 and exited outright; with it the thread stays alive a
 real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
 graphics-error dumps.
 
-**Still not rendering**, GPU packets at 6. But the question is better posed now: the main
-thread spins on `sys_ppu_thread_yield` (syscall 43) from inside the interpreter rather than
-blocking on a wait --- so it is **polling a memory location**, not sleeping on a primitive.
-Finding which location is the next step, and a store/read watch is the tool for it.
+**Still not rendering**, GPU packets at 6. Counting the full syscall trace for guest thread 1
+--- the one that runs the R3000 --- gives the clearest picture yet, and corrects an earlier
+yield-spin reading of mine: **7,008** calls to `sys_timer_usleep` with `r3 = 0x1E` (a
+**30 microsecond** sleep) against 1,178 yields, out of 8,397 total. So the main thread is
+**polling**, alive and running --- not blocked and not deadlocked. No missing wakeup will fix
+that; the condition it re-checks simply never becomes true.
+
+The one PPU spin worth reading turned out to be a raw-SPU mailbox wait at `0xD19A0`
+(`SPU_Mbox_Stat` at `+0x4014`, masking `0x0000FF00` = inbound free slots), and the runtime
+already answers that register correctly from live state --- so it is ruled out too.
+
+The 55 `sys_timer_usleep` sites cluster around `0x1101D8`-`0x111AB8`, the disc/streaming
+region. Identifying which one the main thread sits in, via the guest `lr` at syscall 141, is
+the next step --- exactly how the `lr` on `sys_semaphore_wait` named the flip wait.
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
