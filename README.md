@@ -205,26 +205,18 @@ effect:
    33 MHz, so throughput is orders of magnitude short --- consistent with the interpreter
    getting very small budget slices and paying a millisecond-scale wait per slice, rather than
    with the copy itself being expensive.
-2. **SPU 4 is deadlocked on a reservation nobody breaks.** The audio core parks at
-   `pc=0x0A5E8` on `rdch SPU_RdEventStat` waiting for `MFC_LLR_LOST_EVENT`:
+2. ~~**SPU 4 is deadlocked on a reservation nobody breaks.**~~ **Fixed.** The audio core
+   parked at `pc=0x0A5E8` on `rdch SPU_RdEventStat` waiting for `MFC_LLR_LOST_EVENT` on a
+   line (`0x2DEF80`) that a store watch confirms is only ever zero-initialised. The cause was
+   not a missing writer but `rchcnt` answering "ready" for a channel it had no case for, which
+   lured the SPU into a read it could never complete --- see
+   [Toolchain changes](#-toolchain-changes-upstreamed-to-ps3recomp). `ch-wait` stalls went
+   from blocking for 26+ s to **zero**.
 
-   ```
-   [ch-wait] spu=4 pc=0x0A5E8 ch=0 waited=26000ms evstat=0x0 evmask=0x400 resv[valid=1 ea=0x002DEF80]
-   ```
+That leaves the interpreter's throughput as the open question: what the budget is each slice
+and where the wall-clock goes.
 
-   The runtime's producer for that bit is wired correctly and every gate passes --- mask is
-   `0x400`, the reservation is valid, the EA is non-zero --- so `spu_resv_lost_poll` is
-   running and finding the reserved 128-byte line **unchanged**. Nobody writes `0x2DEF80`.
-
-   Ruled out: the audio event chain is not the cause. `cellAudioPortOpen` ->
-   `CreateNotifyEventQueue` (id 3, key `0x8000000000000001`) -> `SetNotifyEventQueue` ->
-   `PortStart` all succeed, the mixing thread starts, and `_xSPUWaveOut` (tid 6) cycles on
-   that queue rather than sleeping on it.
-
-The next measurement is a store watch on `0x2DEF80` to name the writer the guest expects, and
-a rate check on the interpreter's budget slices to see where the wall-clock goes.
-
-### What unblocked it: the opcode dispatch table was never lifted
+# What unblocked it: the opcode dispatch table was never lifted
 
 Worth writing down, because the symptom pointed nowhere near the cause.
 
@@ -282,6 +274,24 @@ recovered curve and the ECDSA lifter bug that used to sit here --- is in
 [`docs/disc-body.md`](docs/disc-body.md).
 
 ## 🔧 Toolchain changes upstreamed to ps3recomp
+
+- **`runtime/spu/spu_channels.c` --- `rchcnt SPU_RdEventStat` lied, and it deadlocked an SPU.**
+  `spu_rchcnt` had no case for that channel, so it fell through to `default: return 1`
+  ("channel ready"). The SPU idiom is a *guarded* blocking read:
+
+  ```
+  08934  rchcnt $r12, SPU_RdEventStat   ; is an event pending?
+  08938  brnz   $r12, 0xA5E8            ; yes -> commit to the blocking rdch
+  0893C  il     $r30, 8960              ; no  -> carry on working
+  ```
+
+  Answering 1 unconditionally sent the SPU into a `rdch` that then parked forever, because
+  `rdch` correctly blocks while `(event_status & event_mask) == 0`. `rchcnt` and `rdch`
+  disagreed. ps1_netemu's audio SPU sat at `0x0A5E8` waiting for `MFC_LLR_LOST_EVENT` on a
+  line nothing was ever going to touch --- a store watch confirmed `0x2DEF80` is only ever
+  zero-initialised --- when on hardware it would simply have fallen through and kept working.
+  Now the same condition as `spu_ch_ready`'s case, lost-reservation poll included, so the two
+  agree by construction.
 
 - **`tools/ppu_lifter.py` --- jump-table detection missed the biggest dispatcher in the
   image.** Two independent bugs, both found on `ps1_netemu`'s R3000 opcode table:

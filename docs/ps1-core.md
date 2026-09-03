@@ -635,43 +635,63 @@ The interpreter neither returns nor takes the switch's `default` arm, so it is b
 33 MHz PS1. That is far too slow to be the copy itself, and points at the interpreter getting
 very small budget slices with a millisecond-scale wait per slice.
 
-### Next: SPU 4's unbroken reservation
+### Resolved: SPU 4's deadlock was `rchcnt` lying, not a missing writer
 
-The audio core (image 2) parks at `pc=0x0A5E8`, and the SPU code names the event outright:
+The audio core (image 2) parked at `pc=0x0A5E8`, and the SPU code names the event outright:
 
 ```
 0A5E8  il    $r15, 1024              ; 0x400 = MFC_LLR_LOST_EVENT
 0A5EC  rdch  $r14, SPU_RdEventStat
 0A5F0  and   $r13, $r14, $r15
-0A5F4  brz   $r13, 0x893C            ; not lost yet -> go round again
+0A5F4  brz   $r13, 0x893C            ; not the lost bit -> back to work
 ```
 
-This is the GETLLAR / "wait until another processor touches this line" idiom, and the runtime
-already has the only producer for that bit (`spu_resv_lost_poll` in `spu_channels.c`). Every
-gate it checks passes:
+Every gate in the runtime's producer passed:
 
 ```
 [ch-wait] spu=4 pc=0x0A5E8 ch=0 waited=26000ms evstat=0x0 evmask=0x400 resv[valid=1 ea=0x002DEF80]
 ```
 
-mask `0x400`, reservation valid, EA non-zero. So the poll runs on every blocked read and
-finds the reserved 128-byte line **unchanged**: nobody writes `0x2DEF80`.
+mask `0x400`, reservation valid, EA non-zero --- so `spu_resv_lost_poll` ran on every blocked
+read and found the reserved line unchanged. A store watch
+(`LBP_WW=0x2DEF80 LBP_WW_LEN=0x80`) agreed: the only writes to that line are zeros from an
+initialiser at `guest-fn=0x000A7FB4`.
 
-Ruled out --- the audio event chain is alive. `cellAudioPortOpen` ->
-`CreateNotifyEventQueue` (id 3, key `0x8000000000000001`) -> `SetNotifyEventQueue` ->
-`PortStart` all succeed, the mixing thread starts, and `_xSPUWaveOut` (tid 6) *cycles* on
-that queue rather than sleeping on it. The PPU side of audio runs; it just never touches the
-line SPU 4 reserved.
+**That was the symptom.** The right question was not who breaks the reservation but how the
+SPU entered a blocking read at all, and the answer is four instructions earlier:
 
-Two measurements next:
+```
+08934  rchcnt $r12, SPU_RdEventStat   ; is an event pending?
+08938  brnz   $r12, 0xA5E8            ; yes -> commit to the blocking rdch
+0893C  il     $r30, 8960              ; no  -> carry on working
+```
 
-1. A store watch on that address (`LBP_WW=0x2DEF80 LBP_WW_LEN=128`) to name the writer the
-   guest expects. If nothing ever writes it, then the EA recorded at GETLLAR is itself the
-   suspect --- an SPU reserving a *local-store* address, or a DMA EA we mis-decoded, would
-   both present exactly like this.
-2. The interpreter's slice size and wall cost, to explain the 40k-instructions-per-100s rate.
-   The two millisecond-scale waits in reach are `ps3_intr_wait`'s 1 ms poll and
-   `spu_ch_wait`'s 10 ms condition-variable timeout.
+It is a **guarded** read. `spu_rchcnt` had no case for `SPU_RdEventStat` and fell through to
+`default: return 1`, so it always answered "an event is pending". `rdch` then blocked
+correctly, because `(event_status & event_mask)` really was 0. `rchcnt` and `rdch` disagreed,
+and the SPU was lured into a read it could never complete. On hardware it would have fallen
+through to `0x893C` and kept working --- the line at `0x2DEF80` was never meant to change,
+which is exactly what the store watch was telling us.
 
-The `[ch-wait]` heartbeat now prints `evstat`/`evmask` and the reservation state, which is
-what turned "an SPU is stuck" into a named event and a named address in a single run.
+The fix is one case, reusing the condition `spu_ch_ready` already applies so the two agree by
+construction:
+
+```c
+case SPU_RdEventStat:
+    spu_resv_lost_poll(ctx);
+    return (ctx->event_status & ctx->event_mask) != 0;
+```
+
+`ch-wait` stalls went from 26+ seconds of blocking to **zero**. The check is behavioural:
+`grep -c ch-wait` on a run log should stay at 0.
+
+A note for whoever meets the next one of these: `default: return 1` is a reasonable default
+for a channel whose count is genuinely always ready, and it is exactly wrong for any channel
+whose `rdch` can block. Those two properties have to be decided together.
+
+### Next: interpreter throughput
+
+The remaining question is the R3000's rate --- ~40,000 instructions over ~100 s against a
+33 MHz PS1. Measure the budget each slice actually gets (`func_00105FA8`'s return value) and
+how long a slice takes. The millisecond-scale waits in reach are `ps3_intr_wait`'s 1 ms poll
+and `spu_ch_wait`'s 10 ms condition-variable timeout.

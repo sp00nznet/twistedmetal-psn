@@ -1065,12 +1065,49 @@ escaped text --- the same scripted-edit damage previously fixed in README.md.
 
 Detail: [`docs/ps1-core.md`](docs/ps1-core.md).
 
+## 2026-09-03 (later) -- SPU 4's deadlock: `rchcnt` and `rdch` disagreed
+
+The audio SPU parked at `pc=0x0A5E8` on `rdch SPU_RdEventStat` waiting for
+`MFC_LLR_LOST_EVENT` (`0x400`), and every gate in our producer passed --- mask `0x400`,
+reservation valid, EA `0x2DEF80`. The obvious reading was "nobody breaks the reservation",
+and a store watch seemed to confirm it: the only writes to that line are zeros from an
+initialiser at `guest-fn=0x000A7FB4`.
+
+That reading was the symptom. The question worth asking was not *who breaks the reservation*
+but **how the SPU got into a blocking read at all**, and the answer is a few instructions
+earlier:
+
+```
+08934  rchcnt $r12, SPU_RdEventStat   ; is an event pending?
+08938  brnz   $r12, 0xA5E8            ; yes -> commit to the blocking rdch
+0893C  il     $r30, 8960              ; no  -> carry on working
+```
+
+It is a *guarded* read: the SPU asks first and only blocks if told an event is waiting.
+`spu_rchcnt` had **no case** for `SPU_RdEventStat`, so it fell through to `default: return 1`
+and always said yes. `rdch` then correctly blocked, because `(event_status & event_mask)` was
+genuinely 0. The two disagreed, and the SPU was lured into a read it could never complete. On
+hardware it would have fallen through to `0x893C` and kept working; the line at `0x2DEF80`
+was never meant to change.
+
+One case fixes it, with the same condition `spu_ch_ready` already uses (lost-reservation poll
+included, so the two agree by construction):
+
+```c
+case SPU_RdEventStat:
+    spu_resv_lost_poll(ctx);
+    return (ctx->event_status & ctx->event_mask) != 0;
+```
+
+`ch-wait` stalls: 26+ seconds of blocking -> **zero**. The check is behavioural and cheap to
+re-run: `grep -c ch-wait` on any run log should stay at 0.
+
+That leaves interpreter throughput as the single open question.
+
 ## Next steps
 
-1. **Name the writer of `0x2DEF80`.** A store watch (`LBP_WW=0x2DEF80 LBP_WW_LEN=128`) on the
-   guest address SPU 4 reserved. If no PPU code ever writes it, the reservation EA we recorded
-   at GETLLAR is the thing to check next; if something does write it but later, the deadlock is
-   an ordering problem rather than a missing producer.
+1. ~~Name the writer of `0x2DEF80`.~~ **Done, and the premise was wrong** --- the line was
+   never meant to change; `rchcnt` was lying. See the entry above.
 2. **Account for the interpreter's wall clock.** ~40,000 R3000 instructions in ~100 s is
    orders of magnitude short of a 33 MHz PS1. Measure the budget each slice actually gets
    (`func_00105FA8`'s return value) and how long a slice takes; a millisecond-scale wait per
