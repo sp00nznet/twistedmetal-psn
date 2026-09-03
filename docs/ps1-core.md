@@ -67,19 +67,65 @@ old behaviour, and `tools/run.sh` points it at the install tree. The config file
 
 ## Where it stops now
 
-No spins, no stalled SPUs. `tid=2` parks on `sys_event_queue_receive` with **queue id 0** --
-an uninitialised handle, the same shape as the `sys_semaphore_wait(id 0)` spin that the
-`cellAdecOpen` fix cured:
+The three fixes above moved the wall a long way. There are now **no spins at all** -- no
+`HOTREAD`, no `ch-wait`, no busy syscall -- 30,784 frames render in a 150-second run, the
+audio thread services 20,032 real events on its queue, and the config file saves. But
+`packets[seen=0]`: the guest issues no draw commands, and the game does not start.
+
+The reason is one line in the log:
 
 ```
-[sc] 130(0x0, 0xD0004EE0, 0x0, 0x0) -> 0x80010005 (ESRCH) tid=2
-[GSTACK:waitbt tid=2 q=0] sp=0xD0004E30 cia=0x001B7768 lr=0x0001A5E4
+[spu-raw] spu4 stopped: halted=1 pc=0x3FFB0 lr=0x000C8 steps=8288 stop_code=0x0
 ```
 
-The waiter is `func_0001A5D8`. Something upstream should have created that queue and stored
-its id, and did not -- so the next step is the same one that worked for the semaphore: find the
-creator, find what it bailed on.
+**SPU 4 -- the GPU core -- runs away and halts.** The image is 58,208 bytes, so `0x3FFB0` is
+far past the end of it, in zero-filled local store; an all-zero word decodes as `stop 0`,
+which is the `halted=1 stop_code=0x0`. It branched into empty LS.
 
-Also worth noting for later: `user_memory_size= 0/0 <0>` is printed right after `boot from`,
-where the earlier print in the same run reported `201326592/268435456`. That zero looks wrong
-and may be the same missing initialisation seen from the other side.
+This is progress, not a regression: before the lost-reservation fix, SPU 4 blocked forever at
+`0x0A5E8` and never got here. That wait loop is now confirmed correct end to end --
+
+```
+0A5E8: il   $r15, 1024              ; the Lr mask, 0x400
+0A5EC: rdch $r14, SPU_RdEventStat   ; blocks until the reservation is lost
+0A5F0: and  $r13, $r14, $r15
+0A614: wrch SPU_WrEventAck, $r22    ; ack it
+0A61C..30: MFC_LSA / EAL / Size=128 / TagID / Cmd=0xD0   ; re-issue GETLLAR
+0A634: rdch $r2, MFC_RdAtomicStat
+```
+
+-- wait, acknowledge, re-reserve, loop, exactly as the hardware protocol says. SPU 4 takes
+that path three times and then runs on for 8,288 instructions before dying.
+
+Two observations for whoever picks this up:
+
+- **The step count varies between runs** (8,297 / 8,288 / 8,288), so the runaway is
+  timing-dependent. That points at a synchronisation problem -- a DMA or channel result read
+  at the wrong moment -- rather than a deterministic mistranslation, which would fail at the
+  same instruction every time.
+- **SPUs 0-3 (the R3000/GTE cores, sharing the 84,992-byte image) are idle on `rdch ch=29`
+  (`SPU_RdInMbox`) at `pc=0x011A0`**, waiting for the PPU to hand them work. That is the
+  right place for them to be parked before the game starts; they are almost certainly
+  waiting on the GPU core that just died.
+
+## An open oddity
+
+`user_memory_size= 0/0 <0>` prints right after `boot from`, where the same run reported
+`201326592/268435456 <67108864>` earlier. Both print sites disassemble to `li r11, 352; sc`
+(`sys_memory_get_user_memory_size`) -- but **syscall 352 never appears in a full syscall
+trace, and our handler never logs**, in either case. So the values are not coming from where
+the disassembly says they are, and that is unresolved. It may be harmless (a second pool that
+legitimately reads zero) or it may be the same missing initialisation seen from another side.
+Worth settling before trusting anything else about the PS1 core memory setup.
+
+## The event queue the gcm thread waits on
+
+`tid=2` is `_gcm_intr_thread`, and it receives on **queue id 0** -- ESRCH, 20k times. The id
+comes from `*(obj + 0x12D0)` where `obj` is `func_000120E4`'s return, which is null because
+`*(0x2D80B4)` is never written. Exactly one instruction writes that field
+(`0x1200C`, in `func_00011FF4`, which selects one of four 28-byte entries), reached from one
+real call site (`0x12A24` in `func_0001299C`, which rejects an index of -1 with
+`0x802100FF`). A watch confirms the field is never written in a whole run.
+
+This is not what stops the game -- graphics run at 58 fps regardless -- so it is filed rather
+than chased.
