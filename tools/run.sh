@@ -25,6 +25,10 @@ export PS3_DEV_FLASH="${PS3_DEV_FLASH:-G:/recomp/tools/rpcs3/dev_flash}"
 export PS3_HDD0_ROOT="${PS3_HDD0_ROOT:-$ROOT_W/vfs/dev_hdd0}"
 export PS3_VFS_ROOT="${PS3_VFS_ROOT:-$ROOT_W/vfs}"
 export RSX_LIVE_DRAW="${RSX_LIVE_DRAW:-1}"
+# Window title. The harness would otherwise fall back through PARAM.SFO and
+# land on a name from whichever port seeded the shared runtime -- confusing
+# when four PS3 ports share one window path. Name this one outright.
+export PS3_TITLE="${PS3_TITLE:-Twisted Metal (PSOne Classic) - ps3recomp}"
 # The harness reads the title id from <vfs>/PS3_GAME/PARAM.SFO. Without it
 # cellGame keeps the BLES00000 placeholder, and every /dev_hdd0/game/<id> path
 # the emulator builds -- its content dir, its save dir -- points at a title that
@@ -49,6 +53,9 @@ export RSX_LIVE_DRAW="${RSX_LIVE_DRAW:-1}"
 # content id -- for a PSOne Classic those differ (SCUS94304 vs NPUI94304).
 PS1_SERIAL="${PS1_SERIAL:-SCUS94304}"
 PS1_CONTENT="${PS1_CONTENT:-NPUI94304}"
+# A bare "/USRDIR/..." (ps1_netemu saves its CONFIG there) must resolve inside
+# the installed game tree, not at the vfs root.
+export PS3_USRDIR_BASE="${PS3_USRDIR_BASE:-$ROOT_W/vfs/dev_hdd0/game/${PS1_CONTENT}}"
 export YDKJ_BOOTPATH="${YDKJ_BOOTPATH:-/dev_flash/ps1emu/ps1_netemu.self}"
 export PS3_ARGV="${PS3_ARGV:-${PS1_SERIAL}_mc1.VM1;${PS1_SERIAL}_mc2.VM1;0082;1600;/dev_hdd0/game/${PS1_CONTENT};1;2;1}"
 

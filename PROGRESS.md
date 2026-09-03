@@ -23,7 +23,8 @@
 | 12c. Header | read, streamed and hashed | ✅ — guest SHA-1 matches Python byte for byte |
 | 12d. Body | disc body opens (`EBOOT.PBP`) | ✅ — header signature verifies |
 | 12e. Boot | firmware boots the PS1 title | ✅ — `North American Title detected!` |
-| 12f. Core | R3000/GTE core runs | ⬜ — blocked: SPU 4 parks on a channel read |
+| 12f. SPUs | all SPU cores run without stalling | ✅ — Lr event + usbd receive |
+| 12g. Core | R3000/GTE core runs | ⬜ — blocked: event queue id 0 |
 | 13. Render | Twisted Metal on screen | ⬜ |
 | 14. Input / audio / VMC | | 🔄 — pad read served; audio + VMC threads up |
 
@@ -917,6 +918,35 @@ Next: the PS1 core start-up. SPU 4 parks on a channel read at `pc=0x0A5E8` and t
 on `0xD0009F90` -- the R3000/GTE core waiting for work.
 
 Detail: [`docs/disc-body.md`](docs/disc-body.md).
+
+## 2026-09-02 (night) -- three stalls between the boot and the PS1 core
+
+**The lost-reservation event had no producer.** SPU 4 parked forever at `rdch ch=0` with
+evmask=0x400 -- `SPU_RdEventStat` waiting on `MFC_LLR_LOST_EVENT`, the standard "GETLLAR, arm
+Lr, block until another processor writes the line" idiom. The runtime tracked reservations for
+PUTLLC but never set the 0x400 bit; only 0x1 and 0x2 were ever produced. `spu_resv_lost_poll()`
+compares the reserved line against the snapshot GETLLAR already takes -- one memcmp per 10 ms
+poll on a blocked SPU, nothing on the PPU store path. 23 multi-second `ch-wait` stalls -> 0.
+
+**`sys_usbd_receive_event` (540) returned instead of blocking.** 384,339 calls in a 45-second
+run -- one thread spinning a core flat out. Identified from RPCS3's table and corroborated by
+the guest loop's shape (dispatches event types, forwards 1/2 with `sys_event_port_send` = 138).
+On hardware it sleeps until an event is queued; our stub returned CELL_OK instantly with the
+out-params untouched, so the guest read type 0 and looped. Now reports "no event" explicitly
+and sleeps 20 ms: 384,339 -> 2,203 calls, and every HOTREAD/ch-wait spin went to zero.
+
+**A bare `/USRDIR/` resolved to the vfs root.** The flOw flattening in `sys_fs.c` sent
+`/USRDIR/CONFIG` to `<vfs>/USRDIR/CONFIG`; this title has a full `/dev_hdd0/game/<ID>` tree.
+`PS3_USRDIR_BASE` overrides it (opt-in, so flattened trees are unaffected) and run.sh points it
+at the install tree. `save config file: /USRDIR/CONFIG` / `failed` is now a successful open.
+
+Also: the window caption is now set explicitly via `PS3_TITLE` in run.sh, so it names this
+title instead of inheriting a name from whichever port seeded the shared runtime.
+
+Next: `tid=2` parks on `sys_event_queue_receive` with **queue id 0**, an uninitialised handle --
+the same shape as the old `sys_semaphore_wait(id 0)` spin. The waiter is `func_0001A5D8`.
+
+Detail: [`docs/ps1-core.md`](docs/ps1-core.md).
 
 ## Next steps
 

@@ -164,7 +164,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Disc header read, streamed and hashed | ✅ Done — guest SHA-1 matches Python byte for byte |
 | Disc body opens (`EBOOT.PBP`) | ✅ Done — header signature verifies, `EBOOT.PBP` opened |
 | PS1 title boots | ✅ Done — `North American Title detected!`, `boot from /dev_hdd0/game/NPUI94304` |
-| PS1 core runs (R3000 on SPU) | ⬜ **blocker** — SPU 4 parks on a channel read |
+| SPU cores run (no stalls) | ✅ Done — lost-reservation event + `sys_usbd_receive_event` |
+| PS1 core runs (R3000) | ⬜ **blocker** — `sys_event_queue_receive` on an uninitialised queue id 0 |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
