@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — flip deadlock cleared; still stops under 50k instructions |
+| R3000 runs continuously | ⬜ **blocker** — located: a `cellGcmFinish` fence wait on `ctrl->ref` |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -228,20 +228,33 @@ thread received on queue 0 and exited outright; with it the thread stays alive a
 real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
 graphics-error dumps.
 
-**Still not rendering**, GPU packets at 6. Counting the full syscall trace for guest thread 1
---- the one that runs the R3000 --- gives the clearest picture yet, and corrects an earlier
-yield-spin reading of mine: **7,008** calls to `sys_timer_usleep` with `r3 = 0x1E` (a
-**30 microsecond** sleep) against 1,178 yields, out of 8,397 total. So the main thread is
-**polling**, alive and running --- not blocked and not deadlocked. No missing wakeup will fix
-that; the condition it re-checks simply never becomes true.
+**The blocker is now located.** Following the poll to its source, with existing diagnostics:
 
-The one PPU spin worth reading turned out to be a raw-SPU mailbox wait at `0xD19A0`
-(`SPU_Mbox_Stat` at `+0x4014`, masking `0x0000FF00` = inbound free slots), and the runtime
-already answers that register correctly from live state --- so it is ruled out too.
+1. **The poll site.** The syscall trace mapped a *host* backtrace to the nearest guest
+   function (hence the bogus `func_00013040+0x9FF1`); adding `ctx->lr` names it at once ---
+   **8,207** hits at `glr=0x00019928`, next is 232.
+2. **The loop** at `0x000198F4` writes a fence, then spins: `lwz r0, 0x8(r3)` /
+   `cmpw r31, r0` / `usleep(30us)` / re-read.
+3. **The object** is `*(TOC-0x6AD8)->[0x10]`, and a store watch gives `0x20002000` ---
+   exactly our `GCM_CONTROL_GUEST_ADDR`. Offset `+0x08` of `CellGcmControl` is **`ref`**.
 
-The 55 `sys_timer_usleep` sites cluster around `0x1101D8`-`0x111AB8`, the disc/streaming
-region. Identifying which one the main thread sits in, via the guest `lr` at syscall 141, is
-the next step --- exactly how the `lr` on `sys_semaphore_wait` named the flip wait.
+So it is the `cellGcmSetReferenceCommand` / `cellGcmFinish` handshake. And:
+
+```
+[DRAIN] getoff=00002184 put=00002184 ref=00000002
+[refq] drained fence 0xFFFFFFFF / 0x0 / 0x1 / 0x2   (last at getoff 0x1420)
+```
+
+The FIFO is **fully drained** --- nothing stuck in the pipe --- exactly four fences were
+decoded, and `ref` sits at **2** while the guest polls for a value it never sees. The emulator
+is not deadlocked on a primitive and not missing a wakeup: it is waiting on a **fence value
+mismatch**.
+
+**The single next step** is `r4` at `func_000198F4` --- the expected value. It decides between
+a fence above 2 that our FIFO walker failed to decode in the `0x1420`-`0x2184` span (several
+methods there are already logged as "unknown"), and an equality-miss on a value the
+one-fence-per-tick pacing published and moved past. Detail in
+[`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

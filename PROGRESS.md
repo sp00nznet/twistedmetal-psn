@@ -1335,3 +1335,69 @@ published copy would go stale --- so this is not the blocker either, and it is r
 two old `ExitPS1(3)` sites). The next step is to identify *which* of those the main thread is
 sitting in and what it re-reads each pass --- one probe on the guest `lr` at syscall 141 would
 name it, the same way the `lr` on `sys_semaphore_wait` named the flip wait.
+
+### The blocker, located: a `cellGcmFinish` fence wait on `ctrl->ref`
+
+Chasing the poll to its source, entirely with existing diagnostics (no rebuilds beyond adding
+the guest `lr` to the syscall trace).
+
+**1. Name the poll site.** The syscall trace mapped a *host* backtrace to the nearest guest
+function, which is why it kept reporting a bogus `func_00013040+0x9FF1`. Adding `ctx->lr` --
+authoritative, and what named the flip wait -- gives it immediately:
+
+```
+8207  glr=0x00019928      <- the poll
+ 232  glr=0x00032D54
+   1  glr=0x00116518
+```
+
+**2. Read the loop** at `0x000198F4`:
+
+```
+000198F4  (r3 = obj, r4 = expected)
+00019918  bl 0x16D18            ; writes the fence command
+00019920  bl 0x1989C
+00019924  bl 0x15394            ; r3 = the object          <- lr = 0x19928
+0001992C  lwz r0, 0x8(r3)
+00019934  cmpw cr7, r31, r0     ; expected == *(obj+8) ?
+00019938  beq -> done
+0001993C  li r3, 30 ; li r11, 141 ; sc    ; usleep(30us)
+00019948  lwz r29, 0x8(r30)     ; re-read
+00019950  bne -> loop
+```
+
+**3. Resolve the object.** `func_00015394` returns `*(TOC-0x6AD8)->[0x10]`, and a store watch
+gives the value: `0x002D8384 <- 0x20002000`. That is
+`GCM_CONTROL_GUEST_ADDR` (`VM_HLE_INJECT_BASE + 0x2000`) -- **exactly** the address our runtime
+uses -- and `+0x08` of `CellGcmControl` is **`ref`**.
+
+So this is the classic `cellGcmSetReferenceCommand` / `cellGcmFinish` handshake: write a fence
+into the FIFO, then spin until `ctrl->ref` equals it.
+
+**4. Where it breaks.** `GCM_DRAINDBG` and `GCM_REFLOG`:
+
+```
+[DRAIN] getoff=00002184 put=00002184 ref=00000002 ctx.current=00000000
+[refq] drained fence 0xFFFFFFFF at getoff=00001398
+[refq] drained fence 0x0        at getoff=00001410
+[refq] drained fence 0x1        at getoff=00001418
+[refq] drained fence 0x2        at getoff=00001420
+```
+
+The FIFO is **fully drained** (`get == put`), so nothing is stuck in the pipe, and exactly four
+fences were decoded -- the last at `0x1420`, while the guest went on to write commands out to
+`0x2184`. `ref` sits at **2** and the guest is polling for something it never sees.
+
+That is a much better-posed question than "the R3000 stalls": the emulator is not deadlocked on
+a primitive and not starved of a wakeup -- it is waiting on a **fence value mismatch**.
+
+**The single next step** is the expected value: `r4` at `func_000198F4`. One probe reading it
+decides between the two remaining explanations:
+
+* the guest wants a fence **> 2** that it wrote after `0x1420` and our FIFO walker did not
+  decode as `SET_REFERENCE` (the words in that span decode to methods `0x60`/`0x64`/`0x68`/
+  `0x1D84`/`0x1804`/`0x1EA4`, several of which the RSX layer already logs as "unknown method",
+  so a mis-counted batch there is plausible); or
+* the guest wants **1** (or `0`), which the one-fence-per-tick pacing published and moved past
+  before this particular wait began -- the same equality-miss hazard the pacing was written to
+  prevent, which would mean the window is still too short for this title.
