@@ -2700,3 +2700,85 @@ One more thing to fix before drawing timing conclusions: **boot is racy.** Acros
 run reached no cellAdec activity at all. Every run does eventually freeze, so the variance is in
 *when*, not *whether* --- but any measurement taken from a single run needs that caveat
 attached.
+
+## CORRECTION: the PPU -> SPU GPU handoff works. The freeze is on our side.
+
+The section above concluded that the four GPU SPUs "are never sent a 4th inbound mailbox word"
+and therefore "consume nothing". **Both halves of that are wrong**, and the way they were wrong
+is worth keeping, because it is the same mistake three times over in this port.
+
+### The SPU is not waiting for a 4th mailbox word
+
+Reading the lifted SPU code instead of inferring from a log line, `spu0_spu_func_000011A0` is:
+
+```c
+spu_wrch(ctx, SPU_WrOutMbox, 0x15010);        /* "ready; my poll word is at LS 0x15010" */
+ctx->gpr[9] = spu_rdch(ctx, SPU_RdInMbox);    /* word 1 */
+ctx->gpr[8] = spu_rdch(ctx, SPU_RdInMbox);    /* word 2 */
+ctx->gpr[7] = spu_rdch(ctx, SPU_RdInMbox);    /* word 3 */
+...
+{ ctx->pc = 0x1268; ... }                     /* falls through to the steady-state loop */
+```
+
+It reads **exactly three** words, and the PPU sends exactly three (`0x40600000`, the ring base
+`0x00D70E80`, then `0`). The handshake completes. The `[ch-block] ... pc=0x011A0 op=rdch ch=29`
+lines were **init-time transients** --- the channel logger prints while a read waits, and those
+reads were later satisfied. I read a snapshot of a transient state as the steady state.
+
+### And the steady-state kick lands on all four SPUs
+
+The loop the SPUs actually sit in is `0x1268`, and it is a poll, not a mailbox read:
+
+```c
+ctx->gpr[8]  = spu_ls_read128(ctx, 0x15010);      /* its own poll word   */
+ctx->gpr[19] = spu_ceq(ctx->gpr[84], ctx->gpr[8]); /* vs. last consumed  */
+if (...) { ctx->pc = 0x3140; ... }                 /* changed -> do work */
+```
+
+`0x15010` is the address it reported through the outbound mailbox. And `func_0010F658`'s four
+stores write the new ring offset to exactly that address in each SPU's local store --- a raw
+SPU's local store is aliased into guest memory (`s->ctx->ls = vm_base + s->base`), so those are
+plain stores that need no MMIO hook. Which is why the SPU MMIO trace showed no local-store
+writes: **there is nothing to log.** I read that absence as "the kick is lost".
+
+Measured directly, reading the same bytes the SPU reads:
+
+```
+ring[base=0x00D70E80 off=0x00004300] spuLS[00004300 00004300 00004300 00004300]
+```
+
+67 packets published, and **all four GPU SPUs see the exact ring offset**. The PPU -> SPU GPU
+handoff works.
+
+### Three misreads, one shape
+
+| what I concluded | what was actually true |
+|---|---|
+| SPUs blocked forever on `rdch ch=29` | a transient during init; the read completed |
+| the kick is lost (no LS writes logged) | LS is aliased, so correct writes log nothing |
+| SPUs never told about new packets | all four read the exact current offset |
+
+Every one of them is **absence of evidence read as evidence of absence** --- a capped log, an
+unhooked path, a transient snapshot. The same shape as the semaphore-post cap and the missing
+`GetPcmItem` log line earlier in this port. The rule that would have caught all five: *before
+concluding "X never happens", establish that X would have been visible if it did.*
+
+### So where does it actually stop?
+
+Not in the guest's GPU protocol. The freeze looks like it is on our side:
+
+* the R3000 spins `sys_ppu_thread_yield` at `0x1068F0` on a permanently-zero budget
+* `+0x124` (instructions retired) freezes
+* the GPU ring freezes
+* and in the last run the **`[fps]`/`[ps1]` heartbeat itself printed only once in 90 seconds**,
+  where earlier runs printed 14 times --- so the D3D12 present thread stalled too
+
+A guest-logic deadlock does not stop our own present thread. Everything stopping together
+points at a **host-side stall** --- most plausibly a lock held across a blocking wait, where the
+SPU channel wait and the FIFO drain / present path contend. That is a hypothesis, explicitly
+labelled as one; the next step is to attach and get host stacks for all threads at the freeze
+rather than to reason further about it.
+
+The freeze point also varies enormously between identical runs --- 18.6M, 37.5M and 1.03 billion
+instructions across three --- which is itself consistent with a race rather than a deterministic
+protocol gap.

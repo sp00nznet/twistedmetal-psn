@@ -174,7 +174,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | R3000 runs continuously | 🟨 Partly — up to **~1 billion instructions (~17 MIPS)**, then freezes on a zero budget |
 | Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |
 | RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — the PS1 GPU SPUs block on `SPU_RdInMbox`; nothing writes it |
+| PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — verified: ring offset and all four SPU poll words agree |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — whole-process freeze; the present thread stalls too |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
@@ -394,33 +395,37 @@ the only cellAdec code the image ever compares against, and we were returning `0
 The PS1 core now executes **~1 billion instructions per 100 seconds (~17 MIPS) continuously**,
 and the RSX pipeline runs clean: 22,029 packets, 22,029 groups executed, zero drops.
 
-### The blocker now: the PS1 GPU SPUs wait on a mailbox nothing writes
+### The PS1 GPU handoff works --- verified
+
+The four GPU SPUs poll their own local store at `0x15010` (the address each reports to the PPU
+through its outbound mailbox at init), and `func_0010F658` writes the new ring offset there for
+all four. A raw SPU's local store is aliased into guest memory, so those are plain stores.
+Reading the same bytes the SPU reads:
 
 ```
-[ch-block] spu=2 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
-[ch-block] spu=3 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
-[ch-block] spu=4 pc=0x0CC88 op=rdch ch=29 evstat=0x0 evmask=0x0
+ring[base=0x00D70E80 off=0x00004300] spuLS[00004300 00004300 00004300 00004300]
 ```
 
-Channel 29 is `SPU_RdInMbox`. Every GPU SPU is parked waiting for the PPU to send it an inbound
-mailbox message, and nothing does — so the PS1 framebuffer stays empty, 15,961 of those 22,029
-RSX groups are clears, and the window is black.
+67 packets published, all four SPUs seeing the exact current offset. An earlier reading of this
+as "the SPUs are never told" was wrong three separate ways --- all of them *absence of evidence
+read as evidence of absence*. The post-mortem is in [`docs/ps1-core.md`](docs/ps1-core.md); it
+is worth reading before trusting any "X never happens" claim in this repo.
 
-The next question is the mirror of the semaphore one: **what is supposed to write those SPUs'
-inbound mailboxes after startup?** The complete history for a whole run is three words per SPU,
-all at init (`RUNCNTL=1`, then `0x40600000` and the ring base `0x00D70E80`), plus one zero ---
-against 5,695 `SIG_NOTIFY2` writes to SPU 4 in the same run. The notification machinery works;
-it is never used for the four GPU cores again.
+### The blocker now: a whole-process freeze, and it looks like ours
 
-And the R3000 stops by **spinning, not blocking**: 385 of the last 400 syscalls before the
-freeze are `sys_ppu_thread_yield` from `lr=0x001068F4`, inside the interpreter's own outer loop,
-where `func_00105FA8` keeps returning an instruction budget of zero. Instructions retired
-(`+0x124`) and the GPU ring offset (33 packets) freeze on the same sample.
+Every run eventually wedges, at wildly varying points (18.6M, 37.5M and 1.03 billion
+instructions across three identical runs):
 
-That is the same budget-0 condition at `+0x120` that once stopped this port at boot --- moved,
-not gone. Full measurements, and an explicit note on which single link is still inference rather
-than measurement, in [`docs/ps1-core.md`](docs/ps1-core.md).
+* the R3000 spins `sys_ppu_thread_yield` at `0x1068F0` on a permanently-zero budget --- the same
+  budget-0 condition at `+0x120` that once stopped this port at boot, moved rather than gone
+* instructions retired (`+0x124`) freezes, and so does the GPU ring
+* and in the last run the `[fps]` heartbeat printed **once in 90 seconds** where earlier runs
+  printed 14 times --- so the D3D12 present thread stalled too
 
+A guest-logic deadlock does not stop our own present thread. Everything stopping together points
+at a host-side stall, most plausibly a lock held across a blocking wait between the SPU channel
+wait and the FIFO drain / present path. That is a hypothesis, not a measurement; the next step is
+host stacks for every thread at the freeze.
 ### What unblocked the core: the opcode dispatch table was never lifted
 
 Worth writing down, because the symptom pointed nowhere near the cause.
