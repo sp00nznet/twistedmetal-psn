@@ -689,84 +689,69 @@ A note for whoever meets the next one of these: `default: return 1` is a reasona
 for a channel whose count is genuinely always ready, and it is exactly wrong for any channel
 whose `rdch` can block. Those two properties have to be decided together.
 
-### Next: the main thread blocks on a semaphore nobody posts
+### Resolved: the RSX interrupt queue was never published
 
-The R3000 is **not slow** --- 1,000 instructions in 1 ms, about 1 MIPS. It *stops*, hard and
-early: the last dispatch lands at line 763 of a 22,015-line log while the rest of the
-emulator runs on for another 100 s.
+The chain from the stalled R3000 to its cause, and the fix.
 
-Narrowing it, in order:
-
-- **The interpreter is entered once and never returns.** With the dispatch table lifted, the
-  `bctr` is a `goto`, so `func_001066A8` loops internally; the entry counter stays at 1.
-- **The event scheduler is not the problem.** `func_00105FA8` runs ~2,100 rounds, `total`
-  climbing steadily (`0x70500` -> `0x83100`, ~256 cycles per slice) with `headdue == total`
-  each time, then stops with everything else.
-- **No helper blocks.** All 11 `bl` targets inside the interpreter were traced with
-  enter/exit breadcrumbs gated to fire near the stall: **1553 enters, 1553 exits**. The last
-  event is a clean return from `func_0010621C`.
-- **The very next line in the log is the answer:**
-
-  ```
-  [dbg] <<10621C
-  [WAIT tid=1] semaphore_wait(sem=1 timeout=0)
-  ```
-
-  Guest thread **1** is the main thread --- the one running the interpreter --- and it blocks
-  there forever with an infinite timeout.
-
-Semaphore 1 is created `init=0 max=1`, a one-shot completion latch. Counting the whole run:
-
-| sem | waits | posts |
-|---|---|---|
-| 1 | 1 | **0** |
-| 4 | 141 | 25 |
-| 5 | 9 | 96 |
-| 9 | 73 | 73 |
-| 10 | 13 | 105 |
-
-Every other semaphore is posted. Semaphore 1 is waited on once and **never posted**.
-
-How the interpreter reaches a syscall at all: it carries **51 `DRAIN_TRAMPOLINE` sites**, and
-the trampoline runs deferred guest work on the calling thread, so the main thread can leave
-R3000 code without `func_001066A8` returning.
-
-**And the waiter names itself.** With the guest call site added to the log
+**1. The main thread blocks on a flip.** With the guest call site added to the log
 (`[WAIT tid=1] semaphore_wait(sem=1 timeout=0 cia=0x00000000 lr=0x00113EB4)`), the call is
-`bl 0x3030C` at `0x113EB0`, and its surroundings are a **flip**:
+`bl 0x3030C` at `0x113EB0`, sitting in a double-buffer flip:
 
 ```
 00113E84  lwz    r29, 0x1C8(r27)     ; buffer index
-00113E8C  rldicl r4, r29, 0, 56
 00113E90  addi   r29, r29, 1         ; bump it
 00113E94  bl     0x142BC             ; queue the work
-00113EA0  rlwinm r29, r29, 0, 31, 31 ; index &= 1   -> double buffer
-00113EA4  bl     0x2BD9C
+00113EA0  rlwinm r29, r29, 0, 31, 31 ; index &= 1
 00113EB0  bl     0x3030C             ; wait for completion  <-- blocks here
 ```
 
-`r27` comes from `*(TOC-0x7834)`, the same object the semaphore's creator loads at
-`0x116CA8`. So the main thread queues a frame flip and waits to be told it finished.
+Semaphore 1 is created `init=0 max=1` and, over a whole run, was waited on **once** and posted
+**zero** times; every other semaphore had matching posts.
 
-**What should tell it, and why it never does.** The chain closes on a defect already on the
-open-items list:
+**2. Nothing posts it, because gcm's interrupt thread exits at once.**
+`_gcm_intr_thread` (OPD `0x1B7768` -> code `0x1A584`) reads its queue id and blocks:
 
 ```
-[SYS] sys_ppu_thread_create tid=2 name="_gcm_intr_thread" entry=0x001B7768
-[THREAD 2] host thread started, entry=0x001B7768
-[THREAD 2] entry RETURNED (r3=0x0) -- thread finished
+0001A5E0  bl   0x120E4          ; get the gcm context  (NOT the thread arg --
+0001A5EC  rldicl r9, r3, 0, 32  ;  the thread arg really is 0, `li r5,0` at 0x1A4A4)
+0001A628  lwz  r3, 0x12D0(r9)   ; queue id
+0001A62C  sc                    ; 130 = sys_event_queue_receive
 ```
 
-`_gcm_intr_thread` is the RSX interrupt thread. It calls `sys_event_queue_receive` on **queue
-id 0** --- an uninitialised handle (the field at `0x2D80B4` is never written; the one writer
-is at `0x1200C`, reached from `0x12A24`) --- and immediately returns, so the thread exits
-before it has serviced anything. There is exactly one `event_queue_receive(q=0)` in the whole
-run.
+**3. Where `+0x12D0` comes from.** `func_000120E4` returns `*(base->[0x7C] + 0x10)` with
+`base = *(TOC-0x6B00) = 0x2D8038`. A store watch settled two things at once: `0x2D80B4`
+(= `base+0x7C`) **is** written --- `0x2D8044`, by `cellGcmInit` at `0x1299C`, before the
+thread is even created --- and `*(0x2D8054) = 0x20031000` is the context. So the guest side
+was fine; an earlier note in this repo that `0x2D80B4` "is never written" was wrong.
 
-So: no RSX interrupt thread -> no vblank/flip callback -> semaphore 1 is never posted -> the
-main thread blocks at the first flip -> the R3000 stops at ~42,000 instructions.
+`0x20031000` is our own `RSX_DRIVER_INFO_EA`, and `+0x12D0` in it is
+`RsxDriverInfo::handler_queue` --- confirmed field-for-field against RPCS3's struct
+(`Emu/Cell/lv2/sys_rsx.h`), where `sys_rsx_context_allocate` creates an event queue and
+stores its id there. **We never did.** So the thread received on queue **0**, returned at
+once, and exited --- and no gcm ISR meant no flip handler, no post, and a parked main thread.
 
-That makes the `_gcm_intr_thread` queue-id-0 bug --- carried as a minor open item for several
-sessions --- the actual blocker, not a cosmetic wart. Fixing it means finding why `0x2D80B4`
-never receives the queue id: either `0x12A24` is not reached, or the create that feeds it
-fails earlier.
+**The fix** (`libs/video/sys_rsx.c`): create the queue in `rsx_driver_info_init`, publish its
+id at `+0x12D0`, and drive it. Events are filtered through the handler mask the guest
+publishes at `+0x12C0` exactly as `rsx::thread::send_event` does --- sending an unmasked event
+is not merely wasteful, because gcm's ISR dispatches on the flag bits and a bit it never asked
+for reaches a handler slot it never filled in.
+
+The producer has to be a **vblank ticker of its own**, not the flip packet, because the
+deadlock is circular: the main thread cannot issue the flip packet that would otherwise be the
+event source while it is parked waiting for that very flip. (The run confirms it --- the only
+attribute packets that ever appear are `0x101` and `0x10A`; `0x102`/`0x103` never arrive.)
+
+**Result**, same run, same build:
+
+| | before | after |
+|---|---|---|
+| `_gcm_intr_thread` | exits immediately | stays alive on the queue |
+| `semaphore_post(sem=1)` | 0 | **24** |
+| main guest thread | parked forever | wakes, proceeds to storage syscalls |
+
+### Next
+
+Whether the R3000 now runs to the intro video, and whether the PS1 GPU starts issuing its own
+packets (still 6, all from the emulator front-end). The vblank tick is a plain 60 Hz timer
+rather than a real vblank off the present loop --- fine for breaking the deadlock, worth tying
+to the swap if timing ever matters.

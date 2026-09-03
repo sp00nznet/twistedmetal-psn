@@ -1104,19 +1104,68 @@ re-run: `grep -c ch-wait` on any run log should stay at 0.
 
 That leaves interpreter throughput as the single open question.
 
+## 2026-09-03 (evening) -- the RSX interrupt queue was never published
+
+The R3000's stall at ~42,000 instructions traced three levels away from the interpreter, and
+the fix unblocks the main guest thread.
+
+**The chain.** The main thread parks on a flip:
+
+```
+[WAIT tid=1] semaphore_wait(sem=1 timeout=0 cia=0x00000000 lr=0x00113EB4)
+```
+
+Thread 1 is the thread running the R3000. `lr` puts the call at `bl 0x3030C` (`0x113EB0`),
+inside a double-buffer flip -- bump the index at `+0x1C8`, queue the work, wait. Semaphore 1
+is created `init=0 max=1`, waited on **once**, posted **zero** times; every other semaphore
+balanced.
+
+Nothing posts it because `_gcm_intr_thread` exits at once. It reads its queue id from
+`*(context + 0x12D0)` and blocks there. Two readings had to be corrected on the way:
+
+* the thread argument really is 0 (`li r5, 0` at `0x1A4A4`), but that is irrelevant --- the
+  context comes from `bl 0x120E4` *before* r3 is used, which I first misread as the arg;
+* an older note here said `0x2D80B4` is never written. It **is**: a store watch caught
+  `0x2D80B4 <- 0x2D8044` from `cellGcmInit` at `0x1299C`, before the thread is even created,
+  and `*(0x2D8054) = 0x20031000` is the context. The guest side was fine.
+
+`0x20031000` is our own `RSX_DRIVER_INFO_EA`, and `+0x12D0` there is
+`RsxDriverInfo::handler_queue` -- confirmed field-for-field against RPCS3's struct, where
+`sys_rsx_context_allocate` creates an event queue and stores its id. **We never did.** Queue
+id 0, immediate return, dead thread, no flip handler, parked main thread, stopped PS1.
+
+**The fix** (`libs/video/sys_rsx.c`): create the queue at driver-info init, publish the id at
+`+0x12D0`, and drive it with a 60 Hz `SYS_RSX_EVENT_VBLANK` filtered through the handler mask
+at `+0x12C0`. The producer must be an independent ticker, not the flip packet: the deadlock is
+circular, and the run proves it -- the only attribute packets that ever appear are `0x101` and
+`0x10A`, never `0x102`/`0x103`.
+
+| | before | after |
+|---|---|---|
+| `_gcm_intr_thread` | exits immediately | stays alive on the queue |
+| `semaphore_post(sem=1)` | 0 | **24** |
+| main guest thread | parked forever | wakes, proceeds to storage syscalls |
+
+Everything inside the interpreter was cleared first: entered once and looping internally; the
+event scheduler healthy over ~2,100 rounds; all 11 helper calls traced at 1553 enters / 1553
+exits. It reaches a syscall at all through one of its 51 `DRAIN_TRAMPOLINE` sites.
+
+Also corrected: the R3000 is not slow. It runs 1,000 instructions in 1 ms (~1 MIPS) right up
+to the moment it parks.
+
+Detail: [`docs/ps1-core.md`](docs/ps1-core.md).
+
 ## Next steps
 
-1. ~~Name the writer of `0x2DEF80`.~~ **Done, and the premise was wrong** --- the line was
-   never meant to change; `rchcnt` was lying. See the entry above.
-2. **Account for the interpreter's wall clock.** ~40,000 R3000 instructions in ~100 s is
-   orders of magnitude short of a 33 MHz PS1. Measure the budget each slice actually gets
-   (`func_00105FA8`'s return value) and how long a slice takes; a millisecond-scale wait per
-   slice would explain it, and the two candidates are the 1 ms `ps3_intr_wait` poll and the
-   10 ms `spu_ch_wait` condition-variable timeout.
+1. **Measure how far the R3000 now gets**, and whether the PS1 GPU starts issuing its own
+   packets (still 6 in the last run, all from the emulator front-end).
+2. Tie the vblank tick to the present loop rather than a plain 60 Hz timer, if timing ever
+   matters. It is marked `ponytail:` in `sys_rsx.c` with that ceiling named.
 3. Still open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
    (non-fatal); `cellAdecQueryAttr` (`0x7E4A4A49`) returns `CELL_OK` with its attr struct
    untouched; `user_memory_size= 0/0` prints from a site that disassembles to `li r11,352; sc`
-   though syscall 352 never appears in a trace; `_gcm_intr_thread` receives on queue id 0;
-   attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) accepted and ignored.
-4. `ps3recomp` has uncommitted changes (the two `ppu_lifter.py` fixes and the `[ch-wait]`
-   diagnostic among them) --- that side is still not committed.
+   though syscall 352 never appears in a trace; attribute packets `0x300`/`0x301`/`0x302`
+   (tiles, Z-cull) accepted and ignored.
+4. `ps3recomp` still has uncommitted changes: both `ppu_lifter.py` jump-table fixes, the SPU
+   `rchcnt SPU_RdEventStat` fix, the RSX ISR queue, and two diagnostics (`[ch-wait]` event
+   state, `[WAIT] semaphore_wait` call site).
