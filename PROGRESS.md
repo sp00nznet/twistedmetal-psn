@@ -1401,3 +1401,50 @@ decides between the two remaining explanations:
 * the guest wants **1** (or `0`), which the one-fence-per-tick pacing published and moved past
   before this particular wait began -- the same equality-miss hazard the pacing was written to
   prevent, which would mean the window is still too short for this title.
+
+### Correction: that `lr` was stale, and the fence wait completes
+
+The previous entry identified `func_000198F4` as the poll site from an `lr` histogram. That
+identification is **wrong**, and the reasoning is worth keeping because the trap is subtle.
+
+**`lr` is only written by `bl`.** A spin loop that calls nothing keeps whatever return address
+the last `bl` happened to leave. The loop at `0x1993C`-`0x19950` makes no calls, so *any*
+`usleep` reached later without an intervening `bl` still reports `lr=0x00019928`. Every one of
+the 8,207 samples shows that same value, and `cia` is `0x00000000` for this thread -- the
+lifted code does not maintain it -- so there was nothing to cross-check against:
+
+```
+[WAIT] timer_usleep(30 us) lr=0x00019928 cia=0x00000000
+```
+
+**And the fence wait demonstrably completes.** The probe on `func_000198F4` shows it entered
+**exactly once**, wanting `expected=0xFFFFFFFF`, at a moment when `ref=0` and `put=0x00001000`:
+
+```
+[dbg] fencewait #1 expected=0xFFFFFFFF ref=0x00000000 put=0x00001000
+```
+
+The fence `0xFFFFFFFF` is written into the FIFO at `getoff=0x1398`, i.e. *after* that `put`.
+Fences `0`, `1`, `2` then follow at `0x1410`-`0x1420`, and `put` ends at `0x2184`. The guest is
+single-threaded through this path, so it could not have written any of that while still parked
+on the first fence. It waited, the read-driven publisher (`cellGcm_ref_on_poll`, hooked in
+`vm_read32` on exactly `VM_HLE_INJECT_BASE + 0x2008`, paced ~200us, publishing *before* the
+read) handed it `0xFFFFFFFF`, and it moved on.
+
+So the `cellGcmFinish` handshake **works**, and it is not the blocker. The 8,207 `usleep(30us)`
+calls belong to some other loop that has not executed a `bl` since.
+
+**I had already flagged this exact trap** and failed to apply it: the `[sem] create ...
+lr=0x00116CC0` earlier in this file points at a `bl 0xA7FB4` that is a `memset`, and I noted
+then that the `lr` "is stale and should not be trusted". The `lr` on a *blocking* syscall was
+trustworthy for `sys_semaphore_wait` only because that call site really is preceded by the
+`bl` that reaches it.
+
+**What is actually needed** to name a poll site is the guest PC at syscall time. Two options,
+neither done: have the lifter maintain `ctx->cia` at `sc` sites (cheap, a store per syscall,
+and it makes every `[WAIT]` line trustworthy), or capture the host return address and map it
+through the function table properly -- what `PS3_SCTRACE`'s backtrace attempts and gets wrong
+(it reported `func_00013040+0x9FF1`, an offset far past any real function).
+
+Until one of those exists, **no `lr`-based attribution in this file should be trusted for a
+loop that does not call out**, and that includes the fence-wait conclusion above it.

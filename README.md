@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — located: a `cellGcmFinish` fence wait on `ctrl->ref` |
+| R3000 runs continuously | ⬜ **blocker** — not yet located; `lr`-based attribution proved unreliable |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -228,33 +228,27 @@ thread received on queue 0 and exited outright; with it the thread stays alive a
 real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
 graphics-error dumps.
 
-**The blocker is now located.** Following the poll to its source, with existing diagnostics:
+**The blocker is not yet located, and one of my methods proved unreliable.** I identified a
+`cellGcmFinish` fence wait as the culprit from an `lr` histogram (8,207 samples at
+`lr=0x00019928`). That was wrong:
 
-1. **The poll site.** The syscall trace mapped a *host* backtrace to the nearest guest
-   function (hence the bogus `func_00013040+0x9FF1`); adding `ctx->lr` names it at once ---
-   **8,207** hits at `glr=0x00019928`, next is 232.
-2. **The loop** at `0x000198F4` writes a fence, then spins: `lwz r0, 0x8(r3)` /
-   `cmpw r31, r0` / `usleep(30us)` / re-read.
-3. **The object** is `*(TOC-0x6AD8)->[0x10]`, and a store watch gives `0x20002000` ---
-   exactly our `GCM_CONTROL_GUEST_ADDR`. Offset `+0x08` of `CellGcmControl` is **`ref`**.
+- **`lr` is only written by `bl`.** A spin loop that calls nothing keeps whatever return
+  address the last `bl` left, so *any* later `usleep` reports the same `lr`. And `cia` is
+  `0x00000000` for this thread --- the lifted code does not maintain it --- so there was
+  nothing to cross-check.
+- **The fence wait demonstrably completes.** Probing it directly: entered **exactly once**,
+  wanting `0xFFFFFFFF`, at `put=0x00001000`. That fence is written at `getoff=0x1398`, *after*
+  that `put`, and fences `0`/`1`/`2` follow at `0x1410`-`0x1420` with `put` ending at `0x2184`.
+  The guest is single-threaded here, so it could not have written any of that while still
+  parked on the first fence. The read-driven publisher handed it `0xFFFFFFFF` and it moved on.
 
-So it is the `cellGcmSetReferenceCommand` / `cellGcmFinish` handshake. And:
+So `cellGcmFinish` works and is not the blocker. What is actually needed to name a poll site is
+the guest PC at syscall time --- either have the lifter maintain `ctx->cia` at `sc` sites (one
+store per syscall, and every `[WAIT]` line becomes trustworthy), or map the host return address
+through the function table properly, which `PS3_SCTRACE` attempts and gets wrong.
 
-```
-[DRAIN] getoff=00002184 put=00002184 ref=00000002
-[refq] drained fence 0xFFFFFFFF / 0x0 / 0x1 / 0x2   (last at getoff 0x1420)
-```
-
-The FIFO is **fully drained** --- nothing stuck in the pipe --- exactly four fences were
-decoded, and `ref` sits at **2** while the guest polls for a value it never sees. The emulator
-is not deadlocked on a primitive and not missing a wakeup: it is waiting on a **fence value
-mismatch**.
-
-**The single next step** is `r4` at `func_000198F4` --- the expected value. It decides between
-a fence above 2 that our FIFO walker failed to decode in the `0x1420`-`0x2184` span (several
-methods there are already logged as "unknown"), and an equality-miss on a value the
-one-fence-per-tick pacing published and moved past. Detail in
-[`docs/ps1-core.md`](docs/ps1-core.md).
+Until then, no `lr`-based attribution should be trusted for a loop that does not call out.
+Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
