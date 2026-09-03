@@ -879,3 +879,45 @@ user command.
 better posed: the main thread spins on `sys_ppu_thread_yield` (syscall 43) from inside the
 interpreter rather than blocking on a wait, so it is polling a memory location, not sleeping
 on a primitive. Finding *which* location is the next step.
+
+### Correcting the "yield spin": thread 1 is polling, not deadlocked
+
+The `sys_ppu_thread_yield` observation in the previous note was real but I overweighted it.
+Counting the whole syscall trace, for **guest thread 1** (the one that runs the R3000):
+
+| syscall | calls | |
+|---|---|---|
+| 141 `sys_timer_usleep` | **7,008** | `r3 = 0x1E` --- a **30 microsecond** sleep |
+| 43 `sys_ppu_thread_yield` | 1,178 | |
+| 818 / 802 / 94 / 93 / 801 / 817 | < 40 each | |
+| | **8,397 total** | |
+
+So the yield is ~14% of its traffic, not a hot spin, and the dominant behaviour is
+`usleep(30us)` in a loop. That is a **poll**, and it means the main thread is alive and
+running --- not blocked, not deadlocked. Whatever it is waiting on, it is waiting by
+re-checking, so no missing wakeup will fix it; the condition itself is never becoming true.
+
+(For contrast, the process-wide totals are dominated by other threads: 86,303 calls to
+`sys_event_queue_receive` and 4,718 to `sys_usbd_receive_event` are the worker threads in
+their normal idle state, not thread 1.)
+
+The one PPU spin that *was* worth reading is at `0xD19A0`, and it is a raw-SPU mailbox wait:
+
+```
+addis  r30, r11, 0xE004      ; SPU window + 0x40000
+addi   r0,  r30, 16404       ; +0x4014 = SPU_Mbox_Stat
+lwz    r9,  0x0(r31)
+rlwinm r0,  r9, 0, 16, 23    ; mask 0x0000FF00 = In_Mbox FREE SLOTS
+bne    -> proceed
+li     r11, 43 ; sc          ; else yield and re-read
+```
+
+The runtime already answers that register correctly --- `in_free` is computed live from
+`SPU_RAW_IN_MBOX_DEPTH - ch_in_mbox.count` on every MMIO read, with a comment explaining why a
+published copy would go stale --- so this is not the blocker either, and it is ruled out.
+
+**Where that leaves it.** The 55 `sys_timer_usleep` call sites cluster around
+`0x1101D8`-`0x111AB8`, which is the disc/streaming region (`0x110E50` and `0x111BC8` are the
+two old `ExitPS1(3)` sites). The next step is to identify *which* of those the main thread is
+sitting in and what it re-reads each pass --- one probe on the guest `lr` at syscall 141 would
+name it, the same way the `lr` on `sys_semaphore_wait` named the flip wait.
