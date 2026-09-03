@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — not located; spinning in `func_000198F4`, ~7k `usleep`/90s |
+| R3000 runs continuously | ⬜ **blocker** — not a deadlock: every gcm fence wait costs seconds |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -228,39 +228,33 @@ thread received on queue 0 and exited outright; with it the thread stays alive a
 real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
 graphics-error dumps.
 
-**The blocker is not located, and two of my theories collapsed under test.** What was gained
-is a diagnostic that actually works.
-
-`PS3_SCTRACE` resolved a host stack frame by taking the greatest lifted-function entry below
-it and accepting the match within 128 KB --- never checking the frame was *inside* that
-function. That is where the nonsensical `func_00013040+0x9FF1` came from, and I built a wrong
-conclusion on it. Sorting the table once gives every function a real extent
-`[entry, next_entry)`, and it now reports a chain:
+**It is latency, not a deadlock.** Putting the fence publisher on **stderr** --- the same
+stream as an in-loop probe, so the ordering is real rather than an artefact of mixing
+`printf`/stdout with `fprintf`/stderr --- settles it in one run:
 
 ```
-8187 from func_0014E75C+0xA0F5<-func_0014E75C+0x9AC7<-func_000198F4+0x320
- 268 from func_0014E75C+0xA0F5<-func_0014E75C+0x9AC7<-func_00032D20+0x320
+line  94  [dbg] spin #1     expected=0xFFFFFFFF  *(obj+8)=0x00000000
+line 173  [dbg] spin #9000  expected=0xFFFFFFFF  *(obj+8)=0x00000000
+line 229  [refpub] #1 wrote 0xFFFFFFFF -> readback 0xFFFFFFFF
 ```
 
-Real and checkable where the old output was garbage. **Kept.** It also reinstated
-`func_000198F4` as the spinning caller, so my *previous* correction ("the fence wait
-completes") was itself wrong --- it is entered once and never leaves.
+The guest polls **9,000+ times before the first fence is ever published**, and the write is
+fine --- the publisher reads back exactly what it wrote. The probe then stops at `#9000`
+instead of reaching `#12000`, which is what it would do if the loop exited shortly after that
+publish. **The wait completes**; it just costs seconds.
 
-But the fence theory fails its own test. If the waiter wants `0xFFFFFFFF` while `ref` runs on
-to `2`, read-driven fence publication should matter. It does not: **6,891** tid-1 `usleep`
-calls with `GCM_REFPOLL` on versus **7,005** with it off --- identical. The hook is not firing
-on this waiter's reads, so whatever it polls is probably not `ctrl->ref`. The inference from a
-TOC slot to "it polls `ctrl->ref`" has a gap I did not close.
+That one fact explains everything measured earlier: ~7,000 `usleep(30us)` on the main thread
+per 90 s, GPU packets stuck at 6 even over a 300 s run, and the R3000 never getting past
+~42,000 instructions. The emulator is not deadlocked anywhere --- it is advancing at roughly
+one gcm fence per several seconds.
 
-I also tried making "no skip-past" a guarantee rather than a timing hope. No measured change,
-and it lives in runtime code shared with other ports I cannot test here, so it is **reverted**
-rather than kept on the strength of an argument.
-
-**What is solid:** the thread that runs the R3000 spins in `func_000198F4`, entered once,
-~7,000 `usleep(30us)` per 90 s run, with the emulator otherwise healthy (0 exits, 0 SPU
-stalls, 0 graphics errors). **What is needed:** read what that loop actually compares --- `r31`
-and the address in `r30` *captured inside the loop* --- instead of inferring it backwards.
-Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+**Next**, and it is a different question from the one I spent this session on: why is the
+first FIFO walk so late? The walk runs on the present thread's 60 Hz tick, and a kick event
+(`cellGcm_fifo_kick_event`) exists precisely so a dry fence wait can demand one immediately.
+Either that kick is not wired on this path, or the present thread is not yet running when the
+first wait begins. Measurable the same way --- timestamp the first walk against the first spin.
+Detail, including the three readings this corrects, in
+[`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

@@ -1498,3 +1498,88 @@ the R3000 is spinning in `func_000198F4`, entered once, ~7,000 `usleep(30us)` pe
 the emulator is otherwise healthy (0 exits, 0 SPU stalls, 0 graphics errors). What is needed
 next is to read what that loop actually compares -- `r31` and the address in `r30` at the
 compare, captured *in the loop*, rather than inferred backwards from a TOC slot.
+
+### Measured from inside the spin, and a caveat about my own evidence
+
+Probing the loop body directly (rather than inferring from a TOC slot) settles what it polls:
+
+```
+[dbg] spin #1    expected(r31)=0xFFFFFFFF obj(r30)=0x20002000 *(obj+8)=0x00000000
+[dbg] spin #3000 expected(r31)=0xFFFFFFFF obj(r30)=0x20002000 *(obj+8)=0x00000000
+[dbg] spin #6000 expected(r31)=0xFFFFFFFF obj(r30)=0x20002000 *(obj+8)=0x00000000
+[dbg] spin #9000 expected(r31)=0xFFFFFFFF obj(r30)=0x20002000 *(obj+8)=0x00000000
+```
+
+So it *is* `ctrl->ref` after all --- `obj` really is `0x20002000` --- and the previous entry's
+"probably not `ctrl->ref`" was wrong. It wants `0xFFFFFFFF` and reads **`0x00000000`** on every
+one of nine samples spread across a 90 s run. The value never changes.
+
+Meanwhile the present thread's `[DRAIN]` line, reading the same `GCM_CONTROL_GUEST_ADDR + 8`,
+reports `ref=FFFFFFFF` and later `ref=00000002`.
+
+Two things ruled out as the explanation:
+
+* **Not two different accessors.** `cellGcmSys.c` includes `ppu_memory.h`, so its `vm_read32`
+  is the inline one going through `vm_translate(addr)` -- which is literally
+  `return vm_base + addr`, identical to the loader's `vm_base + (uint32_t)a` that the lifted
+  guest code links against.
+* **Not a per-thread base.** `vm_base` has two definitions, `host_main.c` and `host_posix.c`,
+  but they are platform-exclusive; one global, one mapping.
+
+**And a caveat on my own evidence, which matters more than it looks.** `[DRAIN]` uses
+`printf` -- stdout, block-buffered when redirected to a file -- while the spin probe uses
+`fprintf(stderr)`, which is unbuffered. **The interleaving of those two in the log is not a
+timeline.** So "the present thread saw FFFFFFFF while the guest thread saw 0" is not yet
+established as simultaneous, and I should not have read it that way. What *is* established is
+that the guest never observes anything but 0, across the whole run.
+
+**The next probe, stated precisely so it cannot repeat this mistake:** print the ref value from
+the publisher (`gcm_ref_publish_one`, right after its `vm_write32`) on **stderr**, so it shares
+a stream and ordering with the spin probe. If the publisher reports writing `0xFFFFFFFF` while
+the spin continues to read `0`, the write genuinely is not landing where the guest reads and
+the mapping is the bug. If the publisher never reports writing it, then the fence queue is
+being consumed by some other reader before the waiter ever gets a look, and the fix belongs in
+the pacing after all.
+
+### Resolved: the fence is published LATE, not skipped -- this is latency, not deadlock
+
+Putting the publisher on **stderr** (the same stream as the spin probe, so ordering is real)
+settles it in one run:
+
+```
+line  94  [dbg] spin #1     expected=0xFFFFFFFF  *(obj+8)=0x00000000
+line 173  [dbg] spin #9000  expected=0xFFFFFFFF  *(obj+8)=0x00000000
+line 229  [refpub] #1 wrote 0xFFFFFFFF -> readback 0xFFFFFFFF
+line 311  [refpub] #2 wrote 0x00000000 -> readback 0x00000000
+line 316  [refpub] #3 wrote 0x00000001
+line 317  [refpub] #4 wrote 0x00000002
+```
+
+The guest polls **9,000+ times before the first fence is ever published**. The write itself is
+fine -- the publisher reads back exactly what it wrote, so the store lands in the memory the
+guest reads, and every "two different values for one address" worry was an artefact of
+comparing a `printf`/stdout line against an `fprintf`/stderr one. And the spin probe stops at
+`#9000` rather than continuing to `#12000`, which is what it would do if the loop exited
+shortly after line 229 -- i.e. **the wait completes**, once the fence finally arrives.
+
+So the correct description is: *every* fence wait costs seconds, because the FIFO walk that
+decodes the fence runs far too late. That also explains the shape of everything measured
+earlier -- ~7,000 `usleep(30us)` on the main thread per 90 s run, GPU packets stuck at 6 over
+even a 300 s run, and the R3000 never getting past ~42,000 instructions. The emulator is not
+deadlocked at any point; it is progressing at roughly one fence per several seconds.
+
+**Corrections this forces on the previous entries**, all of which are wrong and should be read
+with this one:
+
+* "the condition it re-checks never becomes true" -- it does become true, late;
+* "the hook is not firing on this waiter's reads, so it probably does not poll `ctrl->ref`" --
+  it does poll `ctrl->ref`, and `GCM_REFPOLL` made no difference for the simpler reason that
+  there was nothing queued to publish yet;
+* "two different values for one address" -- an artefact of mixed stdout/stderr buffering.
+
+**Next**, and it is a different question from the one I have been chasing: why is the first
+FIFO walk so late? The walk runs on the present thread's 60 Hz tick and the kick event
+(`cellGcm_fifo_kick_event`) exists precisely so a dry fence wait can demand one immediately.
+Either that kick is not wired on this path or the present thread is not yet running when the
+first wait begins. That is a startup-ordering question, and it is measurable the same way:
+timestamp the first walk against the first spin.
