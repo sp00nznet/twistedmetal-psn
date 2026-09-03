@@ -170,9 +170,9 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | R3000 starts executing | ✅ Done — the opcode dispatch table was never lifted; see below |
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
-| RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **ROOT CAUSE** — blocks on `sys_semaphore_wait(sem=1)`; nothing posts it |
-| Intro video → menu → attract mode | ⬜ |
+| RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, user-command handler reached |
+| R3000 runs continuously | ✅ Done — `GCM_SET_USER_COMMAND` (`0xEB00`) now raises `USER_CMD`; sem 1 posted 835x |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — `cellAdec` is a stub; crashes in `cellAdecDecodeAu` |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
@@ -308,10 +308,8 @@ reaches the flip wait and calls `sys_semaphore_wait(sem=1)` -> nothing posts it,
 never returns -> the main thread parks in `ntdll` -> GP0 is never written -> the GP0 handler
 never fires -> the GPU SPUs starve and spin -> packets stay at 6.
 
-**Next question, narrow:** what should post semaphore 1? It is created `init=0 max=1` --- a
-one-shot completion latch --- and waited on once. A store watch on the field holding its id
-will name the intended poster. Given the flip context, the likeliest answer is a completion
-callback the runtime never invokes. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+**That question is now answered, and the fix is in** --- see below. The predicted shape was
+right: it *is* a callback the runtime never invoked.
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
@@ -322,6 +320,71 @@ nothing blocking. The main thread can reach a syscall at all because the interpr
 Detail, including the store-watch evidence that corrected an earlier note in this repo
 (`0x2D80B4` *is* written --- by `cellGcmInit`, before the thread is created), is in
 [`docs/ps1-core.md`](docs/ps1-core.md).
+
+### SOLVED: the missing link was `GCM_SET_USER_COMMAND` (FIFO method `0xEB00`)
+
+Semaphore 1 is posted by ps1_netemu's **RSX user-command handler**, and the FIFO walker was
+throwing that method away. Followed backwards from the blocked call:
+
+* semaphore 1 lives at `obj+0x1CC`, `obj = *(TOC-0x7834)`, created `init=0 max=1`
+* the only code that posts it is `func_00113AC8` --- a five-instruction leaf with **zero direct
+  callers**, so it is reachable only as a callback
+* its OPD (`0x1B62E0`) is loaded exactly once, at `0x117348`, and handed to `func_00019D88`:
+
+```
+00019DB4  ori  r0, r0, 0x80        ; driverInfo->handlers |= 0x80
+00019DB8  stw  r0, 0x12c0(r3)
+00019DC0  stw  r31, 0x2c(r9)       ; *(TOC-0x6AB4)->slot[0x2C] = handler
+```
+
+* bit `0x80` is **`SYS_RSX_EVENT_USER_CMD`**
+
+And the guest writes the user command inline in the flip path at `0x114530`, immediately before
+it blocks:
+
+```
+00114530  lis  r9, 4
+00114538  ori  r9, r9, 0xeb00      ; header 0x0004EB00
+0011453C  li   r0, 1               ; argument 1
+00114550  bl   0x3030c             ; publish put
+...
+00114AB8  bl   0x113e64            ; -> sys_semaphore_wait(sem=1)
+```
+
+**Why it was invisible.** `GCM_SET_USER_COMMAND` is method `0xEB00`, which is wider than the
+13-bit field the header decode keeps (`method = w & 0x1FFC`, `subch = (w >> 13) & 7`). So it
+arrives as **subchannel 7, method `0x0B00`** --- straight into the 2D engine path, which
+discards what it does not recognise. Nothing about it looked like a missing method; it looked
+like a 2D method nobody had implemented yet.
+
+The fix does what `sys_rsx_context_attribute`'s `0xFEF` case does: stash the argument at
+`driverInfo+0x12CC` (`userCmdParam`), then send `USER_CMD`. The handler-mask filter already in
+`rsx_send_event` does the rest --- the guest's mask settles to `0x84`, so the bit is wanted.
+
+The note already sitting in `sys_rsx.c` turned out to be exactly right: *"rsx_send_event stays
+for whoever wires those up (a genuine flip or user command)"*. This is the user command.
+
+**Measured, same 90-second run before and after:**
+
+| | before | after |
+|---|---|---|
+| semaphore 1 posts | 0 | **835** |
+| RSX FIFO packets seen | 6 | **5,628** |
+| R3000 | stopped after ~42,000 instructions | **running** |
+| furthest call reached | `sys_semaphore_wait` | **`cellAdecDecodeAu`** (decoding audio) |
+
+**A measurement correction worth keeping.** "sem=1 posts: 0" was partly an artifact:
+`sys_semaphore_post`'s log is capped at 40 lines unless `SEMTID` is set, and the posts counted
+summed to *exactly 40* --- the cap, not the truth. The conclusion held only because the wait
+never returning was independent evidence. That is the second logging artifact in this same
+investigation, after the `grep -c "semaphore_post(sem=1"` that also matched `sem=10`. Counts
+from this log are trustworthy only with `SEMTID=1`.
+
+### The blocker now: `cellAdec` is a stub, and the title has started using it
+
+The title runs far enough to open the audio decoder and call `cellAdecDecodeAu`, which is an
+unimplemented stub. It crashes there on a null `ctr` (`lr=0x000EE734`). That is the next piece
+of work, and it sits directly on the path to the intro videos.
 
 ### What unblocked the core: the opcode dispatch table was never lifted
 

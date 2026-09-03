@@ -2242,3 +2242,175 @@ guest code that would post it --- the semaphore id is stored in some object, so 
 on that field will name the writer and the intended poster --- and determine why that path
 never runs. Given the flip context, the likeliest answer is a completion callback the runtime
 never invokes.
+
+## SOLVED: semaphore 1 is posted by the RSX user-command handler
+
+The previous section left one question: what is supposed to post semaphore 1? Answered, and the
+predicted shape was right --- it is a callback the runtime never invoked.
+
+### Following the semaphore back to its poster
+
+Semaphore 1's id is written to `id_out=0x01620370` from `lr=0x00116CC0`. That resolves to a
+static object: the creation site loads `r29` from `TOC-0x7834` (`= 0x016201A4`) and the id lands
+at `obj+0x1CC`.
+
+```
+00116CE0  addi r3, r29, 0x1cc      ; &sem_id
+00116CE4  addi r4, r1, 0xd8        ; attr {init=0, max=1}
+00116CF0  li   r11, 0x5a           ; 90 sys_semaphore_create
+00116CF4  sc
+00116CF8  li   r11, 0x5d           ; 93 sys_semaphore_trywait  (drain to zero)
+00116CFC  lwz  r3, 0x1cc(r29)
+00116D00  sc
+```
+
+Scanning every `sc` in the image for syscall 94 (`sys_semaphore_post`) --- 68 sites --- exactly
+one of them posts *this* field:
+
+```
+00113AC8  lwz  r9, -0x7834(r2)     ; the same object
+00113ACC  mflr r0
+00113AD0  li   r4, 1
+00113AD8  li   r11, 0x5e           ; 94 sys_semaphore_post
+00113ADC  lwz  r3, 0x1cc(r9)       ; the same semaphore
+00113AE0  sc
+00113AEC  blr
+```
+
+`func_00113AC8` is a five-instruction leaf. Scanning every `b`/`bl` in the image for it returns
+**zero callers** --- so it can only be reached indirectly. Its OPD is at `0x1B62E0`
+(`{code=0x113AC8, toc=0x1C3D30}`), the only word in the image holding that OPD address is
+`0x1BC674` = `TOC-0x76BC`, and the only instruction that loads that slot is:
+
+```
+00117348  lwz  r3, -0x76bc(r2)     ; the poster's OPD
+00117350  bl   0x19d88             ; register it
+```
+
+`func_00019D88` is the registration:
+
+```
+00019DA4  cmpwi cr7, r31, 0
+00019DA8  beq   cr7, 0x19dd4       ; NULL handler -> clear the bit instead
+00019DAC  lwz   r0, 0x12c0(r3)
+00019DB4  ori   r0, r0, 0x80       ; driverInfo->handlers |= 0x80
+00019DB8  stw   r0, 0x12c0(r3)
+00019DC0  stw   r31, 0x2c(r9)      ; *(TOC-0x6AB4)->slot[0x2C] = handler
+```
+
+`0x12C0` is the `RsxDriverInfo` handler mask and bit `0x80` is `SYS_RSX_EVENT_USER_CMD`. It is
+also the *only* one of the 16 writes to `+0x12C0` in the image that sets a bit --- consistent
+with the note already in `sys_rsx.c` that the mask settles to `0x84`.
+
+So: **the semaphore ps1_netemu's flip path blocks on is posted by its RSX user-command handler.**
+
+### And the guest does issue the user command
+
+`ori 0xEB00` appears at five addresses; one of them, `0x114538`, is in the same function as the
+wait (`func_00113F08`, which spans `0x113F08..0x1160F4`), and it comes *before* it:
+
+```
+00114518  lwz  r11, 8(r28)         ; ctx->current
+0011451C  lwz  r0, 4(r28)          ; ctx->end
+00114528  bgt  cr7, 0x1156f4       ; out of room -> reserve
+00114530  lis  r9, 4
+00114538  ori  r9, r9, 0xeb00      ; header 0x0004EB00
+0011453C  li   r0, 1               ; argument 1
+00114544  stw  r0, 4(r10)
+00114548  stw  r9, 0(r10)
+00114550  bl   0x3030c             ; publish put
+...
+00114AB8  bl   0x113e64            ; -> sys_semaphore_wait(sem=1) at 0x113EC8
+```
+
+No ordering deadlock, then: the command is written and the put published *before* the wait. The
+FIFO walker was simply dropping it.
+
+### Why the walker dropped it
+
+`GCM_SET_USER_COMMAND` is method `0xEB00`. The walker's header decode keeps 13 bits of method
+and takes the next three as a subchannel:
+
+```c
+u32 count  = (w >> 18) & 0x7FF;
+u32 method = w & 0x1FFCu;
+u32 subch  = (w >> 13) & 7;
+```
+
+`0x0004EB00` therefore decodes as count 1, **subchannel 7, method `0x0B00`** --- which routes
+into `gcm_2d_method`, whose default is to discard anything it does not recognise. That is why
+this never showed up as a missing method: it looked like an unimplemented 2D method on a
+subchannel nobody had claimed.
+
+`libs/video/tests/test_user_command.c` pins this decode down, so widening the method mask fails
+a test instead of silently returning the port to zero frames.
+
+### The fix, and what it moved
+
+`rsx_raise_user_cmd()` in `sys_rsx.c` does what `sys_rsx_context_attribute`'s `0xFEF` case does
+in RPCS3: write the argument to `driverInfo+0x12CC` (`userCmdParam`), then `rsx_send_event`
+`USER_CMD`. The existing handler-mask filter makes it safe.
+
+The guest side then works unmodified, which is the useful confirmation --- its ISR
+(`0x1A5D8`) receives on the queue we publish at `+0x12D0`, checks `data1 == 0`, tests bit
+`0x80` of `data2`, reads `userCmdParam`, and calls the slot:
+
+```
+0001A62C  sc                       ; 130 sys_event_queue_receive
+0001A634  mr   r18, r6             ; data2 = flags
+0001A64C  cmpdi cr7, r5, 1         ; data1 == 1 -> exit the ISR loop
+0001A654  cmpdi cr7, r5, 0         ; data1 != 0 -> ignore, loop
+0001A65C  rlwinm r0, r6, 0, 0x18, 0x18   ; test bit 0x80
+0001A668  lwz  r9, 0x2c(r14)       ; the handler we saw registered
+0001A684  lwz  r3, 0x12cc(r11)     ; userCmdParam
+0001A694  bctrl
+```
+
+and the runtime log shows exactly the payload it wants:
+
+```
+[usercmd] #1 arg=0x00000001 handlers=0x84 qid=1
+[evt] q=1 receive RETURNED to tid=2: src=0x0 d1=0x0 d2=0x80 d3=0x0
+```
+
+**Measured, same 90-second run before and after:**
+
+| | before | after |
+|---|---|---|
+| semaphore 1 posts | 0 | **835** |
+| user-command raises | 0 | **836** |
+| RSX FIFO packets seen | 6 | **5,628** |
+| R3000 | stopped after ~42,000 instructions | **running** |
+| furthest call reached | `sys_semaphore_wait` | **`cellAdecDecodeAu`** |
+
+### A second logging artifact, in the same investigation
+
+"sem=1 posts: 0" was partly an artifact. `sys_semaphore_post`'s log is capped at 40 lines unless
+`SEMTID` is set --- and the posts counted summed to *exactly 40*:
+
+```
+24 sem=10   11 sem=9   2 sem=6   2 sem=4   1 sem=7      = 40
+```
+
+That was the cap, not the distribution. The root-cause conclusion held only because the wait
+never returning was independent evidence; the number never supported it. With `SEMTID=1` the
+same build shows 837 posts to sem 6, 836 to sem 7, 835 to sem 1.
+
+This is the second time a logging artifact drove this investigation: the earlier one was
+`grep -c "semaphore_post(sem=1"` also matching `sem=10`. **Counts from this log are only
+trustworthy with `SEMTID=1`, and only with a `grep` pattern anchored past the digits.**
+
+### Next: `cellAdec` is a stub, and the title now uses it
+
+With the flip unblocked the title reaches its audio decoder and crashes:
+
+```
+[cellAdec] StartSeq(handle=0)
+[cellAdec] DecodeAu(handle=0, addr=0x764D80, size=384)
+[CRASH] code=0xC0000005 rip=00000000001B5F00
+[CRASH] last HLE NID 0x1BC200F4 (cellAdecDecodeAu)
+[CRASH] guest ctr=0x00000000 lr=0x000EE734 r3=0x00000000
+```
+
+A null `ctr` means the guest called through a function pointer the stub never filled in. This is
+on the direct path to the intro videos: they have audio.
