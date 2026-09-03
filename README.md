@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **ROOT CAUSE FOUND** — it idles waiting to be woken; nothing wakes it |
+| R3000 runs continuously | ⬜ **ROOT CAUSE** — an always-due event throttles it to ~400 instr/sec |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -270,52 +270,41 @@ state**:
 0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
 ```
 
-### Root cause: the R3000 idles waiting to be woken, and nothing wakes it
+### Root cause: an always-due event throttles the R3000 to a crawl
 
-Per-thread sampling plus the guest `lr` on the main thread's last syscalls closes this.
+The main thread is blocked in a kernel wait (`tid 20596: guest=4 ntdll=430`), and its last
+syscalls are `sys_ppu_thread_yield` with guest `lr`s inside the interpreter --- `0x001068F4`,
+`0x00106824`, `0x00106360`, each just after a `bl 0x105FA8` (the event scheduler). The third
+sits in a loop in `func_0010621C` that schedules, yields, checks the exit reason, and repeats.
 
-**The main thread is blocked, not spinning** --- `tid 20596: guest=4 ntdll=430`. Four guest
-samples in a whole run (the brief BIOS execution); everything else parked in a kernel wait.
-
-**Its last syscalls are `sys_ppu_thread_yield`, from inside the interpreter** ---
-`glr=0x001068F4`, `0x00106824`, `0x00106360`, each just after a `bl 0x105FA8` (the event
-scheduler). The third is an **idle loop** in `func_0010621C`:
-
-```
-0010631C  stw r5, 0x120(r28)   ; store the scheduler's return into the CYCLE BUDGET
-00106328  bl  0xC2778          ; yield
-0010635C  bl  0x105FA8         ; event scheduler -> new budget
-00106360  lwz r0, 0x138(r28)   ; the exit-reason field
-0010636C  beq -> 0x10631C      ; still -1 -> go round again
-```
-
-The interpreter runs its ~42,000 BIOS instructions, enters this loop, and stays: schedule,
-yield, check, repeat. That single state explains every symptom this investigation chased ---
-why it stops dispatching, why it never returns, why the profiler finds it in `ntdll` rather
-than burning CPU.
-
-**Only one thing can wake it.** `+0x138` gets a real value from `func_001058AC` alone, and that
-has exactly one caller, at `0x000C2730` with `r3 = 7`:
+That much reads like an idle wait, and I first wrote it up as one. Instrumenting the
+scheduler's queue shows otherwise:
 
 ```
-000C2710  sld r0, r0, r11      ; r0 = 1 << event_index
-000C270C  ori r9, r9, 0x1111   ; the "does not wake" mask
-000C272C  bne cr6, 0xC2750     ; bit in the mask -> record it, do NOT wake
-000C2730  bl  0x1058AC         ; ** wake the R3000, reason 7 **
+[dbg] sched #1     has-events  due=0x00000000 total=0x00000000
+[dbg] sched #1800  has-events  due=0x00070500 total=0x00070500
+[dbg] sched #2000  has-events  due=0x0007CD00 total=0x0007CD00
 ```
 
-The emulator wakes the R3000 only for events whose bit falls **outside** `0x1111`.
+The queue is **never empty**, and **`due == total` every time** --- an event is always due
+*right now*, and the head cycles between a few slots that are fired and immediately re-armed.
 
-**The chain, complete:** no waking event -> `+0x138` stays `-1` -> the R3000 idles forever ->
-no game code -> GP0 never written -> the GP0 handler never fires -> the GPU SPUs get no
-packets and spin -> no PS1 output, packet count stuck at 6. Everything this investigation
-chased after "the R3000 stalls" was downstream of this one state.
+So the core is not parked waiting for a wake. It is **thrashing**: the scheduler computes the
+new budget as `next_due - now`, which is ~0 because something is always due; the interpreter
+gets ~20 instructions; it calls `func_0010621C` to refill, yields, and repeats. Measured:
+~4,799 refill calls and ~2,000 scheduler rounds for ~42,000 instructions. **The R3000 was never
+stopped --- it runs about five orders of magnitude too slowly**, which is why every probe read
+as a stall.
 
-**Next step, specific:** log every event index reaching `0x000C2730`'s function and see which
-the `0x1111` mask suppresses. The BIOS here is almost certainly waiting on the PS1 **vblank**;
-if vblank's index is inside that mask --- or if no event reaches this function at all --- that
-is the bug, and it lives in the emulator's own timing/event plumbing, not anywhere downstream.
-Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+This vindicates the first diagnosis of the investigation, which I discarded. It opened on "the
+cycle budget at `+0x120` is 0"; I demoted that to a symptom because a zero budget is normal and
+the scheduler tops it up. Both halves were true and the conclusion was still wrong --- it is
+topped up *to ~0*, every time.
+
+**Next step:** `func_0010EA58` schedules two events back to back at `0x10ED74` (delay 64) and
+`0x10ED94` (**delay 0**). A delay-0 event re-armed on each fire produces exactly this
+signature. Log the delay argument to `func_00105E68` per call, find which event re-arms at 0,
+and why. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

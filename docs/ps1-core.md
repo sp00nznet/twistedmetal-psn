@@ -1718,3 +1718,45 @@ it is called with, and see which arrive and which the `0x1111` mask suppresses. 
 this point is almost certainly waiting on the PS1 **vblank**, so if vblank's index is inside
 that mask --- or if no event of any kind reaches this function --- that is the bug, and it sits
 in the emulator's own timing/event plumbing rather than anywhere downstream.
+
+### Correction, and the measured picture: an always-due event, not an idle wait
+
+The previous entry said the R3000 "idles waiting to be woken" and that nothing wakes it. The
+yielding is real, but the reason was inferred and the inference was wrong. Instrumenting the
+scheduler's own queue settles it:
+
+```
+[dbg] sched #1     head=0x0076C6CC listhead=0x0076C5C0 has-events due=0x00000000 total=0x00000000
+[dbg] sched #2     head=0x0076C6E0 listhead=0x0076C5C0 has-events due=0x00000040 total=0x00000040
+[dbg] sched #1800  head=0x0076C6B8 listhead=0x0076C5C0 has-events due=0x00070500 total=0x00070500
+[dbg] sched #2000  head=0x0076C6F4 listhead=0x0076C5C0 has-events due=0x0007CD00 total=0x0007CD00
+```
+
+The queue is **never empty** --- every sample reports `has-events` --- and **`due == total` on
+every single one**. There is always an event due *right now*, and the head cycles between a
+few slots (`0x76C6B8`, `0x76C6E0`, `0x76C6F4`) that are fired and immediately re-armed.
+
+So the core is not parked waiting for an external wake. It is **thrashing**: `func_00105FA8`
+computes the new budget as `next_due - now`, that is ~0 because an event is always due, the
+interpreter gets a slice of roughly twenty instructions, calls `func_0010621C` to refill,
+yields, and goes round again. Measured: ~4,799 refill calls and ~2,000 scheduler rounds for
+~42,000 instructions --- about **20 instructions per round**, and the yield makes each round
+cost a scheduler round-trip.
+
+That is why every probe read as a stall: at ~400 instructions/second the BIOS makes no visible
+progress, the PC sits in the same region for the whole run, and the thread spends its life in
+`ntdll` inside the yield. **It was never stopped. It is running about five orders of magnitude
+too slowly.**
+
+**And this vindicates the very first diagnosis of this investigation, which I discarded.** The
+session opened on "the cycle budget at `+0x120` is 0". I demoted that to a symptom on the
+grounds that a zero budget is normal and the scheduler tops it up. Both halves of that were
+true and the conclusion was still wrong: the budget is topped up, to ~0, every time, because an
+event is perpetually due. The original observation was pointing at the right field.
+
+**The concrete next step**, and it is where the session began: `func_0010EA58` schedules two
+events back to back at `0x10ED74` (delay 64) and `0x10ED94` (**delay 0**). A delay-0 event
+re-armed each time it fires produces exactly this signature. Log the delay argument to
+`func_00105E68` per call and find which event re-arms at 0 --- then why. The scheduler and its
+callers are small and now well understood, and the queue instrumentation to confirm a fix
+already exists.
