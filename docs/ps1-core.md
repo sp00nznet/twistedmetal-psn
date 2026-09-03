@@ -749,6 +749,15 @@ attribute packets that ever appear are `0x101` and `0x10A`; `0x102`/`0x103` neve
 | `semaphore_post(sem=1)` | 0 | **24** |
 | main guest thread | parked forever | wakes, proceeds to storage syscalls |
 
+**It did not, on its own, get the PS1 running.** Measured afterwards over a 150 s run:
+the ISR thread stays alive, `sem 1` is posted, the main thread wakes and runs on --- and the
+R3000 still does not pass **50,000** dispatches, essentially where it stopped before. The flip
+semaphore was a real deadlock and is cleared; a second stall sits behind it, unfound.
+
+Lead: `_gcm_intr_thread` receives on its queue only **once** and then blocks again, so the
+vblank tick is probably filtered out by the handler mask at `+0x12C0` after the first event.
+That mask is the first thing to check.
+
 ### Next
 
 Whether the R3000 now runs to the intro video, and whether the PS1 GPU starts issuing its own

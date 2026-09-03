@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ — unblocked; how far it now gets is being measured |
+| R3000 runs continuously | ⬜ **blocker** — flip deadlock cleared; still stops under 50k instructions |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -202,6 +202,16 @@ packet that would be the event source while it is parked waiting for that flip.
 | `_gcm_intr_thread` | exits immediately | stays alive on the queue |
 | `semaphore_post(sem=1)` | 0 | **24** |
 | main guest thread | parked forever | wakes, proceeds to storage syscalls |
+
+**But this did not, on its own, get the PS1 running.** Measured after the fix over a 150 s
+run: the ISR thread stays alive, `sem 1` is posted, the main thread wakes and runs on --- and
+the R3000 still does not pass **50,000** dispatches, essentially where it stopped before. So
+the flip semaphore was a real deadlock and is genuinely cleared, but a second stall sits
+behind it that has not been found yet.
+
+One lead for whoever picks this up: `_gcm_intr_thread` receives on its queue only **once** and
+then blocks again, so the vblank tick is likely being filtered out by the handler mask at
+`+0x12C0` after the first event. That mask is the first thing to check.
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

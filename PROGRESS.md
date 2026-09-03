@@ -1146,6 +1146,15 @@ circular, and the run proves it -- the only attribute packets that ever appear a
 | `semaphore_post(sem=1)` | 0 | **24** |
 | main guest thread | parked forever | wakes, proceeds to storage syscalls |
 
+**It did not, on its own, get the PS1 running.** Measured afterwards over a 150 s run:
+the ISR thread stays alive, `sem 1` is posted, the main thread wakes and runs on --- and the
+R3000 still does not pass **50,000** dispatches, essentially where it stopped before. The flip
+semaphore was a real deadlock and is cleared; a second stall sits behind it, unfound.
+
+Lead: `_gcm_intr_thread` receives on its queue only **once** and then blocks again, so the
+vblank tick is probably filtered out by the handler mask at `+0x12C0` after the first event.
+That mask is the first thing to check.
+
 Everything inside the interpreter was cleared first: entered once and looping internally; the
 event scheduler healthy over ~2,100 rounds; all 11 helper calls traced at 1553 enters / 1553
 exits. It reaches a syscall at all through one of its 51 `DRAIN_TRAMPOLINE` sites.
