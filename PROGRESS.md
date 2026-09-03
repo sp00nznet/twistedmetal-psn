@@ -2876,3 +2876,57 @@ traffic (540: 3,265 calls, 604: 281) rather than none.
 
 Order matters here: fix the nondeterminism first. The other two are only measurable once a run
 behaves the same way twice.
+
+## CORRECTION: the "nondeterminism" was mostly my own instrumentation
+
+The section above named nondeterminism the dominant problem, on the strength of five runs
+spanning 0 to 75,527 non-zero VRAM words. That spread was substantially an **observer effect**.
+
+Two clean 60-second runs with no framebuffer dump:
+
+```
+run1 vram nonzero=75527  outmbox=5 inmbox_writes=0 chblock=9 intr_deliver=1
+run2 vram nonzero=75527  outmbox=5 inmbox_writes=0 chblock=9 intr_deliver=2
+```
+
+**Identical, to the word.** Every run that reached only 0--7,127 was carrying the periodic
+`PS1_FBDUMP`, which wrote a 1.5 MB PPM on every 5-second heartbeat. Measuring the thing was
+changing it, and I then documented the measurement as a property of the system.
+
+That is the sixth instance of the same family of error in this port, and the first one where the
+probe itself was the cause rather than a capped log or an unhooked path. The dump is now
+one-shot and gated on content (`PS1_FBDUMP_MIN`, default 20,000 non-zero words), which also
+means it captures a drawn frame instead of whatever happened to be there at an arbitrary moment.
+
+Wedges do still happen and are still worth chasing --- but they are not the every-run,
+two-orders-of-magnitude spread the previous section claimed.
+
+## And the game is running, not just the BIOS
+
+The one-shot dump at 75,527 non-zero words contains **Twisted Metal's own assets**: car sprites,
+wheels, vehicle art, and large stylised title letters --- with the BIOS boot screen still sitting
+in the display-buffer region at the top right.
+
+So the chain is longer than "the BIOS drew its logo": the PS1 booted, the game took over, and it
+has loaded its title/intro textures into VRAM.
+
+The garish green/magenta in those regions is **correct, not a fault**. The dump interprets every
+16-bit word as 1-5-5-5 direct colour; those regions hold 4- and 8-bit CLUT-indexed texture data,
+so they are supposed to look like noise when read as direct colour. Only the display-buffer
+region is meaningfully viewable this way --- which is exactly where the BIOS text is legible.
+
+### So what is left
+
+The display-buffer region (columns 0..639) is still black while every drawn thing sits at
+x >= 640. Two questions, in order:
+
+1. **Where does the PS1 think its display area is?** The BIOS drew its boot screen at x >= 640,
+   which is a normal place for a PS1 back buffer. If the program set its display start there and
+   our composite samples x = 0, that alone is the black screen.
+
+2. **What texture coordinates does the composite quad use?** The PS3 side binds all of VRAM as a
+   single 1024x512 texture, so the visible region is selected entirely by the quad's UVs. Logging
+   them for the draw that binds `1:0x00400000` answers question 1 directly.
+
+Neither needs any more work on the PS1 side. Everything from the R3000 through the GPU SPUs to
+VRAM is verified, and the game's own art is in memory.

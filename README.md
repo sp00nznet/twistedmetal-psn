@@ -176,7 +176,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
 | PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — verified: **21,206 packets consumed** in step with production |
 | **PS1 renders (BIOS boot screen in VRAM)** | ✅ **Done** — dumped and read: PlayStation logo + SCEA licence text |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — nondeterministic: runs vary from 0 to 29% of VRAM drawn |
+| **PS1 game runs and loads its art** | ✅ **Done** — VRAM holds Twisted Metal car sprites and title letters |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — display area: everything is drawn at VRAM x≥640, x<640 is black |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
@@ -427,16 +428,14 @@ happens" claim in this repo.
 
 ### What is left, in order
 
-**1. Nondeterminism — now the dominant problem.** Five identical runs:
+**1. The display area.** Everything the PS1 draws sits at VRAM x≥640; columns 0..639 are black.
+The PS3 side binds all of VRAM as one 1024x512 texture, so the visible region is chosen entirely
+by the composite quad's texture coordinates — logging them for the draw that binds
+`1:0x00400000` answers it directly.
 
-```
-VRAM non-zero words:   0        0        1,776    7,127    75,527
-instructions retired:  6.8M     26.7M    31.5M    966M     1,097M
-```
-
-One run drew nothing in 150 seconds; another ran 1.1 billion instructions and filled 29% of VRAM.
-Until this is pinned down, no single-run measurement downstream means much — which is exactly
-what produced two conclusions in this repo's own history that later runs refuted.
+*(An earlier claim here that nondeterminism was the dominant problem was largely an observer
+effect: two clean runs both reach exactly 75,527 non-zero VRAM words, and every low reading came
+from a run carrying a 1.5 MB-per-heartbeat framebuffer dump. Measuring it was changing it.)*
 
 **2. The display origin.** The BIOS drew at VRAM x>=640; columns 0..639 are black. What texture
 coordinates does the composite quad use, and what does ps1_netemu think the PS1 display start is?
