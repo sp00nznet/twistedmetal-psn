@@ -2368,3 +2368,97 @@ rather than to reason further about it.
 The freeze point also varies enormously between identical runs --- 18.6M, 37.5M and 1.03 billion
 instructions across three --- which is itself consistent with a race rather than a deterministic
 protocol gap.
+
+## The PS1 core renders. Here is the proof, and what is actually left.
+
+Two corrections to the section above first, then the verified state of the whole pipeline.
+
+### "The window is black" was an unfalsifiable assumption
+
+`PrintWindow` on a D3D12 swapchain returns black whether the page is black or the capture
+failed. Every screenshot taken in this port could not distinguish those, so none of them was
+evidence of anything.
+
+`PS1_FBDUMP=<path>` writes PS1 VRAM straight out of guest memory as a PPM --- 1024x512, 16-bit
+1-5-5-5, pitch 2048, the format `[tex-refresh]` reports. No D3D, no window, no swapchain. What
+came out:
+
+**the PlayStation logo, "SCEA", "Licensed by Sony Computer Entertainment of America", and a block
+of legal text.** That is the PS1 BIOS boot screen. The PS1 core renders correctly.
+
+It also says where the picture is: **every non-black pixel is in columns 640..1023.** The region
+at columns 0..639 is entirely black. The content is in one VRAM region and something is
+presenting another --- a display-origin problem, not a rendering one.
+
+### And the earlier GPU-handoff conclusion was wrong three ways
+
+The previous section concluded the four GPU SPUs "are never sent a 4th inbound mailbox word" and
+"consume nothing". Reading the lifted SPU code rather than inferring from a log line:
+`spu0_spu_func_000011A0` writes its outbound mailbox once and reads **exactly three** inbound
+words --- which the PPU sends --- then falls through to its steady-state loop at `0x1268`. That
+loop is a *poll*, not a mailbox read: it compares its own local store at `0x15010` against the
+last offset it consumed. `func_0010F658` writes the new ring offset to exactly that address in
+each SPU's local store, and a raw SPU's local store is aliased into guest memory
+(`s->ctx->ls = vm_base + s->base`), so those are plain stores that need no MMIO hook.
+
+| what I concluded | what was actually true |
+|---|---|
+| SPUs blocked forever on `rdch ch=29` | a transient during init; the read completed |
+| the kick is lost (no LS writes logged) | LS is aliased, so correct writes log nothing |
+| SPUs never told about new packets | all four read the exact current offset |
+
+All three are **absence of evidence read as evidence of absence** --- a capped log, an unhooked
+path, a transient snapshot. With the semaphore-post cap and the missing `GetPcmItem` log line,
+that is five in this port. The rule that would have caught every one: *before concluding "X never
+happens", establish that X would have been visible if it did.*
+
+### The verified pipeline
+
+Every row measured, in good runs:
+
+| stage | evidence |
+|---|---|
+| R3000 executes | `+0x124` reaches **1.1 billion** instructions, ~14 MIPS sustained |
+| GP0 -> ring | ring offset reaches `0x6EF300` = **28,403 packets** |
+| ring -> 4 GPU SPUs | `pub == done` on all four at every sample, to **21,206 packets consumed** |
+| SPUs -> PS1 VRAM | non-zero words climb 0 -> 1,776 -> 7,127 -> **75,527** of 262,144 |
+| VRAM content | the BIOS boot screen, dumped and read |
+| VRAM -> RSX texture | `checks=640 unreadable=0 changed=6 span=1048576 1024x512 pitch=2048` |
+| RSX draws | 12,887 packets, 12,887 groups executed, **zero** drops of any kind |
+| surface content | 9,573 drops per run -> **0** (surfaces now keyed on size) |
+
+The texture path deserves a note because it was the prime suspect. `[tex-refresh]` firing only 6
+times in 90 seconds looked like a stale cache. `LD_FBDBG=1` settled it: the texture is bound and
+hash-checked 640 times, always readable, over the full 1 MB span with the correct pitch, and it
+refreshes exactly when the content changes --- which in that run was 6 times, because VRAM sat at
+7,127 non-zero words throughout. The cache was working correctly on nearly static content. Three
+candidate causes, separated by counting rather than by reasoning.
+
+### What is actually left
+
+**1. Nondeterminism, and it is now the dominant problem.** Across five identical runs:
+
+```
+VRAM non-zero words:   0        0        1,776    7,127    75,527
+instructions retired:  6.8M     26.7M    31.5M    966M     1,097M
+```
+
+One run drew nothing at all in 150 seconds. Another ran 1.1 billion instructions and filled 29%
+of VRAM. Some wedge; the wedge point ranges over two orders of magnitude. Until this is pinned
+down, no single-run measurement of anything downstream means much --- which is exactly the trap
+that produced the "budget 0 forever" and "present thread stalled" readings, both of which were
+single wedged runs and both of which later runs refuted.
+
+**2. The display origin.** The BIOS drew its boot screen at VRAM x>=640 and columns 0..639 are
+black. Either the PS1 program set its display area there and the composite is sampling x=0, or
+the content is in a back buffer that never became the front buffer. That is a narrow question
+with a narrow answer: what texture coordinates does the composite quad use, and what does
+ps1_netemu believe the PS1 display start is?
+
+**3. The BIOS gets stuck after the logo.** VRAM stops changing once the boot screen is drawn.
+The next thing a real PS1 BIOS does is read `SYSTEM.CNF` off the disc and boot the executable ---
+so the CD-ROM path is the likely place it is waiting, and the syscall histogram does show storage
+traffic (540: 3,265 calls, 604: 281) rather than none.
+
+Order matters here: fix the nondeterminism first. The other two are only measurable once a run
+behaves the same way twice.

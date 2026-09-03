@@ -171,11 +171,12 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, user-command handler reached |
-| R3000 runs continuously | 🟨 Partly — up to **~1 billion instructions (~17 MIPS)**, then freezes on a zero budget |
+| R3000 runs continuously | 🟨 Partly — **1.1 billion instructions (~14 MIPS)** in a good run; some runs wedge early |
 | Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |
 | RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
-| PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — verified: ring offset and all four SPU poll words agree |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — whole-process freeze; the present thread stalls too |
+| PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — verified: **21,206 packets consumed** in step with production |
+| **PS1 renders (BIOS boot screen in VRAM)** | ✅ **Done** — dumped and read: PlayStation logo + SCEA licence text |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — nondeterministic: runs vary from 0 to 29% of VRAM drawn |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
@@ -394,6 +395,54 @@ the only cellAdec code the image ever compares against, and we were returning `0
 
 The PS1 core now executes **~1 billion instructions per 100 seconds (~17 MIPS) continuously**,
 and the RSX pipeline runs clean: 22,029 packets, 22,029 groups executed, zero drops.
+
+### The PS1 core renders --- proof, not inference
+
+`PrintWindow` on a D3D12 swapchain returns black whether the page is black or the capture failed,
+so every screenshot in this port was unfalsifiable. `PS1_FBDUMP=<path>` writes PS1 VRAM straight
+out of guest memory as a PPM instead --- no D3D, no window. What came out:
+
+**the PlayStation logo, "SCEA", "Licensed by Sony Computer Entertainment of America", and a block
+of legal text --- the PS1 BIOS boot screen.**
+
+It also locates the picture: every non-black pixel is in columns 640..1023, and columns 0..639
+are entirely black. A display-origin problem, not a rendering one.
+
+### The verified pipeline
+
+| stage | evidence |
+|---|---|
+| R3000 executes | `+0x124` reaches **1.1 billion** instructions, ~14 MIPS |
+| GP0 → ring | ring offset reaches `0x6EF300` = **28,403 packets** |
+| ring → 4 GPU SPUs | `pub == done` on all four, **21,206 packets consumed** |
+| SPUs → PS1 VRAM | non-zero words 0 → 1,776 → 7,127 → **75,527** of 262,144 |
+| VRAM → RSX texture | 640 hash checks, 0 unreadable, full 1 MB span, correct pitch |
+| RSX draws | 12,887 packets, 12,887 groups executed, **zero** drops |
+| surface content | 9,573 drops per run → **0** |
+
+An earlier claim here that the GPU SPUs "are never told about new packets" was wrong three
+separate ways, all of them *absence of evidence read as evidence of absence*. The post-mortem is
+in [`docs/ps1-core.md`](docs/ps1-core.md) and is worth reading before trusting any "X never
+happens" claim in this repo.
+
+### What is left, in order
+
+**1. Nondeterminism — now the dominant problem.** Five identical runs:
+
+```
+VRAM non-zero words:   0        0        1,776    7,127    75,527
+instructions retired:  6.8M     26.7M    31.5M    966M     1,097M
+```
+
+One run drew nothing in 150 seconds; another ran 1.1 billion instructions and filled 29% of VRAM.
+Until this is pinned down, no single-run measurement downstream means much — which is exactly
+what produced two conclusions in this repo's own history that later runs refuted.
+
+**2. The display origin.** The BIOS drew at VRAM x>=640; columns 0..639 are black. What texture
+coordinates does the composite quad use, and what does ps1_netemu think the PS1 display start is?
+
+**3. The BIOS stops after the logo.** Next a real PS1 BIOS reads `SYSTEM.CNF` off the disc, so
+the CD-ROM path is the likely wait.
 
 ### The PS1 GPU handoff works --- verified
 
