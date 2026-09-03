@@ -689,9 +689,84 @@ A note for whoever meets the next one of these: `default: return 1` is a reasona
 for a channel whose count is genuinely always ready, and it is exactly wrong for any channel
 whose `rdch` can block. Those two properties have to be decided together.
 
-### Next: interpreter throughput
+### Next: the main thread blocks on a semaphore nobody posts
 
-The remaining question is the R3000's rate --- ~40,000 instructions over ~100 s against a
-33 MHz PS1. Measure the budget each slice actually gets (`func_00105FA8`'s return value) and
-how long a slice takes. The millisecond-scale waits in reach are `ps3_intr_wait`'s 1 ms poll
-and `spu_ch_wait`'s 10 ms condition-variable timeout.
+The R3000 is **not slow** --- 1,000 instructions in 1 ms, about 1 MIPS. It *stops*, hard and
+early: the last dispatch lands at line 763 of a 22,015-line log while the rest of the
+emulator runs on for another 100 s.
+
+Narrowing it, in order:
+
+- **The interpreter is entered once and never returns.** With the dispatch table lifted, the
+  `bctr` is a `goto`, so `func_001066A8` loops internally; the entry counter stays at 1.
+- **The event scheduler is not the problem.** `func_00105FA8` runs ~2,100 rounds, `total`
+  climbing steadily (`0x70500` -> `0x83100`, ~256 cycles per slice) with `headdue == total`
+  each time, then stops with everything else.
+- **No helper blocks.** All 11 `bl` targets inside the interpreter were traced with
+  enter/exit breadcrumbs gated to fire near the stall: **1553 enters, 1553 exits**. The last
+  event is a clean return from `func_0010621C`.
+- **The very next line in the log is the answer:**
+
+  ```
+  [dbg] <<10621C
+  [WAIT tid=1] semaphore_wait(sem=1 timeout=0)
+  ```
+
+  Guest thread **1** is the main thread --- the one running the interpreter --- and it blocks
+  there forever with an infinite timeout.
+
+Semaphore 1 is created `init=0 max=1`, a one-shot completion latch. Counting the whole run:
+
+| sem | waits | posts |
+|---|---|---|
+| 1 | 1 | **0** |
+| 4 | 141 | 25 |
+| 5 | 9 | 96 |
+| 9 | 73 | 73 |
+| 10 | 13 | 105 |
+
+Every other semaphore is posted. Semaphore 1 is waited on once and **never posted**.
+
+How the interpreter reaches a syscall at all: it carries **51 `DRAIN_TRAMPOLINE` sites**, and
+the trampoline runs deferred guest work on the calling thread, so the main thread can leave
+R3000 code without `func_001066A8` returning.
+
+**And the waiter names itself.** With the guest call site added to the log
+(`[WAIT tid=1] semaphore_wait(sem=1 timeout=0 cia=0x00000000 lr=0x00113EB4)`), the call is
+`bl 0x3030C` at `0x113EB0`, and its surroundings are a **flip**:
+
+```
+00113E84  lwz    r29, 0x1C8(r27)     ; buffer index
+00113E8C  rldicl r4, r29, 0, 56
+00113E90  addi   r29, r29, 1         ; bump it
+00113E94  bl     0x142BC             ; queue the work
+00113EA0  rlwinm r29, r29, 0, 31, 31 ; index &= 1   -> double buffer
+00113EA4  bl     0x2BD9C
+00113EB0  bl     0x3030C             ; wait for completion  <-- blocks here
+```
+
+`r27` comes from `*(TOC-0x7834)`, the same object the semaphore's creator loads at
+`0x116CA8`. So the main thread queues a frame flip and waits to be told it finished.
+
+**What should tell it, and why it never does.** The chain closes on a defect already on the
+open-items list:
+
+```
+[SYS] sys_ppu_thread_create tid=2 name="_gcm_intr_thread" entry=0x001B7768
+[THREAD 2] host thread started, entry=0x001B7768
+[THREAD 2] entry RETURNED (r3=0x0) -- thread finished
+```
+
+`_gcm_intr_thread` is the RSX interrupt thread. It calls `sys_event_queue_receive` on **queue
+id 0** --- an uninitialised handle (the field at `0x2D80B4` is never written; the one writer
+is at `0x1200C`, reached from `0x12A24`) --- and immediately returns, so the thread exits
+before it has serviced anything. There is exactly one `event_queue_receive(q=0)` in the whole
+run.
+
+So: no RSX interrupt thread -> no vblank/flip callback -> semaphore 1 is never posted -> the
+main thread blocks at the first flip -> the R3000 stops at ~42,000 instructions.
+
+That makes the `_gcm_intr_thread` queue-id-0 bug --- carried as a minor open item for several
+sessions --- the actual blocker, not a cosmetic wart. Fixing it means finding why `0x2D80B4`
+never receives the queue id: either `0x12A24` is not reached, or the create that feeds it
+fails earlier.

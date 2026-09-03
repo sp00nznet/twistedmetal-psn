@@ -170,95 +170,79 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | R3000 starts executing | ✅ Done — the opcode dispatch table was never lifted; see below |
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
-| R3000 runs continuously | ⬜ **blocker** — ~40,000 instructions in, inside the BIOS word-copy loop |
+| R3000 runs continuously | ⬜ **blocker** — main thread parks on a flip semaphore nobody posts |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
 
 The PS1 core **runs**. The disc decrypts, its header signature verifies, the body opens, the
-BIOS boots and the R3000 executes:
+BIOS boots and the R3000 executes at about **1 MIPS** (1,000 instructions in 1 ms). Then it
+stops dead at ~42,000 instructions, while the rest of the emulator runs on for another 100 s.
 
-```
-[dbg] R3000 disp 1     pc=BFC00004      <- mfc0 $k0,$15 at the reset vector
-[dbg] R3000 disp 1000  pc=BFC022A4
-[dbg] R3000 disp 10000 pc=BFC4B844
-[dbg] R3000 disp 40000 pc=BFC58820
-```
+It is one chain, and it ends somewhere unexpected:
 
-It gets ~40,000 instructions in and stops inside a BIOS **word-copy loop** --- not a poll, an
-ordinary `memcpy`:
+1. **The main guest thread blocks forever.**
+   `[WAIT tid=1] semaphore_wait(sem=1 timeout=0 cia=0x00000000 lr=0x00113EB4)` --- thread 1
+   is the thread running the interpreter. Semaphore 1 is created `init=0 max=1` and, over a
+   whole run, is **waited on once and posted zero times**; every other semaphore has matching
+   posts.
+2. **It is waiting on a frame flip.** The call site `bl 0x3030C` at `0x113EB0` sits in a
+   double-buffer flip --- bump index, queue the work, wait for completion --- on the same
+   object the semaphore's creator loads.
+3. **Nothing completes it, because the RSX interrupt thread is dead on arrival.**
+   `_gcm_intr_thread` starts, calls `sys_event_queue_receive` on **queue id 0** (an
+   uninitialised handle --- the field at `0x2D80B4` is never written), and returns at once:
 
-```
-BFC5881C  lw    $t8, 0($a0)
-BFC58820  addiu $a0, $a0, 4
-BFC58824  sltu  $at, $a0, $v0
-BFC58828  addiu $a1, $a1, 4
-BFC5882C  bne   $at, $zero, 0xBFC5881C
-BFC58830  sw    $t8, -4($a1)      ; delay slot
-```
+   ```
+   [SYS] sys_ppu_thread_create tid=2 name="_gcm_intr_thread" entry=0x001B7768
+   [THREAD 2] entry RETURNED (r3=0x0) -- thread finished
+   ```
 
-Two things are true at that point and it is not yet established which is cause and which is
-effect:
+No interrupt thread -> no flip callback -> semaphore 1 never posted -> the main thread parks
+-> the R3000 stops. The `_gcm_intr_thread` queue-id-0 defect had been carried as a *minor*
+open item for several sessions; it is the actual blocker.
 
-1. **The R3000 is slow.** ~40,000 instructions over ~100 s of wall clock. A PS1 runs at
-   33 MHz, so throughput is orders of magnitude short --- consistent with the interpreter
-   getting very small budget slices and paying a millisecond-scale wait per slice, rather than
-   with the copy itself being expensive.
-2. ~~**SPU 4 is deadlocked on a reservation nobody breaks.**~~ **Fixed.** The audio core
-   parked at `pc=0x0A5E8` on `rdch SPU_RdEventStat` waiting for `MFC_LLR_LOST_EVENT` on a
-   line (`0x2DEF80`) that a store watch confirms is only ever zero-initialised. The cause was
-   not a missing writer but `rchcnt` answering "ready" for a channel it had no case for, which
-   lured the SPU into a read it could never complete --- see
-   [Toolchain changes](#-toolchain-changes-upstreamed-to-ps3recomp). `ch-wait` stalls went
-   from blocking for 26+ s to **zero**.
+Everything else inside the interpreter was cleared on the way there: it is entered once and
+loops internally (so a stall is not a return); the event scheduler runs ~2,100 rounds with its
+cycle total climbing normally; and all 11 helper calls were traced with enter/exit breadcrumbs
+--- **1553 enters, 1553 exits**, nothing blocks. The main thread can reach a syscall at all
+because the interpreter carries **51 `DRAIN_TRAMPOLINE` sites**, which run deferred guest work
+on the calling thread.
 
-That leaves the interpreter's throughput as the open question: what the budget is each slice
-and where the wall-clock goes.
-
-# What unblocked it: the opcode dispatch table was never lifted
+### What unblocked the core: the opcode dispatch table was never lifted
 
 Worth writing down, because the symptom pointed nowhere near the cause.
 
-`ps1_netemu`'s R3000 interpreter (`func_001066A8`) dispatches every guest MIPS instruction
-through a **jump table**: `lwzx r5, r19, r11; mtctr r5; bctr` at `0x1067D4`, reading a
-128-entry table of mid-function addresses. ps3recomp's `discover_jump_tables` missed it for
-two independent reasons:
+The R3000 interpreter (`func_001066A8`) dispatches every guest MIPS instruction through a
+128-entry jump table --- `lwzx r5, r19, r11; mtctr r5; bctr` at `0x1067D4`, table at
+`0x1B37D4`. ps3recomp's `discover_jump_tables` missed it for two independent reasons: the
+table base `lwz r19,-0x79CC(r2)` sits **36 instructions** before the `bctr`, outside a fixed
+30-instruction window; and entry `[0]` is a **null slot** for an opcode the table never
+dispatches, which made the decoder break on the first invalid entry for **0 targets**.
 
-1. **The table-base load was out of window.** The base comes from `lwz r19, -0x79CC(r2)` at
-   `0x106744` -- **36 instructions** before the `bctr`. The detector searched a fixed
-   30-instruction window, found the `mtctr` and the `lwzx` but no base, and gave up.
-2. **Entry 0 is a null slot.** Index 0 is an opcode the table never dispatches, so the first
-   word is `0`. The decoder broke on the first invalid entry, so even with the right base it
-   decoded **0 targets**.
-
-With the dispatcher dropped, every case target stayed unlabelled, and the `bctr` fell back to
-the generic `ps3_indirect_call` -- which only knows function **entries**. `0x1070E4` is a
-mid-function address: not a label, not a function, not in the table. So the call silently did
-nothing, `func_001066A8` returned, and the main loop at `0xB3E68` saw a status other than 5
-and tore the emulator down.
-
-The trace that made it obvious -- one guest instruction, correctly fetched and decoded, then
-oblivion:
+With the dispatcher dropped, the case targets stayed unlabelled and the `bctr` fell back to
+the generic indirect-call dispatcher, which resolves function **entries** only. Every case is
+a mid-function address, so the call did nothing:
 
 ```
 [dbg] R3000 enter #1 pc=BFC00000 budget=00000000
-[dbg] R3000 bctr  #1 ctr=001070E4 pc=BFC00004 insn=401A7800 budget=FFFFFFF7
+[dbg] R3000 bctr  #1 ctr=001070E4 pc=BFC00004 insn=401A7800
 ```
 
-`0x401A7800` is `mfc0 $k0,$15` -- the PS1 BIOS's first instruction, fetched byte-reversed
-from the right offset. The fetch, the i-cache cycle penalty and the PC advance were all
-correct. Only the dispatch went nowhere.
-
-**A correction worth recording.** The previous note here said the blocker was a cycle budget
-of 0 at `+0x120`. That was a symptom read as a cause: a budget of 0 is *normal*. The
-interpreter immediately calls its event scheduler (`func_00105FA8`), which fires the due
-events and returns `next_due - now` as the new budget. Poking the budget to a nonzero value
-changed nothing, which was the clue that the budget was never the problem.
+`0x401A7800` is `mfc0 $k0,$15` --- the BIOS's first instruction, fetched byte-reversed from
+the right offset. Fetch, i-cache cycle penalty and PC advance were all correct. Only the
+dispatch went nowhere, so `func_001066A8` fell out and the main loop at `0xB3E68` saw a status
+other than 5 and tore the emulator down.
 
 Both fixes are in `ppu_lifter.py`; see
-[Toolchain changes](#-toolchain-changes-upstreamed-to-ps3recomp). Together they took the
-image from 67 dispatchers / 654 case targets to **68 / 718**.
+[Toolchain changes](#-toolchain-changes-upstreamed-to-ps3recomp). Together they took the image
+from 67 dispatchers / 654 case targets to **68 / 718**.
+
+**Two corrections worth recording.** The earlier note here blamed a cycle budget of 0 at
+`+0x120`: that was a symptom read as a cause --- a budget of 0 is normal, and the scheduler
+tops it up. And "the R3000 is orders of magnitude too slow" measured a *stall*, not a rate;
+it runs at ~1 MIPS right up to the moment it parks.
 
 ### Also open
 
