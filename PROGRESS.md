@@ -1704,3 +1704,84 @@ from reasoning forward off a partial signal --- a stale `lr`, a mixed stdout/std
 count divided by the wrong denominator. The two things that actually produced answers were
 both *measurements built for the question*: `ps3_qpc_us()` for comparable timing, and this
 sampler for busy time. Build the instrument first.
+
+### Retraction: the "99% in func_00022F28" result was my own tool lying
+
+I hardened the sampler and it demolished its own previous answer. Three attribution modes, same
+workload:
+
+| attribution | guest samples | top guest function |
+|---|---|---|
+| extent `[entry, next_entry)` | 446 / 4960 (9.0%) | `func_00022F28` **99.1%**, 5 threads |
+| extent, capped at `0x20000` | 338 / 4949 (6.8%) | `func_00022F28` 98.8%, **4** threads |
+| exact, via `RtlLookupFunctionEntry` | **0 / 4931 (0.0%)** | **none** |
+
+The extent heuristic was the problem, and I should have seen it before publishing a headline
+off it. The function table holds **PPU functions only**, so SPU-lifted code and runtime code
+sit in the gaps between entries; an uncapped `[entry, next_entry)` span silently swallows
+whatever occupies the hole and blames the preceding PPU function. Capping at `0x20000` moved
+the answer from "5 threads, 99%" to "4 threads, 98.8%" --- which should itself have been the
+tell, since a real measurement does not shift its subject when you adjust an unrelated bound.
+The four/five "busy" threads were the raw-SPU workers all along (four SPUs run image 1, one
+runs image 2), running lifted **SPU** code that the PPU table cannot describe.
+
+x64 Windows records exact function bounds in `.pdata`, and `RtlLookupFunctionEntry` returns the
+true start for any RIP. Matching that start against the table **exactly** means a hit is
+genuinely that lifted function and everything else misses cleanly. That is the mode now in
+place.
+
+**What survives, and what is now open.** The module-level split is unaffected by any of this
+and is the trustworthy part:
+
+```
+[samp] 4931 samples
+[samp] host  89.2%  ntdll.dll     (4399)     <- threads parked in kernel waits
+[samp] host  10.5%  tmpsn.exe     (518)      <- runtime: RSX backend, SPU emulation
+```
+
+So the process is ~89% idle, and essentially all real work is host-side runtime code. That
+matches everything else measured (GPU packets at 6, R3000 at <50k instructions, one thread
+waiting on a fence) and it is the first *quantified* statement of it.
+
+**A caveat I will not paper over**: exactly `0` guest samples is suspicious in its own right.
+It could mean no lifted PPU code runs during the steady state --- consistent with 89% of
+threads sitting in waits --- or it could mean `RtlLookupFunctionEntry` finds no `.pdata` entry
+for the lifted bodies, in which case the exact mode misses *all* guest code by construction.
+Those are very different conclusions and I have not distinguished them. The check is cheap:
+call `RtlLookupFunctionEntry` on a known lifted function pointer straight out of
+`function_table` at startup and print whether it resolves. Do that before trusting either
+number.
+
+And the self-check settles which reading was right --- **neither**:
+
+```
+[samp] pdata self-check: func_0014F6D0 at 00007FF7AEA52E50
+       -> NO .pdata entry -- exact mode cannot see guest code
+```
+
+`RtlLookupFunctionEntry` finds no unwind record for the lifted bodies, so the exact mode
+cannot attribute guest code **at all**. Its `0 / 4931` is not a measurement of anything; it is
+the mode failing silently. So:
+
+* extent mode **over**-attributes (SPU and runtime code in the gaps land on the preceding PPU
+  function) --- its "99% in `func_00022F28`" is retracted;
+* exact mode **under**-attributes to zero --- its "no guest code runs" is equally retracted.
+
+The only numbers from this profiler worth keeping are the module-level ones, which neither
+mode affects: **~89% `ntdll.dll`** (threads parked in kernel waits) and **~10% `tmpsn.exe`**
+(runtime --- RSX backend and SPU emulation). The process is ~89% idle and what work there is
+happens in host code. That is consistent with every other measurement and is the first
+quantified version of it.
+
+**To make the sampler actually work**, one of two things:
+
+1. **Merge the SPU registry into the map.** The gaps that swallow samples are SPU-lifted
+   bodies; `spu_channels.c`'s `s_registry` knows their host pointers. With both tables sorted
+   together, `[entry, next_entry)` becomes meaningful and extent mode is correct rather than
+   approximately correct. This is the smaller change and it fixes the actual cause.
+2. **Get `.pdata` for the lifted TU** (an unwind-tables compile flag) and keep the exact mode.
+   Cleaner in principle, but it means changing how a 22 MB generated translation unit is
+   compiled, for a diagnostic.
+
+Option 1 is the one to do. Until then `PS3_SAMPLE` is honest only at module granularity, and
+the header comment in `ppu_loader.cpp` says so.

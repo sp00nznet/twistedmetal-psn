@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — 99% of guest CPU in `func_00022F3C`; 91% of CPU is host-side |
+| R3000 runs continuously | ⬜ **blocker** — not located; ~89% of the process is idle |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -234,27 +234,37 @@ spin polls are 43 us apart and `GCM_RATE=1` shows a steady **270 FIFO walks/sec*
 the poll loop nor the walk is starved --- the ~2 s is the guest's own work between fences, and
 the fence wait is a symptom.
 
-**Then the tool that was missing all along.** Every probe here reports where a thread
-*blocks*; none could say where one spends time while *running*, which is precisely the gap.
-`PS3_SAMPLE=<ms>` now suspends each thread, reads `RIP`, and maps it to a lifted function by
-extent:
+**Then the tool that was missing all along --- and a retraction.** Every probe here reports
+where a thread *blocks*; none could say where one spends time while *running*. `PS3_SAMPLE=<ms>`
+now samples thread RIPs. Its first answer was "99.1% of guest CPU in `func_00022F28`", and
+**that was my own tool lying**:
+
+| attribution | guest samples | top guest function |
+|---|---|---|
+| extent `[entry, next_entry)` | 446 / 4960 | `func_00022F28` **99.1%**, 5 threads |
+| extent capped at `0x20000` | 338 / 4949 | `func_00022F28` 98.8%, **4** threads |
+| exact, `RtlLookupFunctionEntry` | **0 / 4931** | **none** |
+
+The function table holds **PPU functions only**, so SPU-lifted and runtime code sit in the gaps
+and an extent span blames the preceding PPU function --- the "busy" threads were the raw-SPU
+workers. That the answer shifted from 5 threads to 4 when I adjusted an unrelated bound should
+itself have been the tell. And the exact mode is no better: a startup self-check reports
+`NO .pdata entry` for the lifted bodies, so it cannot see guest code at all and its `0` is a
+silent failure, not a measurement.
+
+**What survives** is the module split, which neither mode affects:
 
 ```
-[samp] 4960 samples, 446 in guest code (9.0%)
-[samp]    99.1%  func_00022F28  (442)
+[samp] host  89.2%  ntdll.dll     (4399)   <- threads parked in kernel waits
+[samp] host  10.5%  tmpsn.exe     (518)    <- runtime: RSX backend, SPU emulation
 ```
 
-Two results, neither of which any amount of reasoning had produced:
+The process is **~89% idle**, and what work exists is host-side. Consistent with everything
+else measured, and the first quantified version of it.
 
-1. **Only 9% of process CPU is in guest code.** The other 91% is runtime/host --- the RSX
-   backend and its D3D12 work.
-2. **99.1% of the guest time is one function**, the body at `0x00022F3C`, with five callers
-   clustered at `0x243EC`-`0x24A0C`. Its inner loop walks an index 6668 -> 7148 by 32 calling
-   `func_00022F30`, which is literally `li r3,-1; blr` --- so the arm that branches on
-   `r3 != -1` never runs. Normal firmware or a lifting artefact, that is the highest-value
-   thing to check next, and it was invisible for this whole session.
-
-Detail, and the list of readings this corrects, in [`docs/ps1-core.md`](docs/ps1-core.md).
+**To make the sampler work**, merge `spu_channels.c`'s `s_registry` into the map so the gaps
+become real entries and extents mean something. Detail, and the full list of readings this
+session corrects, in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and
