@@ -378,3 +378,73 @@ Also still open, and cosmetic: two `sys_interrupt_thread_disestablish() failed` 
 teardown. Syscall 89 (`_sys_interrupt_thread_disestablish`, per RPCS3's table) is now
 implemented and unbinds the tag, but the guest evidently reaches it by another number, so the
 stub still answers. Harmless -- it happens after `R3000Exit` -- but worth pinning down.
+
+## Past the interrupts: the R3000 has nothing to run
+
+With interrupts delivering, the failure moved up a layer. The emulator no longer wedges -- it
+boots, runs briefly, and **shuts itself down**. Tracing that shutdown gives a clean chain.
+
+### The exit is a deliberate decision, not a crash
+
+`TTY_BT` on the config save puts it in the PPU CRT (`0x10230`/`0x10354`), so saving the config
+is an *atexit* handler: `main` returned. The decision is at `0xB3E60`:
+
+```
+bl 0xB671C
+bl 0xB66E0          ; -> status
+cmpwi r3, 5   -> 0xB3E58   keep running
+cmpwi r3, 4   -> 0xB3C30   other path
+otherwise:
+bl 0xB2280          ; save config      <- the atexit-looking print
+bl 0xB6650          ; teardown, ending in R3000Exit()
+```
+
+`func_000B66E0` returns whatever `func_001066A8` returns, and `func_001066A8` is the **R3000
+interpreter**: it takes the same state block `R3000Exit` uses (`*(TOC-0x79FC)`), reads the PC
+from `+0x108`, adds the PS1 RAM base from `*(TOC-0x79D4)`, and fetches with
+`lwbrx r29, r0, r9` -- a byte-reversed load, i.e. a little-endian PS1 instruction. Status 5
+means "keep interpreting".
+
+So the emulator is asking its R3000 core to run, the core returns something other than
+"continue", and it shuts down. `R3000Exit(): PS1_EXIT_STOP` is the *consequence*, not the
+cause -- `func_00105E18` only sets an "already exited" flag at `+0x110`.
+
+### Why: the disc body is opened and never read
+
+```
+line 703  [sys_fs] open OK: ...USRDIR/CONTENT/EBOOT.PBP
+          (no reads)
+line 918  save config file: /USRDIR/CONFIG        <- the exit path
+```
+
+Watching the open-file size at `cdrom_obj + 0x70A0` shows the file switch itself works
+perfectly:
+
+```
+0x00100028   the decrypted EDAT   (1,048,616)
+0x0418B2D5   EBOOT.PBP            (68,727,509)
+0x00000000   closed again
+```
+
+So `pspi.c` verifies the header, closes the EDAT, opens the PBP, records its real size -- and
+then closes it without streaming a byte. Everything up to and including the file switch is
+correct; the read that should follow never happens.
+
+The code right after the switch (`0xF15D0`) reads 40 bytes and then walks a track table at
+`0xF16B0`: `r22 * 0xB3C80` per entry, bounded by the track count at `+0x70D8`, validating BCD
+MSF digits (`nibble > 9` and `high*10+low > 99` both branch to the `0xF0930` teardown). That
+also finally explains the `0xB3C80` constant from the very first mount investigation: it is
+the **per-track stride in the track table**, not a byte count, which is why reading that many
+bytes never made sense.
+
+### Where to pick up
+
+The next measurement is which of those checks rejects the PBP -- the 40-byte read at
+`0xF15F0`, the track-count bound at `0xF16AC`, or one of the three BCD gates at
+`0xF16DC`/`0xF16E8`/`0xF1700`. All three BCD gates jump to `0xF0930`, which is the teardown
+whose call site the PC-history ring already names, so a store watch on `+0x70D8` plus the
+existing miss dump should settle it in one run.
+
+Worth carrying forward: the PS1 RAM base is `*(TOC-0x79D4)` and the R3000 PC is at
+`+0x108` of `*(TOC-0x79FC)`. Watching those two directly is the fastest way to confirm
+"nothing was ever loaded" independently of the disc path.
