@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — not yet located; `lr`-based attribution proved unreliable |
+| R3000 runs continuously | ⬜ **blocker** — not located; spinning in `func_000198F4`, ~7k `usleep`/90s |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -228,26 +228,38 @@ thread received on queue 0 and exited outright; with it the thread stays alive a
 real events. Verified with the ticker gone: thread alive, `sem 1` posted 24x, and **zero**
 graphics-error dumps.
 
-**The blocker is not yet located, and one of my methods proved unreliable.** I identified a
-`cellGcmFinish` fence wait as the culprit from an `lr` histogram (8,207 samples at
-`lr=0x00019928`). That was wrong:
+**The blocker is not located, and two of my theories collapsed under test.** What was gained
+is a diagnostic that actually works.
 
-- **`lr` is only written by `bl`.** A spin loop that calls nothing keeps whatever return
-  address the last `bl` left, so *any* later `usleep` reports the same `lr`. And `cia` is
-  `0x00000000` for this thread --- the lifted code does not maintain it --- so there was
-  nothing to cross-check.
-- **The fence wait demonstrably completes.** Probing it directly: entered **exactly once**,
-  wanting `0xFFFFFFFF`, at `put=0x00001000`. That fence is written at `getoff=0x1398`, *after*
-  that `put`, and fences `0`/`1`/`2` follow at `0x1410`-`0x1420` with `put` ending at `0x2184`.
-  The guest is single-threaded here, so it could not have written any of that while still
-  parked on the first fence. The read-driven publisher handed it `0xFFFFFFFF` and it moved on.
+`PS3_SCTRACE` resolved a host stack frame by taking the greatest lifted-function entry below
+it and accepting the match within 128 KB --- never checking the frame was *inside* that
+function. That is where the nonsensical `func_00013040+0x9FF1` came from, and I built a wrong
+conclusion on it. Sorting the table once gives every function a real extent
+`[entry, next_entry)`, and it now reports a chain:
 
-So `cellGcmFinish` works and is not the blocker. What is actually needed to name a poll site is
-the guest PC at syscall time --- either have the lifter maintain `ctx->cia` at `sc` sites (one
-store per syscall, and every `[WAIT]` line becomes trustworthy), or map the host return address
-through the function table properly, which `PS3_SCTRACE` attempts and gets wrong.
+```
+8187 from func_0014E75C+0xA0F5<-func_0014E75C+0x9AC7<-func_000198F4+0x320
+ 268 from func_0014E75C+0xA0F5<-func_0014E75C+0x9AC7<-func_00032D20+0x320
+```
 
-Until then, no `lr`-based attribution should be trusted for a loop that does not call out.
+Real and checkable where the old output was garbage. **Kept.** It also reinstated
+`func_000198F4` as the spinning caller, so my *previous* correction ("the fence wait
+completes") was itself wrong --- it is entered once and never leaves.
+
+But the fence theory fails its own test. If the waiter wants `0xFFFFFFFF` while `ref` runs on
+to `2`, read-driven fence publication should matter. It does not: **6,891** tid-1 `usleep`
+calls with `GCM_REFPOLL` on versus **7,005** with it off --- identical. The hook is not firing
+on this waiter's reads, so whatever it polls is probably not `ctrl->ref`. The inference from a
+TOC slot to "it polls `ctrl->ref`" has a gap I did not close.
+
+I also tried making "no skip-past" a guarantee rather than a timing hope. No measured change,
+and it lives in runtime code shared with other ports I cannot test here, so it is **reverted**
+rather than kept on the strength of an argument.
+
+**What is solid:** the thread that runs the R3000 spins in `func_000198F4`, entered once,
+~7,000 `usleep(30us)` per 90 s run, with the emulator otherwise healthy (0 exits, 0 SPU
+stalls, 0 graphics errors). **What is needed:** read what that loop actually compares --- `r31`
+and the address in `r30` *captured inside the loop* --- instead of inferring it backwards.
 Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops

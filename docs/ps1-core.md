@@ -1034,3 +1034,53 @@ through the function table properly -- what `PS3_SCTRACE`'s backtrace attempts a
 
 Until one of those exists, **no `lr`-based attribution in this file should be trusted for a
 loop that does not call out**, and that includes the fence-wait conclusion above it.
+
+### Two theories collapsed; one real diagnostic gained
+
+**The backtrace mapping was broken, and fixing it was worth doing.** `PS3_SCTRACE` resolved a
+host stack frame by taking the greatest lifted-function entry below it and accepting the match
+if within 128 KB -- it never checked the frame was actually *inside* that function, so frames
+in runtime/CRT code resolved to whichever lifted function happened to precede them. That is
+where `func_00013040+0x9FF1` came from. Sorting the table once gives every function a real
+extent `[entry, next_entry)`, so a frame either lands in one or is skipped, and it now reports
+a chain rather than the first hit. On the very first run it produced:
+
+```
+8187 from func_0014E75C+0xA0F5<-func_0014E75C+0x9AC7<-func_000198F4+0x320
+ 268 from func_0014E75C+0xA0F5<-func_0014E75C+0x9AC7<-func_00032D20+0x320
+```
+
+That is a real, checkable answer where the old code produced nonsense. **Kept.**
+
+It also *reinstated* `func_000198F4` as the spinning caller -- so the previous entry's
+correction ("the fence wait completes") was itself wrong. The probe showing it entered once,
+plus 6,644 `usleep` calls attributed to it, means it is entered once and never leaves. The
+fences `0`/`1`/`2` and `put=0x2184` must therefore come from another thread, which is the
+assumption I should have tested instead of asserting the guest was single-threaded here.
+
+**But the fence theory does not survive its own test.** If the waiter wants `0xFFFFFFFF` and
+`ref` runs past it to `2`, then the read-driven publisher (`cellGcm_ref_on_poll`, hooked in
+`vm_read32` on exactly `VM_HLE_INJECT_BASE + 0x2008`) should matter. It does not:
+
+| | tid-1 `usleep` calls |
+|---|---|
+| `GCM_REFPOLL` default (on) | 6,891 |
+| `GCM_REFPOLL=0` (ticker only) | 7,005 |
+
+Identical. Turning read-driven publication off changes nothing, which means **the hook is not
+firing on this waiter's reads at all** -- so whatever it polls, it is probably not
+`0x20002008`. The chain of inference from `*(TOC-0x6AD8)->[0x10] = 0x20002000` to "it polls
+`ctrl->ref`" has a gap in it: that field could be repointed after the write the store watch
+caught.
+
+I also tried making "no skip-past" a guarantee rather than a timing hope (hold each published
+fence until a read has returned it, instead of trusting a ~200us gate against a poller whose
+`usleep(30us)` costs ~12ms under load). It produced **no measured change**, and it lives in
+runtime code shared with other ports that I cannot test here, so it is **reverted** rather than
+left in on the strength of an argument.
+
+**Honest position.** The blocker is not located. What is now solid: the guest thread that runs
+the R3000 is spinning in `func_000198F4`, entered once, ~7,000 `usleep(30us)` per 90s run, and
+the emulator is otherwise healthy (0 exits, 0 SPU stalls, 0 graphics errors). What is needed
+next is to read what that loop actually compares -- `r31` and the address in `r30` at the
+compare, captured *in the loop*, rather than inferred backwards from a TOC slot.
