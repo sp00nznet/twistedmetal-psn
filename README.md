@@ -165,7 +165,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Disc body opens (`EBOOT.PBP`) | ✅ Done — header signature verifies, `EBOOT.PBP` opened |
 | PS1 title boots | ✅ Done — `North American Title detected!`, `boot from /dev_hdd0/game/NPUI94304` |
 | SPU cores run (no stalls) | ✅ Done — lost-reservation event + `sys_usbd_receive_event` |
-| PS1 core runs (R3000) | ⬜ **blocker** — GPU core (SPU 4) exits cleanly with status 0 and is never restarted |
+| PS1 core runs (R3000) | ⬜ **blocker** — raw-SPU interrupts never delivered, so the PPU never replies to the SPUs |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

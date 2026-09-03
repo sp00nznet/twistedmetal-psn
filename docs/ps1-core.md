@@ -242,3 +242,73 @@ Two directions from here, in order:
    `SPU_STATUS_STOPPED_BY_STOP | (stop_code << 16)`, so the status register reads correctly;
    what is not yet established is whether `gpuio.cc: gpuCmdInterruptHandlerThread` (tid=5)
    ever polls it.
+
+## The blocker: raw-SPU interrupts are never delivered
+
+Tracing where every PPU thread is parked (last completed syscall per tid) finishes the
+picture:
+
+| tid | thread | parked after |
+|---|---|---|
+| 1 | main | `sc 91` |
+| 2 | `_gcm_intr_thread` | `sc 130(queue 0)` -> ESRCH |
+| 3 | `libusbd_callback_thread` | `sc 540` (now sleeping, see above) |
+| 5 | **`gpuio.cc: gpuCmdInterruptHandlerThread`** | **`sc 88` = `sys_interrupt_thread_eoi`** |
+| 6 | `_xSPUWaveOut` | `sc 130(queue 3)` -- working, 20k real events |
+| 7 | **`spu.c: SPUCxInterruptHandlerThread`** | **`sc 88` = `sys_interrupt_thread_eoi`** |
+| 8 | `_xcdrom_thread` | `sc 94` |
+| 9 | `xPadThread` | `sc 130(queue 2)` |
+| 10 | `_xMcThread` | `sc 94` |
+| 11 | `_PSPiStorageThread` | `sc 94` |
+
+The two threads whose whole job is servicing the SPUs -- the GPU command handler and the SPU
+class-2 handler -- are both sitting in `sys_interrupt_thread_eoi`, waiting for an interrupt
+that never arrives. And `sys_interrupt_thread_establish` (84) and `eoi` (88) are both stubs:
+nothing in `runtime/syscalls/` implements them.
+
+That single gap explains every symptom at once:
+
+```
+[spu-raw] R spu0 OUT_MBOX      <- once
+[spu-raw] R spu1 OUT_MBOX      <- once
+[spu-raw] R spu2 OUT_MBOX      <- once
+[spu-raw] R spu3 OUT_MBOX      <- once
+[spu-raw] R spu4 OUT_MBOX      <- once
+```
+
+Five reads of the outbound mailbox, one per SPU, during init -- and **not one write to
+`IN_MBOX` in the entire run**. The handshake is one-way. Each SPU announces itself, the PPU
+collects the five messages while it is still polling, and from then on the PPU expects to be
+*interrupted* when an SPU wants something. It never is, so it never replies. SPUs 0-3 park on
+`rdch ch=29` (`SPU_RdInMbox`) forever, and SPU 4 -- which does
+`wrch SPU_WrOutMbox` at `0x0CD1C`, calls `0x8800`, then tests `brnz $r80` at `0x0CD2C` --
+takes the `r80 == 0` branch, zeroes `0x1D580..0x2F700`, returns 0, and exits.
+
+So SPU 4 is not failing. It asked the PPU a question, got no answer, and shut down tidily.
+
+## What the runtime already has, and what is missing
+
+Present:
+
+- `s->intrtag` and `s->int_stat` per raw SPU.
+- `raw_out_mbox_hook()` sets `int_stat |= 1` on a `WrOutIntrMbox` -- the class-2 mailbox
+  interrupt.
+- `sys_raw_spu_get_int_stat` (154) and `set_int_stat` (153, write-1-to-clear) so the PPU can
+  read and acknowledge.
+
+Missing -- and this is the work:
+
+1. **`sys_interrupt_thread_establish` (84)**: record which PPU thread services which interrupt
+   tag, instead of returning success and forgetting.
+2. **Delivery**: when a raw SPU raises `int_stat` (an out-interrupt mailbox write, or a stop),
+   wake the thread established for that tag.
+3. **`sys_interrupt_thread_eoi` (88)**: park the handler until the next interrupt rather than
+   returning immediately.
+
+That is the mechanism `ps1_netemu` is built on: the SPU writes its interrupt mailbox, the PPU
+handler wakes, reads `OUT_MBOX`, and replies through `IN_MBOX`. Until it exists, the R3000
+cores have no way to be given work, and nothing the disc path does can reach the screen.
+
+Worth saying plainly: this is the *third* time on this title that a "stub that returns
+CELL_OK" has been the whole blocker -- after `_sys_malloc` and `sys_usbd_receive_event`. A
+syscall that succeeds without doing anything is much harder to find than one that fails.
