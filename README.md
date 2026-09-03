@@ -167,85 +167,152 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | SPU cores run (no stalls) | ✅ Done — lost-reservation event + `sys_usbd_receive_event` |
 | Raw-SPU interrupts delivered | ✅ Done — establish/eoi/stop-and-signal, level-triggered |
 | BIOS loaded, R3000 at reset vector | ✅ Done — `mfc0 $k0,$15` at `0xBFC00000` |
-| PS1 core runs (R3000) | ⬜ **blocker** — cycle budget `+0x120` is 0, so the interpreter runs 0 instructions |
+| R3000 starts executing | ✅ Done — the opcode dispatch table was never lifted; see below |
+| Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
+| R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
+| R3000 runs continuously | ⬜ **blocker** — ~40,000 instructions in, inside the BIOS word-copy loop |
+| Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
 
-The disc decrypts, streams and hashes **correctly** — and then one signature check stops it:
+The PS1 core **runs**. The disc decrypts, its header signature verifies, the body opens, the
+BIOS boots and the R3000 executes:
 
 ```
-[edat] ...ISO.BIN.EDAT: version=3 license=3 flags=0x00000000 block=0x4000 size=1048616
-[edat] klicensee NP_PSX_KEY verified against dev_hash
-[edat] decrypted 1048616 bytes -> ...ISO.BIN.EDAT.dec
-[sys_fs] open OK: ...ISO.BIN.EDAT.dec
-ExitPS1(): code=3 <0>
+[dbg] R3000 disp 1     pc=BFC00004      <- mfc0 $k0,$15 at the reset vector
+[dbg] R3000 disp 1000  pc=BFC022A4
+[dbg] R3000 disp 10000 pc=BFC4B844
+[dbg] R3000 disp 40000 pc=BFC58820
 ```
 
-**How far it actually gets.** The `PSISOIMG0000` compare passes. The streaming reader
-consumes the entire megabyte — the stream position climbs in `0x1000` steps to exactly
-`0x100000`, then to `0x100028` after a 40-byte trailer — hashing as it goes. Watching the
-digest the guest writes:
+It gets ~40,000 instructions in and stops inside a BIOS **word-copy loop** --- not a poll, an
+ordinary `memcpy`:
 
 ```
-guest  SHA1(header) = 6c55da7ff8eb8c09df8d5269dca4444b561097aa
-python SHA1(dec[0:0x100000]) = 6c55da7ff8eb8c09df8d5269dca4444b561097aa
+BFC5881C  lw    $t8, 0($a0)
+BFC58820  addiu $a0, $a0, 4
+BFC58824  sltu  $at, $a0, $v0
+BFC58828  addiu $a1, $a1, 4
+BFC5882C  bne   $at, $zero, 0xBFC5881C
+BFC58830  sw    $t8, -4($a1)      ; delay slot
 ```
 
-Byte for byte. One comparison validates the whole chain: the EDAT decryption, the block-key
-derivation, the ring buffer's ordering, and the lifted SHA-1 over a megabyte.
+Two things are true at that point and it is not yet established which is cause and which is
+effect:
 
-**The two-file design.** `ps1_netemu` builds *both* `/USRDIR/ISO.BIN.EDAT` and
-`/USRDIR/CONTENT/EBOOT.PBP`. Comparing them shows why: the PSAR's header is `\0PGD`
-ciphertext from `0x400` on, while the EDAT has the same region in the clear — serial
-`_SCUS_94304`, a valid 9-track CD TOC, and the block index. `ISO.BIN.EDAT` is Sony's
-**decrypted, signed** copy of the PSAR's `0x100000`-byte header; the PS3 never runs PGD and
-streams the compressed body out of `EBOOT.PBP`. The strings name the subsystem: `pspi/pspi.c`.
+1. **The R3000 is slow.** ~40,000 instructions over ~100 s of wall clock. A PS1 runs at
+   33 MHz, so throughput is orders of magnitude short --- consistent with the interpreter
+   getting very small budget slices and paying a millisecond-scale wait per slice, rather than
+   with the copy itself being expensive.
+2. **SPU 4 is deadlocked on a reservation nobody breaks.** The audio core parks at
+   `pc=0x0A5E8` on `rdch SPU_RdEventStat` waiting for `MFC_LLR_LOST_EVENT`:
 
-**Where it stops.** At `0xF132C`, right after `SHA1_Final`:
+   ```
+   [ch-wait] spu=4 pc=0x0A5E8 ch=0 waited=26000ms evstat=0x0 evmask=0x400 resv[valid=1 ea=0x002DEF80]
+   ```
+
+   The runtime's producer for that bit is wired correctly and every gate passes --- mask is
+   `0x400`, the reservation is valid, the EA is non-zero --- so `spu_resv_lost_poll` is
+   running and finding the reserved 128-byte line **unchanged**. Nobody writes `0x2DEF80`.
+
+   Ruled out: the audio event chain is not the cause. `cellAudioPortOpen` ->
+   `CreateNotifyEventQueue` (id 3, key `0x8000000000000001`) -> `SetNotifyEventQueue` ->
+   `PortStart` all succeed, the mixing thread starts, and `_xSPUWaveOut` (tid 6) cycles on
+   that queue rather than sleeping on it.
+
+The next measurement is a store watch on `0x2DEF80` to name the writer the guest expects, and
+a rate check on the interpreter's budget slices to see where the wall-clock goes.
+
+### What unblocked it: the opcode dispatch table was never lifted
+
+Worth writing down, because the symptom pointed nowhere near the cause.
+
+`ps1_netemu`'s R3000 interpreter (`func_001066A8`) dispatches every guest MIPS instruction
+through a **jump table**: `lwzx r5, r19, r11; mtctr r5; bctr` at `0x1067D4`, reading a
+128-entry table of mid-function addresses. ps3recomp's `discover_jump_tables` missed it for
+two independent reasons:
+
+1. **The table-base load was out of window.** The base comes from `lwz r19, -0x79CC(r2)` at
+   `0x106744` -- **36 instructions** before the `bctr`. The detector searched a fixed
+   30-instruction window, found the `mtctr` and the `lwzx` but no base, and gave up.
+2. **Entry 0 is a null slot.** Index 0 is an opcode the table never dispatches, so the first
+   word is `0`. The decoder broke on the first invalid entry, so even with the right base it
+   decoded **0 targets**.
+
+With the dispatcher dropped, every case target stayed unlabelled, and the `bctr` fell back to
+the generic `ps3_indirect_call` -- which only knows function **entries**. `0x1070E4` is a
+mid-function address: not a label, not a function, not in the table. So the call silently did
+nothing, `func_001066A8` returned, and the main loop at `0xB3E68` saw a status other than 5
+and tore the emulator down.
+
+The trace that made it obvious -- one guest instruction, correctly fetched and decoded, then
+oblivion:
 
 ```
-r5 = *(TOC-0x7A1C) = 0x175510      ; a 40-byte public key
-bl  0x10D24 (sig, hash, key, 2)    ; ECDSA verify, curve 2
-beq cr7, 0xF14F4                   ; VERIFY OK -> close EDAT, open EBOOT.PBP
+[dbg] R3000 enter #1 pc=BFC00000 budget=00000000
+[dbg] R3000 bctr  #1 ctr=001070E4 pc=BFC00004 insn=401A7800 budget=FFFFFFF7
 ```
 
-The branch is not taken, so `0xF1590` — the one instruction in the image that points the
-open-path field at the `EBOOT.PBP` buffer — is never reached, and the reader returns `-1`
-into `ExitPS1(3)`. **The disc body is never opened because the header signature does not
-verify.** Detail: [`docs/disc-body.md`](docs/disc-body.md).
+`0x401A7800` is `mfc0 $k0,$15` -- the PS1 BIOS's first instruction, fetched byte-reversed
+from the right offset. The fetch, the i-cache cycle penalty and the PC advance were all
+correct. Only the dispatch went nowhere.
 
-Ruled out: it is not a stubbed dependency (the verify calls only real code in the image, no
-import trampolines), not the hash input, and not our carry arithmetic on review (`adde`,
-`subfe`, `addc`, `subfc`, `addze` all lift correctly).
+**A correction worth recording.** The previous note here said the blocker was a cycle budget
+of 0 at `+0x120`. That was a symptom read as a cause: a budget of 0 is *normal*. The
+interpreter immediately calls its event scheduler (`func_00105FA8`), which fires the due
+events and returns `next_due - now` as the new budget. Poking the budget to a nonzero value
+changed nothing, which was the clue that the budget was never the problem.
 
-**The signature is valid — so the bug is ours.** The curve is built at runtime, not stored in
-the ELF, so it was read out of the guest's own memory (`func_000109C4` copies six 20-byte
-fields into a 144-byte context; replaying those writes in order, before the struct is reused
-as scratch, gives them exactly). It is a 160-bit curve with `a = p-3`, the table in the
-classic `p, a, b, N, Gx, Gy` order; both the generator and the public key lie on it and
-`n*G` is the point at infinity. Verified offline against that curve, the header's signature
-**passes** — `X.x mod n == r` exactly. So `ISO.BIN.EDAT` is authentic and Sony-signed, and
-`func_00010D24` returns the wrong answer on correct data. That is a ps3recomp lifter bug, and
-it is worth fixing properly: any title that checks a signature will hit it.
+Both fixes are in `ppu_lifter.py`; see
+[Toolchain changes](#-toolchain-changes-upstreamed-to-ps3recomp). Together they took the
+image from 67 dispatchers / 654 case targets to **68 / 718**.
 
-That also settles what the crack does, and it is the ordinary thing. An EDAT is only a
-container, so re-wrapping the same plaintext under a free klicensee (license type 3 instead of
-the retail type 2, which is bound to a per-console RAP) leaves Sony's signature intact. It has
-to — cracked PSOne Classics ran on real consoles, and `ps1_netemu` runs this check
-unconditionally.
+### Also open
 
-Checked against a second title: `2Xtreme [NPUI-94508]` has the identical package layout,
-with an `ISO.BIN.EDAT` of **exactly** the same 1,049,920 bytes — that size is what this form
-always is, not a truncation.
+A bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR` (non-fatal --- the
+emulator prints `failed` and continues); `cellAdecQueryAttr` (`0x7E4A4A49`) still returns
+`CELL_OK` with its attr struct untouched; `user_memory_size= 0/0` prints from a site that
+disassembles to `li r11,352; sc` though syscall 352 never appears in a trace; `_gcm_intr_thread`
+receives on queue id 0; and the `0x300`/`0x301`/`0x302` attribute packets (tiles, Z-cull) are
+accepted but ignored.
 
-Also open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
-(non-fatal — the emulator prints `failed` and continues); `cellAdecQueryAttr`
-(`0x7E4A4A49`) still returns `CELL_OK` with its attr struct untouched;
-`sys_interrupt_thread_establish` (84) and `eoi` (88) are stubs; and the
-`0x300`/`0x301`/`0x302` attribute packets (tiles, Z-cull) are accepted but ignored.
+Historical detail on the disc chain --- the two-file design, the byte-exact SHA-1 proof, the
+recovered curve and the ECDSA lifter bug that used to sit here --- is in
+[`docs/disc-body.md`](docs/disc-body.md).
 
 ## 🔧 Toolchain changes upstreamed to ps3recomp
+
+- **`tools/ppu_lifter.py` --- jump-table detection missed the biggest dispatcher in the
+  image.** Two independent bugs, both found on `ps1_netemu`'s R3000 opcode table:
+  - The **table-base search was window-limited.** `discover_jump_tables` looked for the
+    `lwz rBase, disp(r2)` inside a fixed 30-instruction window before the `bctr`. Here the
+    base load sits **36** instructions back, so the detector found the `mtctr` and the
+    `lwzx` and then gave up. The base walk now scans the enclosing function, bounded by the
+    nearest preceding `blr` --- the same guard the two-level-base path already used. Safe for
+    the cases that already worked, because the walk stops at the *nearest* definition, so a
+    base inside the old window still wins.
+  - **A leading null slot truncated the table to nothing.** The decoder stopped at the first
+    entry that failed validation. A dense opcode table has null slots for the codes it never
+    dispatches, and this one's index 0 is exactly that, so a correct base still decoded
+    **0 targets**. Leading holes are now skipped (bounded at 4, so a genuinely wrong base
+    still fails fast); the first hole *after* real entries still ends the table.
+
+  A dropped dispatcher is silent and expensive: the case targets never get labels, and the
+  runtime `bctr` falls through to the generic indirect-call dispatcher, which resolves
+  function **entries** only. Every jump-table case is a mid-function address, so the call
+  does nothing at all. Across this image the fix went from 67 dispatchers / 654 case targets
+  to **68 / 718**.
+
+- **`tools/ppu_lifter.py` --- stores through a frame pointer were invisible.** A PPC64
+  red-zone leaf keeps locals below `r1` with no `stdu`, and writes them through a copied
+  pointer (`addi r5,r1,-128` -> `r31` -> `r30`, then `std r9,0x8(r30)`). `_write_counts`
+  only saw literal `r1 + off` stores, so the slot looked untouched, was treated as a
+  callee-save spill, and the matching `ld r25,-0x78(r1)` returned the *caller's* `r25`. In
+  `ps1_netemu`'s Montgomery multiply that put a pointer into the carry chain, so every ECDSA
+  signature the firmware checked came out wrong and no PSOne disc would mount. The lifter now
+  tracks registers holding `r1 + off` through the zero-extend and register-move idioms and
+  charges the store to the slot it lands on.
 
 - **`tools/pkg_extract.py` — mixed-key packages.** A PSOne Classic is `pkg_type=2` and
   uses *both* keys at once: entry structs and some payloads on the PSP key

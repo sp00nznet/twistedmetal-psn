@@ -764,7 +764,7 @@ whose only payload is a license-type-3 `ISO.BIN.EDAT`.
 | `USRDIR/CONTENT/DOCUMENT.DAT` | 5,105,104 | 1,859,880 |
 
 The two halves carry different things. `EBOOT.PBP`'s `DATA.PSAR` (at 0x18000) also begins
-`PSISOIMG0000`, but its payload from 0x400 is ` PGD` -- PSP **PGD**-encrypted, the POPS
+`PSISOIMG0000`, but its payload from 0x400 is `\0PGD` -- PSP **PGD**-encrypted, the POPS
 path. The decrypted `ISO.BIN.EDAT` has that same region in the clear: the serial
 `_SCUS_94304` at 0x400 and a valid CD TOC at 0x800 (points A0/A1/A2 -- first track 1, last
 track 9, i.e. a data track plus eight CD-DA tracks). So the EDAT is the PS3-side header and
@@ -782,7 +782,7 @@ the match branch. And the exit is via `0x111BC8`, not `0x110E50`: the reader ret
 
 **The two-file design, confirmed from the binary.** `func_000EFBA8` builds *both*
 `/USRDIR/ISO.BIN.EDAT` and `/USRDIR/CONTENT/EBOOT.PBP`. Diffing the decrypted EDAT against
-`DATA.PSAR` shows only 29% of the first megabyte matching, with the PSAR being ` PGD`
+`DATA.PSAR` shows only 29% of the first megabyte matching, with the PSAR being `\0PGD`
 ciphertext from 0x400 on while the EDAT holds the same region in the clear. So
 `ISO.BIN.EDAT` is Sony's *decrypted, signed* copy of the PSAR header; the PS3 never runs PGD
 and streams the body from the PBP. The subsystem names itself: `pspi/pspi.c`.
@@ -948,17 +948,138 @@ the same shape as the old `sys_semaphore_wait(id 0)` spin. The waiter is `func_0
 
 Detail: [`docs/ps1-core.md`](docs/ps1-core.md).
 
+## 2026-09-03 -- THE PS1 CORE RUNS: the opcode dispatch table was never lifted
+
+The R3000 executes, the PS1 GPU issues draw packets, and the emulator no longer exits.
+
+**The cause was not the cycle budget.** Yesterday's note called the blocker a cycle budget of
+0 at `+0x120`. That was a symptom read as a cause. A budget of 0 is *normal*: the interpreter
+immediately calls `func_00105FA8`, which fires the due events and returns `next_due - now` as
+the new budget. Poking the budget nonzero changed nothing --- which was the clue.
+
+**What it actually was.** Tracing the interpreter's two exits showed one guest instruction
+executed, then nothing:
+
+```
+[dbg] R3000 enter #1 pc=BFC00000 budget=00000000
+[dbg] R3000 bctr  #1 ctr=001070E4 pc=BFC00004 insn=401A7800 budget=FFFFFFF7
+```
+
+`0x401A7800` is `mfc0 $k0,$15`, the PS1 BIOS's first instruction, fetched byte-reversed from
+the right BIOS offset (`0xBFC00000 & 0x1FFFFFFF + 0xE0400000` wraps to 0). The fetch, the
+i-cache cycle penalty at `0x107A74` and the PC advance were all correct. Only the dispatch
+went nowhere: `0x1070E4` is inside `func_001066A8`'s range but was **not a label, not a
+function, and not in the function table**, so `ps3_indirect_call` silently found nothing,
+the interpreter returned, and the main loop at `0xB3E68` saw a status other than 5 and tore
+the emulator down.
+
+The dispatcher is a 128-entry jump table at `0x1B37D4` reached by
+`lwzx r5, r19, r11; mtctr r5; bctr` at `0x1067D4`. `discover_jump_tables` missed it twice
+over --- `JT_DEBUG=0x1067D4` named both:
+
+1. `r_base=None`. The base load `lwz r19,-0x79CC(r2)` is at `0x106744`, **36** instructions
+   before the `bctr`, outside the fixed 30-instruction window.
+2. With the base supplied, `entry[0] raw=0x0 -> valid=False` and the decoder broke on the
+   first invalid entry: **0 targets**. Index 0 is an opcode the table never dispatches.
+
+Both fixed in `ppu_lifter.py` (function-bounded base scan clamped at the preceding `blr`;
+leading null slots skipped, bounded at 4). 67 dispatchers / 654 case targets -> **68 / 718**,
+with 127 targets decoded for this table.
+
+**What that bought.** No more `ExitPS1` / `CoreBoot() failed` / `R3000Exit`. Instead:
+
+```
+title: 0xc0546d88U, "SCUS_943.04" P
+North American Title detected!
+boot from /dev_hdd0/game/NPUI94304[1] 0
+[RSX null] set_render_target(format=0x9090148, 720x512)
+[RSX] DRAW_ARRAYS prim=8 first=0 count=4
+[fps] 205.2
+```
+
+720x512 is the PS1 framebuffer. GPU packets went 0 -> 6, `clears[guest]` 0 -> 6, and both
+vertex and pixel shaders compiled.
+
+**How far the R3000 gets.**
+
+```
+[dbg] R3000 disp 1     pc=BFC00004
+[dbg] R3000 disp 3     pc=BFC00010
+[dbg] R3000 disp 10    pc=BFC02038
+[dbg] R3000 disp 100   pc=BFC02094
+[dbg] R3000 disp 1000  pc=BFC022A4
+[dbg] R3000 disp 10000 pc=BFC4B844
+```
+
+The reset sequence matches the BIOS byte for byte --- `mfc0 $k0,$15`, `nop`,
+`sltiu $1,$k0,0x59`, `bne $1,$0,0xBFC00024` --- and only three of those five dispatch,
+because `nop` is short-circuited before the `bctr` (`cmpwi cr7,r29,0; beq cr7,0x107978` at
+`0x1067B8`). By 10,000 instructions it is at `0xBFC4B844`, deep in BIOS init.
+
+By 40,000 it is at `0xBFC58820` and stops there, inside a BIOS **word-copy loop** --- an
+ordinary `memcpy`, not a poll:
+
+```
+BFC5881C  lw    $t8, 0($a0)
+BFC58820  addiu $a0, $a0, 4
+BFC58824  sltu  $at, $a0, $v0
+BFC58828  addiu $a1, $a1, 4
+BFC5882C  bne   $at, $zero, 0xBFC5881C
+BFC58830  sw    $t8, -4($a1)      ; delay slot
+```
+
+Note the rate: ~40,000 instructions over ~100 s of wall clock, against a 33 MHz PS1. The
+interpreter neither returns nor takes the switch's `default` arm, so it is blocked *inside*.
+Whether the slowness causes the stop or shares a cause with it is not yet established.
+
+**The other half: SPU 4 is deadlocked on a reservation nobody breaks.** The audio core parks
+at `pc=0x0A5E8`. Disassembling it names the event outright:
+
+```
+0A5E8  il    $r15, 1024              ; 0x400 = MFC_LLR_LOST_EVENT
+0A5EC  rdch  $r14, SPU_RdEventStat
+0A5F0  and   $r13, $r14, $r15
+0A5F4  brz   $r13, 0x893C            ; not lost yet -> go round again
+```
+
+The runtime's producer for that bit already exists (`spu_resv_lost_poll`), and every gate it
+checks passes:
+
+```
+[ch-wait] spu=4 pc=0x0A5E8 ch=0 waited=26000ms evstat=0x0 evmask=0x400 resv[valid=1 ea=0x002DEF80]
+```
+
+mask `0x400`, reservation valid, EA non-zero --- so the poll runs every time and finds the
+reserved 128-byte line **unchanged**. Nobody writes `0x2DEF80`.
+
+Ruled out: the audio event chain. `cellAudioPortOpen` -> `CreateNotifyEventQueue` (id 3, key
+`0x8000000000000001`) -> `SetNotifyEventQueue` -> `PortStart` all succeed, the mixing thread
+starts, and `_xSPUWaveOut` (tid 6) *cycles* on that queue rather than sleeping on it. So the
+PPU side of audio is alive; it simply never touches the line SPU 4 reserved.
+
+Also added: the `[ch-wait]` heartbeat now prints `evstat`/`evmask` and the reservation state,
+which is what turned this from "an SPU is stuck" into a named event and address in one run.
+
+Also repaired: two literal NUL bytes in this file where the PGD magic should have been the
+escaped text --- the same scripted-edit damage previously fixed in README.md.
+
+Detail: [`docs/ps1-core.md`](docs/ps1-core.md).
+
 ## Next steps
 
-1. **Decide whether the ECDSA failure is ours or the data's.** Either read the curve table
-   properly -- best by dumping the context the guest builds rather than guessing the layout,
-   since no field assignment tried puts both the generator and the public key on one curve --
-   and check the signature offline; or obtain the **retail** `ISO.BIN.EDAT` (license type 2,
-   the file Sony actually signed) by recovering the owner's own RAP/RIF for `NPUI94304`. The
-   copy in `vfs/` is the archive's license-type-3 rewrap, and a rewrap preserves the signature
-   only if the plaintext was left untouched.
-2. Then: the disc body out of `EBOOT.PBP`, R3000 execution and geometry.
+1. **Name the writer of `0x2DEF80`.** A store watch (`LBP_WW=0x2DEF80 LBP_WW_LEN=128`) on the
+   guest address SPU 4 reserved. If no PPU code ever writes it, the reservation EA we recorded
+   at GETLLAR is the thing to check next; if something does write it but later, the deadlock is
+   an ordering problem rather than a missing producer.
+2. **Account for the interpreter's wall clock.** ~40,000 R3000 instructions in ~100 s is
+   orders of magnitude short of a 33 MHz PS1. Measure the budget each slice actually gets
+   (`func_00105FA8`'s return value) and how long a slice takes; a millisecond-scale wait per
+   slice would explain it, and the two candidates are the 1 ms `ps3_intr_wait` poll and the
+   10 ms `spu_ch_wait` condition-variable timeout.
 3. Still open: a bare `/USRDIR/` config path resolves to the VFS root and fails `EISDIR`
    (non-fatal); `cellAdecQueryAttr` (`0x7E4A4A49`) returns `CELL_OK` with its attr struct
-   untouched; `sys_interrupt_thread_establish` (84) / `eoi` (88) are stubs; attribute
-   packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) accepted and ignored.
+   untouched; `user_memory_size= 0/0` prints from a site that disassembles to `li r11,352; sc`
+   though syscall 352 never appears in a trace; `_gcm_intr_thread` receives on queue id 0;
+   attribute packets `0x300`/`0x301`/`0x302` (tiles, Z-cull) accepted and ignored.
+4. `ps3recomp` has uncommitted changes (the two `ppu_lifter.py` fixes and the `[ch-wait]`
+   diagnostic among them) --- that side is still not committed.

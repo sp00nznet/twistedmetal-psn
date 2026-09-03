@@ -508,18 +508,170 @@ The last one is `func_0010EA58` at `0x10ED94`, which schedules two events back t
 handles at `+0x13C` and `+0x234`. The second schedules an event **due immediately**, which
 pins the budget at zero.
 
-### Next
+### Resolved: neither reading. The dispatch table was never lifted.
 
-Two readings, and they need separating before writing any code:
+Reading 1 was closer, but the mechanism was not the event dispatch --- and **the budget was
+never the problem at all**. A budget of 0 is *normal*: `func_001066A8` runs down its budget,
+falls through at `0x1068DC`, and calls `func_00105FA8`, which fires every due event and
+returns `next_due - now` as the new budget (`0x106078` writes `+0x124 = due`, `0x106094`
+returns the difference). If reason (`+0x138`) is still `-1` it branches back to `0x106834`
+and keeps running. Poking the budget to `0x1000` changed nothing, which was the clue.
 
-1. A delay of 0 is legitimate ("fire on the next poll") and the interpreter is supposed to
-   *service* the due event and carry on -- in which case something in the event dispatch is
-   not running, and the interpreter returns 0 rather than 5.
-2. The delay of 0 is itself wrong, because one of the two events at `0x10ED74`/`0x10ED94` is
-   being handed a bad parameter -- `func_0010EA58` is reached during init and its inputs have
-   not been checked.
+What actually happened is that the interpreter never got as far as the budget check. Its
+opcode dispatch is a jump table, and that table was never lifted.
 
-The cheapest discriminator is to watch `+0x124` (the cycle counter) and `+0x13C`/`+0x234` (the
-two event handles) across the single poll, and to read `func_0010EA58`'s callers to see what
-decides those two delays. `func_00105E68` is small and its semantics are now known, so either
-answer should fall out quickly.
+**The trace.** `func_001066A8` has exactly two exits in the lifted output: a `bctr` tail
+dispatch and a plain return. Logging both showed the `bctr` taken once and the return never
+reached:
+
+```
+[dbg] R3000 enter #1 pc=BFC00000 cost(+0x114)=00000001 budget(+0x120)=00000000
+[dbg] R3000 bctr  #1 ctr=001070E4 pc=BFC00004 insn=401A7800 budget=FFFFFFF7
+```
+
+Everything before the dispatch is correct:
+
+- **Fetch.** `0xBFC00000` is not in main RAM, so `0x1066D4`/`0x106740` divert to `0x108314`,
+  which computes `(pc & 0x1FFFFFFF) + 0xE0400000` --- for the reset vector that wraps to
+  **0**, the right BIOS offset --- and `lwbrx` reads `0x401A7800`, byte-reversed
+  `mfc0 $k0,$15`. That is the PS1 BIOS's first instruction.
+- **The block-cache miss at `0x107A74` is not an error path.** It is the i-cache cycle
+  penalty: it recomputes the per-instruction cost into `r7`, updates `+0x128`, stores the tag,
+  and falls back into the main flow at `0x106794` (`b 0x106794`). Hence `budget = 0 - 9`.
+- **PC advance.** `0x106794 add r26,r26,r27`. The in-memory PC at `+0x108` is only written
+  back on exit, which is why it still read `0xBFC00000` afterwards --- that had misled an
+  earlier reading.
+
+**The dispatch went nowhere.** `0x1070E4` lies inside `func_001066A8`'s range
+(`0x106748`--`0x108348`) but was **not a label, not a separate function, and not in the
+generated function table**, so `ps3_indirect_call` matched nothing and returned silently.
+`func_001066A8` then fell out, and the main loop --- `bl 0xB67A0; bl 0xB671C; bl 0xB66E0;
+cmpwi r3,5; beq` at `0xB3E58`--`0xB3E74` --- saw a status other than 5 and tore the emulator
+down. (The return value is `*(+0x110)`, the pending-exit code set by `func_00105DA4`; no
+caller of it passes 5, because 5 is produced on the *normal* path, not the exit path.)
+
+**The table.** `lwzx r5, r19, r11; mtctr r5; bctr` at `0x1067C8`--`0x1067D4`, with
+`r19 = *(TOC-0x79CC)` and the index `(insn >> 26)` folded with the function field and masked
+to `0x1FC` --- a 128-entry table, found in the image at **`0x1B37D4`**. `JT_DEBUG=0x1067D4`
+named both reasons ps3recomp dropped it:
+
+```
+rC=r5                                     <- mtctr found
+lwzx=r5, r19, r11                         <- table load found
+disp=None disp2=None r_base=None          <- base NOT found
+```
+
+1. The base load `lwz r19,-0x79CC(r2)` is at `0x106744`, **36** instructions before the
+   `bctr`, outside the detector's fixed 30-instruction window.
+2. With the base supplied it got `table_base=0x1B37D0 count=256` and then
+   `entry[0] raw=0x0 -> valid=False`, breaking on the first invalid entry for **0 targets**.
+   Index 0 is an opcode this table never dispatches; the 127 real handlers start at index 1.
+
+Both fixed in `ppu_lifter.py`: the base walk now scans the enclosing function bounded by the
+nearest preceding `blr` (the guard the two-level-base path already used), and leading null
+slots are skipped, bounded at 4. The dispatcher now decodes **127 targets**, and the image
+went from 67 dispatchers / 654 case targets to 68 / 718.
+
+One consequence worth noting: with the table known, the `bctr` lifts to
+`switch ((uint32_t)ctx->ctr) { case 0x001070E4u: goto loc_001070E4; ... }`, so the interpreter
+loops **inside** one C call instead of returning per instruction. `func_001066A8` is now
+entered once and stays there --- which is why the in-memory PC at `+0x108` still reads the
+reset vector while the core is running.
+
+### What that changed
+
+```
+title: 0xc0546d88U, "SCUS_943.04" P
+North American Title detected!
+boot from /dev_hdd0/game/NPUI94304[1] 0
+[RSX null] set_render_target(format=0x9090148, 720x512)
+[RSX] DRAW_ARRAYS prim=8 first=0 count=4
+[fps] 205.2
+```
+
+`ExitPS1`, `CoreBoot() failed` and `R3000Exit` are all gone. 720x512 is the PS1 framebuffer.
+GPU packets went 0 -> 6 and `clears[guest]` 0 -> 6, with both shaders compiled.
+
+### How far the R3000 gets
+
+```
+[dbg] R3000 disp 1     pc=BFC00004
+[dbg] R3000 disp 3     pc=BFC00010
+[dbg] R3000 disp 10    pc=BFC02038
+[dbg] R3000 disp 100   pc=BFC02094
+[dbg] R3000 disp 1000  pc=BFC022A4
+[dbg] R3000 disp 10000 pc=BFC4B844
+```
+
+The reset sequence matches `ps1_rom.bin` byte for byte:
+
+```
+BFC00000  mfc0  $k0, $15          <- dispatch 1
+BFC00004  nop                     <- short-circuited, no dispatch
+BFC00008  sltiu $1, $k0, 0x59     <- dispatch 2
+BFC0000C  bne   $1, $0, 0xBFC00024  <- dispatch 3
+BFC00010  nop                     <- short-circuited
+```
+
+Only three of the five dispatch, because `nop` is caught before the `bctr` --- `cmpwi cr7,
+r29, 0; beq cr7, 0x107978` at `0x1067B8`. That accounts exactly for the 1/2/3 PCs, and was
+briefly misread as "the core stops after three instructions" (the measurement came from a
+binary whose relink had failed on a file lock; the current build reaches `0xBFC4B844`).
+
+By 40,000 it is at `0xBFC58820` and stops, inside a BIOS **word-copy loop** --- an ordinary
+`memcpy`, not a poll:
+
+```
+BFC5881C  lw    $t8, 0($a0)
+BFC58820  addiu $a0, $a0, 4
+BFC58824  sltu  $at, $a0, $v0
+BFC58828  addiu $a1, $a1, 4
+BFC5882C  bne   $at, $zero, 0xBFC5881C
+BFC58830  sw    $t8, -4($a1)      ; delay slot
+```
+
+The interpreter neither returns nor takes the switch's `default` arm, so it is blocked
+*inside*. And the rate matters: ~40,000 instructions over ~100 s of wall clock, against a
+33 MHz PS1. That is far too slow to be the copy itself, and points at the interpreter getting
+very small budget slices with a millisecond-scale wait per slice.
+
+### Next: SPU 4's unbroken reservation
+
+The audio core (image 2) parks at `pc=0x0A5E8`, and the SPU code names the event outright:
+
+```
+0A5E8  il    $r15, 1024              ; 0x400 = MFC_LLR_LOST_EVENT
+0A5EC  rdch  $r14, SPU_RdEventStat
+0A5F0  and   $r13, $r14, $r15
+0A5F4  brz   $r13, 0x893C            ; not lost yet -> go round again
+```
+
+This is the GETLLAR / "wait until another processor touches this line" idiom, and the runtime
+already has the only producer for that bit (`spu_resv_lost_poll` in `spu_channels.c`). Every
+gate it checks passes:
+
+```
+[ch-wait] spu=4 pc=0x0A5E8 ch=0 waited=26000ms evstat=0x0 evmask=0x400 resv[valid=1 ea=0x002DEF80]
+```
+
+mask `0x400`, reservation valid, EA non-zero. So the poll runs on every blocked read and
+finds the reserved 128-byte line **unchanged**: nobody writes `0x2DEF80`.
+
+Ruled out --- the audio event chain is alive. `cellAudioPortOpen` ->
+`CreateNotifyEventQueue` (id 3, key `0x8000000000000001`) -> `SetNotifyEventQueue` ->
+`PortStart` all succeed, the mixing thread starts, and `_xSPUWaveOut` (tid 6) *cycles* on
+that queue rather than sleeping on it. The PPU side of audio runs; it just never touches the
+line SPU 4 reserved.
+
+Two measurements next:
+
+1. A store watch on that address (`LBP_WW=0x2DEF80 LBP_WW_LEN=128`) to name the writer the
+   guest expects. If nothing ever writes it, then the EA recorded at GETLLAR is itself the
+   suspect --- an SPU reserving a *local-store* address, or a DMA EA we mis-decoded, would
+   both present exactly like this.
+2. The interpreter's slice size and wall cost, to explain the 40k-instructions-per-100s rate.
+   The two millisecond-scale waits in reach are `ps3_intr_wait`'s 1 ms poll and
+   `spu_ch_wait`'s 10 ms condition-variable timeout.
+
+The `[ch-wait]` heartbeat now prints `evstat`/`evmask` and the reservation state, which is
+what turned "an SPU is stuck" into a named event and a named address in a single run.
