@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — GPU SPUs are fed exactly once, then starve |
+| R3000 runs continuously | ⬜ **blocker (root)** — stalls in BIOS; everything else is downstream |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -270,37 +270,45 @@ state**:
 0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
 ```
 
-So the four image-1 SPUs --- the GPU cores --- sit at their entry and in that loop. Tracing the
-handshake both ways settles what is and is not broken.
+So the four image-1 SPUs --- the GPU cores --- sit at their entry and in that loop. Following
+the feed path to its origin closes the loop, and reorganises the problem.
 
-**The mailbox handshake works.** Running the mailbox-depth probe and the raw-SPU MMIO trace on
-one stream shows every message consumed within a few lines of being written:
-
-```
-7824 [spu-outmbox] spu=1 wrote 0x00015010 depth=1
-7827 [spu-raw]     R spu1 OUT_MBOX -> 0x00015010     <- consumed
-```
-
-All five SPUs publish, all five are read --- one `OUT_MBOX` read each. (An earlier draft of
-this section claimed only SPU 0's was read; that came from treating a snapshot taken *at* the
-write as a steady state, and it was wrong.)
-
-**What is broken is the feed.** Watching the raw-SPU LS windows --- SPU 0 at `0xE0015010`, SPU 1
-at `0xE0115010` --- gives the same result on both:
+The command-packet sender `func_0010F658` is called **exactly once**, and the probe names the
+caller: `lr=0x00108588`, the init path. The other two call sites both live in
+`func_0010C48C`, which never runs --- no direct callers, no switch arm, its address only in an
+OPD at `0x001B6158` reachable from one TOC slot. And the code that loads that slot says what it
+is:
 
 ```
-[ww] 0xE0015010 <- 0x100 (w4) guest-fn=0x0010F658    ... and nothing further
-[ww] 0xE0115010 <- 0x100 (w4) guest-fn=0x0010F658    ... and nothing further
+00108518  lwz  r6, -0x79BC(r2)     ; r6 = OPD of func_0010C48C
+0010852C  ori  r3, r3, 0x1810      ; r3 = 0x1F801810 -- PS1 GP0, the GPU command port
+0010853C  bl   0xC23E0             ; register the handler
 ```
 
-**Every GPU SPU is fed exactly once with `0x100`, and never again**, so all four spin on
-buffers that never change --- the 47.7% and 26.2% profiler hot spots --- and no PS1 GPU packets
-are produced, which is why the count has been pinned at 6 throughout.
+**`func_0010C48C` is the PS1 GPU register-write handler.** It never runs because the R3000
+never writes GP0 --- because the R3000 is stuck in the BIOS. So the chain runs the opposite way
+from how the last stretch of this investigation read it:
 
-**The open question, with the neighbours eliminated:** `func_0010F640` broadcasts one value to
-four pointers from a table at `*(TOC-0x7948)` --- the "kick all four GPU SPUs" path --- and it
-runs once. What should drive it repeatedly? The mailbox side is ruled out, and the SPUs have
-their buffers and poll them correctly. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+```
+R3000 stalls in the BIOS
+  -> never reaches game code, never writes GP0
+     -> the GP0 handler never fires
+        -> no command packets after the single init one
+           -> the four GPU SPUs spin on buffers that never change
+              -> no PS1 GPU packets, so the count stays at 6
+```
+
+Everything after "the R3000 stalls" --- the fence wait, the mailbox handshake, the LS feed, the
+SPU spin --- is **downstream** of that one stall. That work produced two real fixes
+(`rchcnt SPU_RdEventStat`, the RSX handler queue), but none of it could have started the game.
+
+**The root question is the original one, unchanged:** why does the R3000 stop after ~42,000
+instructions of BIOS? Known: the interpreter is entered once and never returns, stops
+dispatching, all eleven of its `bl` targets return cleanly (1553/1553), its opcode table is
+fully lifted, and the main thread afterwards sits in a fence wait that does complete. Unknown:
+what it does between the last dispatch and that wait. `PS3_SAMPLE` with the merged map can
+answer that if pointed at the **first second** rather than the steady state --- every probe so
+far has been too late to catch it. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

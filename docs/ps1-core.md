@@ -1570,3 +1570,63 @@ costume: a snapshot taken *at* an event says nothing about the state *after* it.
 conclusions here came from reading one-shot instrumentation as if it were a steady-state
 measurement, and both were caught only by putting two probes on one stream and reading the
 ordering. That is the cheap check, and it should come first.
+
+### Structural correction: the SPU spin is downstream of the R3000, not a separate bug
+
+Following the feed path to its origin closes the loop, and it reorganises the whole problem.
+
+`func_0010F658` --- the command-packet sender --- is called **exactly once**, and the probe
+names the caller:
+
+```
+[dbg] sendpkt #1 src=0x0FEFFA40 words=1 lr=0x00108588
+```
+
+`lr=0x108588` is the call at `0x108584`, in `func_001083AC` --- the init path. The other two
+call sites (`0x10C5F0`, `0x10CA4C`) both live in `func_0010C48C`, which **never runs**. It has
+no direct callers and no switch arm; its address lives in an OPD at `0x001B6158`
+(`{code=0x0010C48C, toc=0x001C3D30}`), referenced from exactly one TOC slot, `TOC-0x79BC`.
+
+Two sites load that slot. The one that matters is `0x108518`, inside the init that did run:
+
+```
+00108514  li   r7, 2
+00108518  lwz  r6, -0x79BC(r2)     ; r6 = OPD of func_0010C48C
+00108524  lis  r3, 0x1F80
+0010852C  ori  r3, r3, 0x1810      ; r3 = 0x1F801810  -- PS1 GP0, the GPU command port
+00108534  li   r4, 16
+0010853C  bl   0xC23E0             ; register the handler
+```
+
+**`func_0010C48C` is the PS1 GPU register-write handler.** It is registered against
+`0x1F801810` --- GP0, the PS1's GPU command port --- and it is what turns a guest GPU write into
+command packets for the SPU cores. It never runs because **the R3000 never writes to GP0**,
+because the R3000 is stuck in the BIOS after ~42,000 instructions.
+
+So the chain runs the other way from how I have been reading it:
+
+```
+R3000 stalls in the BIOS
+   -> never reaches game code, never writes GP0
+      -> func_0010C48C (the GP0 handler) never fires
+         -> no command packets after the single init one
+            -> the four GPU SPUs spin on buffers that never change
+               -> no PS1 GPU packets -> the packet count stays at 6
+```
+
+Everything I investigated after "the R3000 stalls" --- the fence wait, the mailbox handshake,
+the LS feed, the SPU spin --- is **downstream** of that one stall. The SPU work produced two
+genuine fixes (`rchcnt SPU_RdEventStat`, the RSX handler queue) and they were worth having, but
+none of them could have started the game, because none of them was the cause.
+
+**The root question is the one from the beginning, unchanged**: why does the R3000 stop after
+~42,000 instructions of BIOS? What is known about it: the interpreter is entered exactly once
+and never returns; it stops dispatching; all eleven of its `bl` targets return cleanly
+(1553/1553); its opcode table is fully lifted; and the main thread afterwards sits in a
+`cellGcmFinish` fence wait that *does* complete. What is not known is what it does between the
+last dispatch and that wait.
+
+The tool for that now exists and did not before: `PS3_SAMPLE` with the merged PPU+SPU map. A
+profile taken **during the first second**, rather than in the steady state, would show whether
+the interpreter is still executing when it stops dispatching --- which is the one thing every
+probe so far has been too late to catch.
