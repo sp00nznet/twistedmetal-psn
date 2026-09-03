@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — GPU SPUs spin on local-store state nothing writes |
+| R3000 runs continuously | ⬜ **blocker** — GPU SPUs are fed once, then starve |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -270,11 +270,34 @@ state**:
 0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
 ```
 
-So the four image-1 SPUs --- the GPU cores --- sit at their entry and in this loop, polling
-memory nothing updates. On hardware the PPU writes that through the raw-SPU LS window
-(`0xE0000000 + n*0x100000`). **What should write LS `0x15010` on these SPUs, and why it never
-does, is the next question** --- and the first concrete one this project has had.
-Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+So the four image-1 SPUs --- the GPU cores --- sit at their entry and in that loop. Reading the
+protocol out of image 1 shows what they are waiting for:
+
+```
+011B8  ila  $r10, 0x15010          ; the SPU's own LS buffer address
+011D4  wrch SPU_WrOutMbox, $r10    ; publish it: "PPU, write my work here"
+0126C  lqr  $r8, 0x15010           ; then poll it (the 47.7% hot spot)
+```
+
+The image references `0x15010` exactly twice --- the `ila` that publishes it and the `lqr` that
+polls it --- so **the SPU never writes it** and the value can only come from outside. A store
+watch on the raw-SPU LS window (`0xE0000000 + 0x15010`) shows the PPU writing it **exactly
+once**:
+
+```
+[ww] 0xE0015010 <- 0x100 (w4) guest-fn=0x0010F658    ... and nothing further
+```
+
+So the remaining bug has a shape: **the GPU SPUs are fed once and then starve.** They are not
+blocked on a channel and not missing an interrupt --- they have a buffer, the PPU filled it
+once, and nothing refills it, while the PPU itself sits idle (3 samples out of 4,964).
+`func_0010F640`, immediately before the writer, stores the same register to four separate
+pointers --- exactly the shape of "write this to all four image-1 SPUs" --- which is where to
+start reading.
+
+**The next question is narrow**: what should drive the `0x10F658` path repeatedly, and why does
+it run once? With the PPU idle rather than blocked, a producer that is never scheduled is more
+likely than one that is stuck. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

@@ -1419,3 +1419,55 @@ on these SPUs, and why it never happens. Note it is *not* the same wait as the a
 Worth stating plainly: this answer only exists because the tool was fixed after it produced a
 confident wrong one. The measured/inferred distinction earlier in this file applies to
 instruments too --- a profiler is not trustworthy because it is a profiler.
+
+### The SPU/PPU handshake, and where it stops
+
+With the profiler trustworthy, the protocol reads cleanly out of image 1.
+
+**The SPU publishes its own buffer address and then polls it.** At `0x11A0`-`0x11D4`:
+
+```
+011A0  rchcnt $r4, MFC_WrTagUpdate     <- earlier logs show spu=0 parked exactly here
+011A4  brz    $r4, 0x11A0
+011B4  rdch   $r3, MFC_RdTagStat       ; wait out the DMA
+011B8  ila    $r10, 0x15010            ; r10 = its LS buffer address
+011D4  wrch   SPU_WrOutMbox, $r10      ; tell the PPU "write my work here"
+```
+
+and then spins on that address, which is the 47.7% hot spot:
+
+```
+0126C  lqr    $r8, 0x15010
+01274  ceq    $r19, $r84, $r8
+0129C  brz    $r35, 0x1268             ; loop while r85 <= 0
+```
+
+The SPU image references `0x15010` exactly twice --- the `ila` that publishes it and the `lqr`
+that polls it. **It never writes it itself**, so the value can only come from outside.
+
+**And the PPU writes it exactly once.** A store watch on the raw-SPU LS window
+(`0xE0000000 + 0x15010` for SPU 0):
+
+```
+[ww] 0xE0015010 <- 0x100 (w4) guest-fn=0x0010F658     ... and nothing further
+```
+
+One 4-byte write, value `0x100`, and then silence for the rest of the run. Meanwhile the
+profiler says the PPU is idle (3 samples out of 4,964) and the four image-1 SPUs burn
+essentially all guest CPU spinning on that address.
+
+So the shape of the remaining bug is: **the GPU SPUs are fed once and then starve.** They are
+not blocked on a channel and not waiting on a missing interrupt --- they have a buffer, the PPU
+filled it once, and nothing refills it. Worth noting `func_0010F640`, immediately before the
+writer, stores the same register to four separate pointers --- exactly the shape of "write this
+to all four image-1 SPUs" --- which is a good place to start reading.
+
+**The next question is narrow and concrete**: what should call the `0x10F658` path repeatedly,
+and why does it run once? Given the PPU is idle rather than blocked, the likely answer is a
+producer that is never scheduled rather than one that is stuck --- and that is checkable by
+watching the same LS address with the PPU-side caller logged, which the store watch already
+does.
+
+This is the first point in the whole investigation where the two sides of a handshake are both
+identified, with the exact address they communicate through and a count of how many times it
+actually happens.
