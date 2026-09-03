@@ -171,7 +171,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, `sem 1` posted 24x |
-| R3000 runs continuously | ⬜ **blocker** — located: only SPU 0’s startup message is ever read |
+| R3000 runs continuously | ⬜ **blocker** — GPU SPUs are fed exactly once, then starve |
 | Intro video → menu → attract mode | ⬜ |
 | Twisted Metal renders | ⬜ |
 
@@ -270,38 +270,37 @@ state**:
 0129C  brz   $r35, 0x1268        ; loop while r85 <= 0
 ```
 
-So the four image-1 SPUs --- the GPU cores --- sit at their entry and in that loop. Two more
-measurements locate the cause exactly, and they agree.
+So the four image-1 SPUs --- the GPU cores --- sit at their entry and in that loop. Tracing the
+handshake both ways settles what is and is not broken.
 
-**The guest never enables the plain-mailbox interrupt.** It passes class-2 mask `0x3`
-(interrupt-mailbox | stop) for spu0 and spu4 only --- **not** `0x10`, the plain-mailbox bit.
-The SPUs signal with a plain `wrch SPU_WrOutMbox` (LS `0x11D4`), so that raises no interrupt
-*by design*: the PPU is meant to **poll**. And spu1/2/3 get no interrupt tag at all, so polling
-is the only mechanism they have.
-
-**And the PPU polls exactly one of them:**
+**The mailbox handshake works.** Running the mailbox-depth probe and the raw-SPU MMIO trace on
+one stream shows every message consumed within a few lines of being written:
 
 ```
-[spu-outmbox] spu=0 wrote 0x00015010 depth=0   <- consumed
-[spu-outmbox] spu=1 wrote 0x00015010 depth=1   <- never read
-[spu-outmbox] spu=2 wrote 0x00015010 depth=1   <- never read
-[spu-outmbox] spu=3 wrote 0x00015010 depth=1   <- never read
-[spu-outmbox] spu=4 wrote 0x0000E500 depth=1   <- never read
+7824 [spu-outmbox] spu=1 wrote 0x00015010 depth=1
+7827 [spu-raw]     R spu1 OUT_MBOX -> 0x00015010     <- consumed
 ```
 
-All five publish; only SPU 0's is consumed. That matches the store watch exactly --- one write
-into a raw-SPU local store, SPU 0's, and none to the others.
+All five SPUs publish, all five are read --- one `OUT_MBOX` read each. (An earlier draft of
+this section claimed only SPU 0's was read; that came from treating a snapshot taken *at* the
+write as a steady state, and it was wrong.)
 
-**The complete chain, every link measured:** each GPU SPU publishes its LS work buffer and
-polls it -> the class-2 mask excludes the plain-mailbox bit, so polling is the contract ->
-our PPU reads SPU 0's message and never SPU 1-4's -> SPU 0 gets one buffer write, SPUs 1-3 get
-nothing -> all four spin -> no PS1 GPU packets, which is why the count has been pinned at 6.
+**What is broken is the feed.** Watching the raw-SPU LS windows --- SPU 0 at `0xE0015010`, SPU 1
+at `0xE0115010` --- gives the same result on both:
 
-**The fix belongs in the PPU-side polling, not the SPU emulation.** First things to check:
-whether the guest's poll loop walks all five raw SPUs or stops after the first, and whether our
-`SPU_Out_Mbox` MMIO read (window `+0x4004`) is reachable for SPUs 1-4 --- the runtime only ever
-created interrupt tags for spu0 and spu4, so anything keyed off a tag skips 1-3 by
-construction. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
+```
+[ww] 0xE0015010 <- 0x100 (w4) guest-fn=0x0010F658    ... and nothing further
+[ww] 0xE0115010 <- 0x100 (w4) guest-fn=0x0010F658    ... and nothing further
+```
+
+**Every GPU SPU is fed exactly once with `0x100`, and never again**, so all four spin on
+buffers that never change --- the 47.7% and 26.2% profiler hot spots --- and no PS1 GPU packets
+are produced, which is why the count has been pinned at 6 throughout.
+
+**The open question, with the neighbours eliminated:** `func_0010F640` broadcasts one value to
+four pointers from a table at `*(TOC-0x7948)` --- the "kick all four GPU SPUs" path --- and it
+runs once. What should drive it repeatedly? The mailbox side is ruled out, and the SPUs have
+their buffers and poll them correctly. Detail in [`docs/ps1-core.md`](docs/ps1-core.md).
 
 Everything inside the interpreter was cleared on the way there: it is entered once and loops
 internally; the event scheduler runs ~2,100 rounds with its cycle total climbing normally; and

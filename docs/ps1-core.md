@@ -1521,3 +1521,52 @@ the guest's poll loop walks all five raw SPUs or stops after the first, and whet
 MMIO read of `SPU_Out_Mbox` (window `+0x4004`) is reachable for SPUs 1-4 at all --- note the
 runtime only ever created interrupt tags for spu0 and spu4, so anything keyed off a tag will
 skip 1-3 by construction.
+
+### Correction: the mailbox handshake works. The feed is what happens once.
+
+The previous entry claimed only SPU 0's startup message is ever read. **That was wrong**, and
+the way it was wrong is worth recording: I read a per-write snapshot as a steady state.
+
+Running the mailbox-depth probe and the raw-SPU MMIO trace together, on one stream, shows every
+message consumed within a few lines of being written:
+
+```
+7809 [spu-raw]     R spu0 OUT_MBOX -> 0x00015010
+7811 [spu-outmbox] spu=0 wrote 0x00015010 depth=0
+7824 [spu-outmbox] spu=1 wrote 0x00015010 depth=1
+7827 [spu-raw]     R spu1 OUT_MBOX -> 0x00015010     <- consumed
+7840 [spu-outmbox] spu=2 wrote 0x00015010 depth=1
+7843 [spu-raw]     R spu2 OUT_MBOX -> 0x00015010     <- consumed
+7856 [spu-outmbox] spu=3 wrote 0x00015010 depth=1
+7859 [spu-raw]     R spu3 OUT_MBOX -> 0x00015010     <- consumed
+7888 [spu-outmbox] spu=4 wrote 0x0000E500 depth=1
+7889 [spu-raw]     R spu4 OUT_MBOX -> 0x0000E500     <- consumed
+```
+
+`depth=1` was measured *at the instant of the write*, before the PPU's read three lines later.
+The depth never being 0 in that log meant nothing at all. **All five SPUs publish and all five
+are read**, and the counts confirm it: one `OUT_MBOX` read per SPU, five in total.
+
+The second error was narrower but the same kind: the store watch only ever covered **SPU 0's**
+local store (`0xE0015010`). SPUs 1-3 live in their own windows at `0xE0115010`, `0xE0215010`,
+`0xE0315010`, and I never looked. Watching SPU 1:
+
+```
+[ww] 0xE0115010 <- 0x100 (w4) guest-fn=0x0010F658    ... and nothing further
+```
+
+Same value, same writer, same count. So the shape **is** real and now verified on two SPUs
+rather than extrapolated from one: **every image-1 SPU is fed exactly once with `0x100`, and
+never again.** What is not true is that the mailbox handshake is broken --- it works.
+
+So the open question returns to where it was, but on firmer ground and with the neighbouring
+explanations eliminated: `func_0010F640` broadcasts one value to four pointers from a table at
+`*(TOC-0x7948)` --- the "kick all four GPU SPUs" path --- and it runs once. **What should drive
+that repeatedly, and why does it run only once?** The mailbox side is ruled out; the SPUs have
+their buffers and are polling them correctly.
+
+A note on method, since this is the third time in this file the same mistake appears in a new
+costume: a snapshot taken *at* an event says nothing about the state *after* it. Both wrong
+conclusions here came from reading one-shot instrumentation as if it were a steady-state
+measurement, and both were caught only by putting two probes on one stream and reading the
+ordering. That is the cheap check, and it should come first.
