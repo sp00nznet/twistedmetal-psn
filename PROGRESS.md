@@ -2414,3 +2414,155 @@ With the flip unblocked the title reaches its audio decoder and crashes:
 
 A null `ctr` means the guest called through a function pointer the stub never filled in. This is
 on the direct path to the intro videos: they have audio.
+
+## cellAdec: four ABI faults, and the PS1 core running for the first time
+
+With the user command wired up, ps1_netemu reaches its audio decoder --- and crashed there
+instantly. Four separate faults, none of them visible from inside this codebase. Each was found
+by reading the firmware's own code.
+
+### 1. The callback was called as a host function pointer
+
+`cbFunc` is a guest EA naming an OPD. It was stored in a host `CellAdecCbMsg` and called
+directly:
+
+```
+[CRASH] code=0xC0000005 rip=00000000001B5F00
+[CRASH] last HLE NID (cellAdecDecodeAu)
+```
+
+`0x1B5F00` is not a host address. It is the guest OPD --- and specifically the one whose code
+word is `func_000ED918`, the title's own callback. Dispatching through `g_ps3_guest_caller`
+fixes it; the host typedef is now a comment so nobody can call one again.
+
+### 2. The PcmItem was handed out as a host pointer
+
+`cellAdecGetPcmItem` did `*pcmItem = &s_adec[handle].lastPcm` --- a host address written into
+guest memory. The guest dereferenced it and died (`rip 0x870D0E`, fault `0xCFFDFFF0`).
+
+The layout is not a guess. The guest copies the whole item out with six 8-byte loads at
+`0x000ED964`:
+
+```
+000ED958  lwz  r9, 0x70(r1)        ; the EA we wrote
+000ED964  ld   r0,  0(r9)
+000ED968  ld   r10, 8(r9)
+000ED96C  ld   r8, 0x10(r9)
+000ED970  ld   r7, 0x18(r9)
+000ED988  ld   r0, 0x20(r9)
+000ED984  ld   r10, 0x28(r9)
+```
+
+So it is 0x30 bytes, and `auInfo` sits at +0x18 rather than +0x14 --- it contains a `u64`, so
+it is 8-aligned. That copy settles the padding question that reading RPCS3's struct alone
+cannot.
+
+**And that memory must not come from the guest's heap.** Taking 8 KB through `_sys_malloc` in
+`cellAdecOpen` stalled the title before it even reached `cellAdecStartSeq`: ps1_netemu allocates
+from the same bump allocator. It is a fixed reservation in the HLE inject window at `+0x40000`
+instead, clear of the label/control/offset-table pages and sys_rsx's three.
+
+### 3. The message types were swapped
+
+`ERROR` is 2 and `SEQDONE` is 3, not the other way round --- so `cellAdecEndSeq`'s `SEQDONE`
+arrived at the guest as `ERROR`. Confirmed twice: RPCS3 `Modules/cellAdec.h:304`, and the guest
+callback itself, which branches only on `msgType == 1` (`PCMOUT`):
+
+```
+000ED918  cmpwi cr7, r4, 1
+000ED928  addi  r4, r1, 0x70
+000ED92C  beq   cr7, 0xed944     ; -> cellAdecGetPcmItem
+000ED934  li    r3, 0            ; everything else: ignore
+```
+
+### 4. Every error code was invented --- and one was load-bearing
+
+Ours were `0x80610201..207`. The real list is `FATAL/SEQ/ARG/BUSY/EMPTY = 0x80610001..5`.
+
+The guest says so outright. Its audio thread drains the decoder after a format change:
+
+```
+000EE1FC  lwz   r0, 0x6764(r9)   ; current format
+000EE208  cmpw  cr7, r30, r0     ; same as the new AU's? then skip
+000EE220  bl    0x15f14c         ; cellAdecEndSeq
+000EE230  bl    0x15f0ec         ; cellAdecGetPcm(handle, 0)
+000EE238  cmpw  cr7, r3, r31     ; r31 = 0x80610005
+```
+
+`0x80610005` is the **only** cellAdec code this image ever compares against --- 8 sites, all the
+same value. Returning `0x80610204` for `EMPTY` meant that loop never saw its terminator, so the
+title re-ran the entire format-change path.
+
+There is no `AU` or `PCM` code in the real list; both now alias a real one rather than staying
+values no title can match.
+
+### What it moved
+
+Measured over a 100-second run:
+
+| | before | after |
+|---|---|---|
+| `cellAdecEndSeq` calls | 4,760 | **2** (against 1 `StartSeq`, as intended) |
+| crash | yes | **no** |
+| RSX FIFO packets | 5,628 | **12,264** |
+| live-draw groups executed | 0 | **12,264** |
+
+The draw engine executing anything at all is new --- it had been fed nothing at all before.
+
+`libs/codec/tests/test_adec_abi.c` pins the error codes and message types against the
+firmware's own compared value, because neither can be checked by reading our own source. That
+is exactly why both survived this long.
+
+### The PS1 core now runs continuously
+
+`PS1_PC=1` puts the R3000 state block (`0x76C080`) on the `[fps]` heartbeat:
+
+```
+[ps1] pc[...] exited=0 total=38813184
+[ps1] pc[...] exited=0 total=1036797696
+```
+
+`+0x124` is instructions retired. It climbs past **a billion in 100 seconds** --- roughly
+17 MIPS, continuously. Before the user-command fix it managed 42,000 and stopped.
+
+**A trap worth recording, because it was nearly the next wrong conclusion.** `+0x108` reads
+`0xBFC00000` --- the reset vector --- at every single sample. Hard-sampled, it is
+`changes=0/20000`, and across 14 samples that is 280,000 reads without one different value,
+while the instruction count climbs past a billion. That looks exactly like a **reset loop**: the
+BIOS restarting forever.
+
+It is not. The interpreter loads PC from `+0x108` on entry (`lwz r26, 0x108(r23)` at
+`0x001066CC`) and writes it back only in its epilogue (`stw r26, 0x108(r23)` at `0x00106964`)
+--- and it has not returned, because it is entered once and loops internally. `+0x108` is stale
+from boot. The epilogue also does `ori r26, r26, 0x80` immediately before that store, so a
+genuine exit there could not write `0xBFC00000` at all --- which is what ruled the reset-loop
+reading out, rather than any amount of extra sampling.
+
+Same shape as the two counting mistakes in the previous commits: **a field that is only written
+at one boundary is not live state, and a constant is not evidence of being stuck.** The
+distinct-value sampler is kept in the probe for exactly this reason --- one read cannot tell
+"constant because dead" from "constant because stuck", and those need opposite fixes.
+
+### Next: the PS1 GPU SPUs are waiting for a mailbox that never arrives
+
+The RSX side is healthy --- 22,029 packets, 22,029 groups executed, **zero** drops of any kind,
+2,877 real texture binds. But the window is black and the PS1 GPU cores are parked:
+
+```
+[ch-block] spu=2 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
+[ch-block] spu=3 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
+[ch-block] spu=4 pc=0x0CC88 op=rdch ch=29 evstat=0x0 evmask=0x0
+```
+
+Channel 29 is `SPU_RdInMbox`. All of the GPU SPUs are blocked waiting for the PPU to send them
+an inbound mailbox message, and nothing does. Of the 22,029 RSX groups, 15,961 are clears ---
+consistent with the PS3 side compositing an empty PS1 framebuffer every frame.
+
+So the next question is the mirror of the last one: **what is supposed to write those SPUs'
+inbound mailboxes?** `func_0010F658` is the SPU command-packet sender and `func_0010C48C` is the
+PS1 GP0 handler (OPD `0x1B6158`, registered at `0x108518`). The chain to establish is whether
+the R3000 reaches GP0 at all, and if it does, why the packet never leaves the PPU.
+
+Note also that boot is racy: of five identical 100-second runs, one reached nothing at all while
+the others reached `DecodeAu`. Worth pinning down before any timing-sensitive conclusion is
+drawn from a single run.

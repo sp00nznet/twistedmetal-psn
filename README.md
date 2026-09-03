@@ -171,8 +171,10 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, user-command handler reached |
-| R3000 runs continuously | ✅ Done — `GCM_SET_USER_COMMAND` (`0xEB00`) now raises `USER_CMD`; sem 1 posted 835x |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — `cellAdec` is a stub; crashes in `cellAdecDecodeAu` |
+| R3000 runs continuously | ✅ Done — **~1 billion instructions in 100 s (~17 MIPS)**, no stall, no crash |
+| Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |
+| RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — the PS1 GPU SPUs block on `SPU_RdInMbox`; nothing writes it |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
@@ -380,11 +382,33 @@ never returning was independent evidence. That is the second logging artifact in
 investigation, after the `grep -c "semaphore_post(sem=1"` that also matched `sem=10`. Counts
 from this log are trustworthy only with `SEMTID=1`.
 
-### The blocker now: `cellAdec` is a stub, and the title has started using it
+### `cellAdec` had four ABI faults — all fixed
 
-The title runs far enough to open the audio decoder and call `cellAdecDecodeAu`, which is an
-unimplemented stub. It crashes there on a null `ctr` (`lr=0x000EE734`). That is the next piece
-of work, and it sits directly on the path to the intro videos.
+Detailed in [`docs/ps1-core.md`](docs/ps1-core.md): the callback was invoked as a host function
+pointer, the `PcmItem` was handed out as a host pointer (and must not be allocated from the
+guest's heap), the message types were swapped, and every error code was invented. The last one
+was load-bearing — the guest drains its decoder until `cellAdecGetPcm` returns `0x80610005`,
+the only cellAdec code the image ever compares against, and we were returning `0x80610204`.
+`cellAdecEndSeq` went from 4,760 calls to 2.
+
+The PS1 core now executes **~1 billion instructions per 100 seconds (~17 MIPS) continuously**,
+and the RSX pipeline runs clean: 22,029 packets, 22,029 groups executed, zero drops.
+
+### The blocker now: the PS1 GPU SPUs wait on a mailbox nothing writes
+
+```
+[ch-block] spu=2 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
+[ch-block] spu=3 pc=0x011A0 op=rdch ch=29 evstat=0x0 evmask=0x0
+[ch-block] spu=4 pc=0x0CC88 op=rdch ch=29 evstat=0x0 evmask=0x0
+```
+
+Channel 29 is `SPU_RdInMbox`. Every GPU SPU is parked waiting for the PPU to send it an inbound
+mailbox message, and nothing does — so the PS1 framebuffer stays empty, 15,961 of those 22,029
+RSX groups are clears, and the window is black.
+
+The next question is the mirror of the semaphore one: **what is supposed to write those SPUs'
+inbound mailboxes?** `func_0010F658` is the SPU command-packet sender; `func_0010C48C` is the
+PS1 GP0 handler (OPD `0x1B6158`, registered at `0x108518`).
 
 ### What unblocked the core: the opcode dispatch table was never lifted
 
