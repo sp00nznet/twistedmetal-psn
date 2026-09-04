@@ -3174,3 +3174,43 @@ Stated as a candidate, not a conclusion:
 Confirming it means reading which event **classes** those three descriptors hold. Those are
 runtime values in PS1 kernel RAM around `0xA000B21C`, so it is a memory read rather than a
 disassembly --- and the PS1 CD event class is `0xF0000003`.
+
+### The three descriptors are all zero
+
+Reading the three event descriptors the `TestEvent` loop loads --- PS1 kernel RAM `0x0000B21C`,
+`B224` and `B228`, from `lui $a0,0xa001` + `lw $a0,-0x4de4($a0)` and its two siblings:
+
+```
+[ps1ev] ram=0x00770780  EvCB tbl=0xA000E028 size=448
+[ps1ev]   slot 0xB21C handle=0x00000000
+[ps1ev]   slot 0xB224 handle=0x00000000
+[ps1ev]   slot 0xB228 handle=0x00000000
+```
+
+**The read is validated before the result is used** --- the whole lesson of this port applied
+for once in the right order. The same probe pulls the PS1 kernel's event-table pointer from the
+table-of-tables at `0x0120` and gets `0xA000E028` with size 448: a KSEG1 pointer and exactly 16
+EvCB entries of `0x1C` bytes each. That is a correctly formed PS1 kernel structure, so both the
+RAM base (`*(TOC-0x79D4)` = `0x00770780`) and the byte-swapped read are right.
+
+The byte order matters and would have been easy to get wrong: the interpreter reads PS1 memory
+with `lwbrx`, so PS1 RAM is stored **little-endian** in guest memory. A big-endian read here
+would have produced plausible-looking nonsense.
+
+So the zeros are a reading, not a broken probe. **The BIOS is polling three null event handles.**
+`OpenEvent` was never called for them, or their storage was never filled --- and a `TestEvent`
+loop over null handles can never succeed, which is exactly the forever-wait observed.
+
+### Hedged where it needs to be
+
+* the pc sample that named this loop was a 64-byte bucket (`0xBFC53840`), so the hot code is
+  *that bucket* rather than provably these three instructions
+* the read was taken at a fixed heartbeat, not at a proven steady state
+
+What is solid: the EvCB table is valid, and those three kernel words are zero.
+
+### The remaining work
+
+Narrow, and independent of the hedge: **what should have written those three slots?** They are
+BIOS kernel globals, so the writer is the BIOS routine that opens the events --- most plausibly
+during CD driver init. Finding why it never ran, or ran and stored nothing, is the last step.
