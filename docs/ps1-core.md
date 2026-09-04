@@ -5391,3 +5391,45 @@ source pointer that is short.
 
 Two independent measurements support it (unchanged RMW values; static content
 under hundreds of writes), which is worth more than either alone.
+
+### RETRACTION: the merge does contribute --- the blit writes real data
+
+The section immediately above concluded that "the writes are writing the old
+bytes back" and that the read-modify-write's merge contributes nothing. **Wrong.**
+
+A PUT copies local store to memory verbatim --- there is no merge inside the DMA
+engine --- so the claim was testable directly by printing both sides at the
+instant of the write. `SPU_H2LSRC=1` does that for every `Host2Local_Body` write
+into PS1 VRAM (LS `0x00350..0x00757`, from the firmware symtab):
+
+```
+n=1  pc=0x004DC ea=0x406F1500 size=32  LS=0000DAD6...  VRAM=00000000...  differ
+n=2  pc=0x004DC ea=0x40640500 size=128 LS=00000000...  VRAM=00000000...  IDENTICAL
+n=7  pc=0x004DC ea=0x40642D00 size=128 LS=110011111110...  VRAM=0000...  differ
+n=8  pc=0x004DC ea=0x40643500 size=128 LS=110010010011...  VRAM=0000...  differ
+```
+
+The local store holds **real data** and the destination is zero, so those writes
+put new content into VRAM. The 16 "IDENTICAL" samples against 5 "differ" are all
+**zeros over zeros** --- trivially identical, and no evidence of a broken merge
+at all.
+
+How the wrong conclusion happened, because it is the same mechanism as the eleven
+before it: the earlier evidence was one watched word whose value stayed
+`0x83E083E0` across several GET/PUT pairs, plus row coverage showing static
+content under many writes. Both are true. Neither implies the merge does nothing
+--- a write of the same value it already held looks identical to a write that
+changed nothing, and I generalised from a handful of samples at one address.
+
+Also visible in the same output, and worth keeping: the LS bytes are
+`11 00 11 11 11 10 00 01 ...` --- every nibble 0 or 1. That is 4-bit indexed
+(CLUT4) data, so these particular blits are **texture and font uploads**, not
+movie frames. Attributing them to the FMV path was another over-reach.
+
+**What is measured, and all that is measured:** `Host2Local_Body` copies real
+data into VRAM correctly. The FMV renders and advances, with roughly a third of
+each row carrying picture. After the movie the game draws nothing and attract
+mode never starts. Where the remaining two thirds of a movie row comes from is
+**not established**, and the four explanations offered for it in the sections
+above --- short transfer, wrong source, stale content, dead merge --- have each
+been closed by measurement.
