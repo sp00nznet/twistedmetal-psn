@@ -3729,3 +3729,55 @@ Reading two facts from two different probes on two different schedules is not on
 produced: the VRAM/surface mismatch, the "all surfaces black" artifact, the "24-bit framebuffer"
 hypothesis, the `HwDMAC` misidentification, the CD-handles-are-zero chain, and this. **Put every
 probe that must be compared into one report at one instant, or do not compare them.**
+
+## ROOT CAUSE, one report one instant: the CD interrupt never reaches the BIOS ISR
+
+Applying the discipline the last two sections identified --- every fact that must be compared
+read by the same probe at the same moment --- gives a single coherent picture:
+
+```
+[census] 600000 samples, 85/8192 BIOS buckets ever executed;
+         CdInit: BFC52B80=0 BFC52BC0=1 BFC52C00=0 BFC52C40=0
+                 BFC04680=0 BFC046A0=0
+         handles: F1000007 F1000008 F1000009 F100000A F100000B
+         ev[cls/status]: 3/2000 3/2000 3/2000 3/2000 3/2000
+```
+
+Four facts, one instant:
+
+1. **`CdInit`'s `OpenEvent` block executes** (`BFC52BC0=1`).
+2. **All five handles are valid** (`0xF1000000|7..0xB`).
+3. **All five EvCBs are class 3 (`HwCdRom`) with status `0x2000`** --- `EvStACTIVE`, open and
+   waiting. *None* is `0x4000` (`EvStALREADY`, delivered-not-yet-consumed).
+4. **The BIOS interrupt dispatcher's CD branch never executes.** `0xBFC046A0` is where it reads
+   I_STAT/I_MASK and tests bit 2 before calling `DeliverEvent(0xF0000003)`; that bucket is unset,
+   as is the one before it.
+
+So the CD event machinery is **entirely correct on the guest side** --- opened, enabled, waiting
+--- and the PS1 CD-ROM interrupt never arrives to fire it. `CdReadSector` (A(0xA5)) polls five
+events that nothing will ever deliver.
+
+```
+ps1_netemu never raises the PS1 CD interrupt (I_STAT bit 2)
+  -> the BIOS interrupt dispatcher's CD branch never runs
+     -> DeliverEvent(HwCdRom, ...) is never called
+        -> all five events stay EvStACTIVE forever
+           -> CdReadSector's TestEvent poll can never succeed
+              -> the game never resumes, never draws
+                 -> only type-8 sync packets reach the GP0 ring
+```
+
+### The caveat, and why it holds anyway
+
+Sampling cannot prove absence: `BFC046A0=0` means no sample landed in that bucket, and the ISR is
+short enough to be missed. What makes it sound here is that **fact 3 corroborates fact 4
+independently** --- if the CD branch had ever run, `DeliverEvent` would have set an event to
+`0x4000`, `CdReadSector` would have consumed it and progressed. It has not, in any run.
+
+Two independent facts in the same report, agreeing. **That is the first root-cause claim in this
+document built the way it should have been built from the start.**
+
+### The target
+
+The CD hardware emulation. `0x1F801800 +0x10` is registered as an I/O window, so something inside
+ps1_netemu owns the CD controller, and completing a command must set I_STAT bit 2.
