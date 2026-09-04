@@ -2,8 +2,9 @@
 # everything derived from them. None of this belongs in the repo.
 fw/
 pkg/
-extracted/
-extracted_crack/
+# extracted*/ so a second title (extracted_tm2/, extracted_tm2_crack/, ...)
+# is covered without another edit -- these hold the unpacked EBOOT.PBP.
+extracted*/
 vfs/
 *.rar
 *.pkg

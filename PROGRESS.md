@@ -6821,3 +6821,47 @@ Any PS3 game whose code uses `vmsumshs`, `vsumsws` or `vmulesh` was silently
 getting no-ops, and anything using `vsraw`, `vrlw`, `vmulosh` or integer
 `vmax`/`vmin` was getting byte-reversed lanes. All are fixed in
 ps3recomp `93f1377`.
+
+## A second title: Twisted Metal 2
+
+Confirmation that the target was the right one. `ps1_netemu` is the emulator, so a
+second PSOne Classic needs no code at all --- unpack its package into
+`vfs/dev_hdd0/game/<content>/` and name it:
+
+```sh
+PS1_CONTENT=NPUI94306 PS1_SERIAL=SCUS94306 ./tools/run.sh
+```
+
+It boots, decrypts its own disc, plays the SingleTrac logo movie and its intro,
+and reaches the *World Tour* title screen. 1.65 billion R3000 instructions,
+VRAM at 149,943 non-zero words. The VMX/MDEC fix carries straight over --- its
+FMV decodes on the first try.
+
+`tools/run.sh` is now content-aware: `PS1_SERIAL`/`PS1_CONTENT` pick the disc, the
+window title follows, and `vfs/PS3_GAME/PARAM.SFO` is **refreshed when it does not
+match** the title being launched. That last part matters --- it is shared state, and
+a stale SFO points `cellGame` (and every path built from it) at the previous game.
+
+### The one thing that did not just work: EDAT licence type 2
+
+The first attempt failed at the disc:
+
+```
+[edat] license type 2: header klicensee is NP_PSX_KEY, but the DATA is encrypted
+       with the RIF key from a per-console RAP, which this runtime does not have
+cell/host.c: 625: CoreBoot() failed
+```
+
+`ISO.BIN.EDAT` comes in more than one licence flavour. Type 1 and 3 derive their
+key from a klicensee the runtime can compute; **type 2 is bound to a per-console
+RAP**, and ps3recomp's EDAT path has no RIF/RAP support, so the disc cannot be
+decrypted and `CoreBoot()` gives up.
+
+That is a **runtime capability gap, not a title-specific bug** --- and it is worth
+recording as a feature request rather than a workaround: implementing RIF/RAP
+handling would let a type-2 package be used with the buyer's own RAP, which is the
+correct way to run one. Until then a type-2 disc image needs a licence the runtime
+can actually process.
+
+Diagnosis was immediate because the message names the cause outright --- the EDAT
+work documented in [npdrm.md](npdrm.md) had already made that path legible.

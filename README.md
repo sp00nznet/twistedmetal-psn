@@ -32,6 +32,25 @@ And unattended: one launch, no input, screenshots taken 5 s apart as it plays it
 cards &rarr; **intro FMV** &rarr; title screen &rarr; **attract mode**. Menus respond to
 input; the pad is wired.
 
+### And it is not one game
+
+The recompilation target is the **emulator**, so a second disc costs nothing but its
+content id. **Twisted Metal 2** boots on the same executable, unmodified:
+
+| | |
+|---|---|
+| ![TM2 logo](docs/img/07-tm2-logo.png) | ![TM2 title](docs/img/06-tm2-title.png) |
+| Its intro movie --- same MDEC path | *Twisted Metal 2: World Tour* |
+
+```sh
+PS1_CONTENT=NPUI94306 PS1_SERIAL=SCUS94306 ./tools/run.sh
+```
+
+Boots, plays the SingleTrac logo movie and its own intro, and sits at the title
+screen. Nothing in the port is Twisted Metal specific --- `tools/run.sh` takes the
+content id and serial, and the other 141 PSOne Classics use the same two knobs.
+
+
 ## 📺 What's in the box
 
 `Twisted Metal PSN [NPUI-94304]` is a **PSOne Classic** (`PARAM.SFO: CATEGORY=1P`),
