@@ -50,6 +50,18 @@ Boots, plays the SingleTrac logo movie and its own intro, and sits at the title
 screen. Nothing in the port is Twisted Metal specific --- `tools/run.sh` takes the
 content id and serial, and the other 141 PSOne Classics use the same two knobs.
 
+Two more, tried cold:
+
+| title | result |
+|---|---|
+| **WipEout** (`NPUI94301`) | boots, 1.8 B instructions, **intro FMV renders** --- stale VRAM shows as bands in the letterbox |
+| **Crash Bandicoot** (`NPUI94900`) | boots, 2.2 B instructions, fills 31% of VRAM, but presents black --- open |
+
+![WipEout FMV](docs/img/08-wipeout-fmv.png)
+
+So three of four discs tried reach video, on one binary, with no per-title code.
+
+
 
 ## 📺 What's in the box
 

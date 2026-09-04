@@ -33,11 +33,15 @@ export RSX_LIVE_DRAW="${RSX_LIVE_DRAW:-1}"
 # serial: unpack its package into vfs/dev_hdd0/game/<content>/ and set these.
 #   Twisted Metal    NPUI94304 / SCUS94304   (default)
 #   Twisted Metal 2  NPUI94306 / SCUS94306
+#   WipEout          NPUI94301 / SCUS94301
+#   Crash Bandicoot  NPUI94900 / SCUS94900
 PS1_SERIAL="${PS1_SERIAL:-SCUS94304}"
 PS1_CONTENT="${PS1_CONTENT:-NPUI94304}"
 
 case "$PS1_CONTENT" in
   NPUI94306) _name="Twisted Metal 2" ;;
+  NPUI94301) _name="WipEout" ;;
+  NPUI94900) _name="Crash Bandicoot" ;;
   *)         _name="Twisted Metal"   ;;
 esac
 export PS3_TITLE="${PS3_TITLE:-$_name (PSOne Classic) - ps3recomp}"

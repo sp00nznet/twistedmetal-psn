@@ -6865,3 +6865,39 @@ can actually process.
 
 Diagnosis was immediate because the message names the cause outright --- the EDAT
 work documented in [npdrm.md](npdrm.md) had already made that path legible.
+
+### Two more discs, tried cold
+
+| title | content id | result |
+|---|---|---|
+| Twisted Metal | `NPUI94304` | full sequence to attract mode |
+| Twisted Metal 2 | `NPUI94306` | boots, both intro movies, title screen |
+| WipEout | `NPUI94301` | boots, 1.8 B instructions, **intro FMV renders** |
+| Crash Bandicoot | `NPUI94900` | boots, 2.2 B instructions, presents black --- open |
+
+**WipEout** needed nothing: its intro movie decodes and plays. The only blemish is
+banding in the letterbox --- its video is shorter than the display region, so the
+rows above and below it show whatever was in VRAM before, which is the same
+two-pixel pattern documented above. Cosmetic, and it points at a real gap: nothing
+clears the display area outside the movie.
+
+**Crash Bandicoot** is the interesting one, and it is *not* a rendering failure in
+the PS3 half. Its pipeline is indistinguishable from a working title:
+
+```
+Crash   packets seen=21835 queued=21835 exec=21835  drops=0  clears=15676
+TM2     packets seen=20752 queued=20752 exec=20752  drops=0  clears=15001
+```
+
+And the guest is alive: 2.2 billion R3000 instructions, VRAM 31% non-zero. What
+differs is *where* that content is --- the heartbeat reports `first=+0x80000`, i.e.
+the first non-zero word is at VRAM row 256 --- while the composite samples
+`tc (1,2)..(638,474)` with correct quantiser constants (`c0=(255, 0.5)`,
+`c1=(8/255, -0.5/255)`), which is a full 480-line region. So the sampled region
+overlaps the content and still comes out black, meaning the non-zero words at
+`0x80000` are texture pages rather than a framebuffer, and the framebuffer Crash
+is actually displaying has not been written.
+
+Not chased further. The next measurement is the obvious one: dump PS1 VRAM
+(`PS1_FBDUMP`) during a Crash run and see what is at row 256 and what is at the
+rows the UVs sample.
