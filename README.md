@@ -183,7 +183,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Whole PS3-side render path verified | ✅ Done — draws, shader, constants, upload, readback all correct |
 | PS1 display framebuffer placed correctly | ✅ Done — 320x240 block, native resolution, right position |
 | PS1 CD events opened correctly | ✅ Done — `CdInit` runs; handles `F1000007..F100000B` all valid |
-| Intro video → menu → attract mode | ⬜ **ROOT CAUSE** — the PS1 CD interrupt (I_STAT bit 2) is never raised; all 5 CD events stay `EvStACTIVE` |
+| PS1 CD interrupt raised + unmasked | ✅ Done — `I_STAT_or=0x0D`, `I_MASK_or=0x0D` (bits 0,2,3) |
+| Intro video → menu → attract mode | ⬜ **ROOT CAUSE** — the R3000 never *takes* the interrupt, so `DeliverEvent(HwCdRom)` is never called |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

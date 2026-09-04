@@ -3781,3 +3781,57 @@ document built the way it should have been built from the start.**
 
 The CD hardware emulation. `0x1F801800 +0x10` is registered as an I/O window, so something inside
 ps1_netemu owns the CD controller, and completing a command must set I_STAT bit 2.
+
+## The CD interrupt IS raised and unmasked --- it is never DELIVERED to the guest
+
+Sampling and OR-ing the emulated I_STAT/I_MASK instead of store-watching them gives the complete
+picture in one report:
+
+```
+[census] 600000 samples, 85/8192 BIOS buckets ever executed;
+         CdInit: BFC52B80=0 BFC52BC0=1 ... BFC04680=0 BFC046A0=0
+         handles: F1000007 F1000008 F1000009 F100000A F100000B
+         I_STAT_or=0000000D I_MASK_or=0000000D
+         ev[cls/status]: 3/2000 3/2000 3/2000 3/2000 3/2000
+```
+
+`I_STAT_or = 0x0D` is bits 0, 2 and 3: VBLANK, **CDROM** and DMA. `I_MASK_or = 0x0D` too. So the
+CD interrupt bit **is** set, and it **is** enabled in the mask.
+
+### That retracts the previous section
+
+*"Only VBLANK is ever raised, never bit 2"* came from store-watched runs, and the watch costs a
+check on every `vm_write32` --- watched runs reach 23 BIOS buckets against 79--87 unwatched, so
+they never got far enough to touch the CD at all. **Same observer effect as the framebuffer dump,
+third time in this port.** Sampling and OR-ing is free and answers the same question, which is
+why it was the right instrument.
+
+### What remains, and it is now precise
+
+| fact | value |
+|---|---|
+| I_STAT bit 2 raised | yes (`I_STAT_or` has `0x4`) |
+| I_MASK bit 2 enabled | yes (`I_MASK_or` has `0x4`) |
+| BIOS dispatcher's CD branch executes | **no** (`0xBFC046A0` unset) |
+| any CD event reaches `EvStALREADY` | **no** --- all five stay `0x2000` |
+
+So the CD interrupt is asserted and unmasked, and the R3000 never takes it as an exception ---
+or takes it and the handler never reaches the bit-2 test. Either way `DeliverEvent(HwCdRom)` is
+never called, and `CdReadSector` polls five events that will never fire.
+
+The two independent facts still agree: the dispatcher's CD bucket is unsampled **and** no event
+ever leaves `EvStACTIVE`. If the branch had run even once, `DeliverEvent` would have moved an
+event to `0x4000` and the poll would have consumed it.
+
+### The target
+
+**R3000 interrupt delivery, not the CD controller.** Something has to turn
+`I_STAT & I_MASK != 0` into a MIPS interrupt exception on the emulated CPU, with Cop0 SR/CAUSE
+set so the BIOS handler runs and dispatches. That is far narrower than the CD hardware, and it
+sits squarely in the interpreter.
+
+### On instruments
+
+Eighth correction --- and the first time the instrument was chosen for **not perturbing the thing
+it measures**. That is what finally made the whole picture visible in one report, after three
+separate observer-effect artifacts (the framebuffer dump, the surface dumps, and this).
