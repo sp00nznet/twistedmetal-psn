@@ -5847,3 +5847,82 @@ mode never starts. Where the remaining two thirds of a movie row comes from is
 **not established**, and the four explanations offered for it in the sections
 above --- short transfer, wrong source, stale content, dead merge --- have each
 been closed by measurement.
+
+## `Host2Local_Body` read as code --- the blit is correct
+
+Read deliberately rather than probed, from the lifted source, with the firmware
+symtab giving the extents. The whole function is four blocks: setup at `0x350`, a
+pixel loop `0x3D8 -> 0x400 -> 0x42C -> 0x3D8`, a chunk-flush at `0x4DC`, and a
+finish at `0x438`.
+
+### The pixel loop
+
+```c
+0x3D8:  off   = x + x                       // x*2: 16-bit pixels
+        src_q = LS[srcptr]                  // source quadword
+        dst_q = LS[dstbase + off]           // DESTINATION quadword
+        inner = inner - 1
+0x400:  x     = (x + 1) & 1023              // wraps at the VRAM width
+        s_hw  = rotqby(src_q, srcptr + 14)  // extract source halfword
+        d_hw  = rotqby(dst_q, dstaddr + 14) // extract dest halfword
+        test  = and(MASKCHK, d_hw)          // test a bit in the DESTINATION
+        take  = ceqi(test, 0)
+        merged= selb(d_hw, s_hw | MASKSET, take)
+        LS[dstbase + off] = shufb(merged, dst_q, insert_mask)
+        if (inner == 0) goto 0x4DC          // flush this chunk by DMA
+        srcptr += 2
+0x42C:  outer = outer - 1
+        if (outer != -1) goto 0x3DB8 else goto 0x438
+```
+
+Three things fall out, and they all check out against measurements already taken:
+
+**The chunk size is 24 pixels.** `inner` comes from `rotqbyi(LS[0x24220], 4)`,
+i.e. word 1 of that quadword, measured as `0x18` = **24**. 24 pixels x 2 bytes =
+**48 bytes**, which is exactly the DMA size seen in every `Host2Local_Body`
+transfer from the very first trace. The granularity that this document once
+called "the rasteriser's 48-byte read-modify-write" is simply the blit's chunk.
+
+**The mask test is real but disabled.** `MASKCHK` is
+`and(shlhi(rotqbyi(LS[0x150E0],12),15), 0xFFFF)` --- `shlhi(x,15)` leaves exactly
+one bit, so it is `0x8000` when a flag byte is set and `0` when it is not. That
+is the PS1 **STP / "check mask before draw"** bit, and `MASKSET` beside it is
+"set mask on draw". Measured:
+
+```
+LS[0x150E0] = 00000000 00000100 00000000 00000000
+              word3 -> MASKCHK = 0     word2 -> MASKSET = 0
+```
+
+Both zero, so `dest & 0 == 0` is always true and **every pixel takes the
+source**. The mask-rejection hypothesis --- raised early, dropped on weak
+evidence, and revived by this code --- is now dead on a measurement of the flag
+the code actually reads.
+
+**The x coordinate wraps at 1024**, which is correct for PS1 VRAM.
+
+### So the blit is not the bug
+
+It copies 24 pixels per chunk, unconditionally, wrapping correctly, and DMAs 48
+bytes --- all of which match what was measured from the outside. The **extent** of
+a transfer is set entirely by two counters it is handed:
+
+```
+outer = min(cmd[+0x10], LS[0x24220].word0) - 1      // rows / spans
+inner = LS[0x24220].word1                            // = 24, pixels per chunk
+```
+
+and the pixel data itself is **inline in the command** (`srcptr` starts at
+`cmd + 20`). So how much of a row gets written is decided by whoever builds the
+command --- PPU-side --- not by the SPU.
+
+That is the boundary this port has been circling all session, now placed by
+reading rather than guessing: **everything from the command onward is correct.**
+The remaining FMV question lives entirely on the PPU side of that handoff.
+
+One caution recorded for whoever reads `LS[0x24220].word0` next: sampled at a
+yield it reads **0**, which would make `outer = -1` and skip the loop entirely.
+It cannot be 0 during an active transfer, since the loop demonstrably runs 239
+million times --- the sample is simply taken between transfers. That is the
+compare-two-moments trap this document has fallen into a dozen times; anyone
+wanting that value must read it *inside* the transfer, not from a poll.
