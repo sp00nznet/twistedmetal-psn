@@ -5512,3 +5512,63 @@ It cannot be 0 during an active transfer, since the loop demonstrably runs 239
 million times --- the sample is simply taken between transfers. That is the
 compare-two-moments trap this document has fallen into a dozen times; anyone
 wanting that value must read it *inside* the transfer, not from a poll.
+
+## MEASURED AT THE SOURCE: the movie's pixel data is the pattern
+
+The retraction two sections above --- "the merge does contribute, the blit writes
+real data" --- was measured on the **first ten** blits of a run. Those are
+texture and font uploads (their bytes are CLUT4, every nibble 0 or 1). The movie
+blits happen hundreds of thousands of writes later, and sampling *those* gives
+the opposite answer.
+
+`SPU_H2LSRC=1`, late samples, during the blank phase:
+
+```
+n=4400000 pc=0x004DC ea=0x40667EC0 size=48 LS=F800000000F8F800000000F8
+                                           VRAM=F800000000F8F800000000F8 IDENTICAL
+n=4600000 pc=0x004DC ea=0x40617DA0 size=48 LS=F800000000F8F800000000F8  IDENTICAL
+n=4800000 pc=0x004DC ea=0x4063FC50 size=48 LS=F800000000F8F800000000F8  IDENTICAL
+n=5000000 ...  n=5200000 ...  n=5400000 ...   all IDENTICAL
+```
+
+30 IDENTICAL against 5 "differ", and the 5 are the early texture uploads.
+
+**The local store holds the pattern.** The blit copies it faithfully into VRAM,
+which already contains the same bytes --- which is why the writes look like
+no-ops and why the row never changes however many times it is written.
+
+`F8 00 00 00 00 F8` repeating is a **6-byte period**: as 24-bit pixels that is
+`(F8,00,00)` and `(00,00,F8)`, red and blue alternating, which is the
+green-and-magenta screen after the composite's colour handling.
+
+### Which places the defect exactly
+
+The pixel data for a `Host2Local` command is **inline in the command**
+(`srcptr = cmd + 20`, established by reading the function). So the command built
+on the **PPU side** already carries the pattern. Everything from there on ---
+the SPU blit, the DMA, VRAM, the texture bind, the composite --- is faithful, and
+each has been separately measured to be so.
+
+So the FMV defect is: **whatever fills the movie's CPU-to-VRAM command produces a
+two-pixel repeating pattern instead of decoded video.** That is MDEC output, on
+the PPU side, and it is the last unmeasured link in the chain.
+
+### And the movie never stops
+
+Phase-resolved write accounting (`SPU_VRAMPC` deltas between consecutive
+reports, plus a per-buffer split) during the blank phase:
+
+```
+BlockClear        0 new          Host2Local_Body  20,000 new (all of them)
+buf0 (0..959)     +450 KB        buf1 (960..1919) +175 KB      tex 0 KB
+```
+
+A 320x240 24-bit frame is 230 KB, so that is roughly two frames per window
+landing in buffer 0 and most of one in buffer 1. **The movie is still streaming
+through the entire "blank" phase**, into both display buffers, carrying the
+pattern. The screen is not blank because nothing is happening --- it is blank
+because what is being drawn is a flat pattern.
+
+That also explains why attract mode never appears: the title is still inside
+movie playback, feeding frames that carry no picture, and it has no reason to
+move on.
