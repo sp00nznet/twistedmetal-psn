@@ -4037,3 +4037,58 @@ I had been sampling both classes interchangeably and treating the results as one
 
 **Bug 1 first.** It is reproducible, it is a hard deadlock with a known signature to trigger on,
 and until it is fixed a third of all measurements are taken from a dead process.
+
+## Bug 1 caught in the act: the stalled run spins yield from a `bctr`-dispatched handler
+
+Looped the run until a class-B stall was caught (attempt 3 of 6: 18 heartbeats, 2 distinct
+totals, frozen at 14,407,680 instructions), then read the last syscall per thread from **that**
+process:
+
+```
+tid=1  n=59443  num=43  lr=0x00106824  a4=0xFFFFFFFFFFFFFFFE
+tid=3  n=29     num=540 lr=0x00000000
+tid=6  n=272    num=130 a3=0x4   (flip thread, normal)
+tid=8  n=6      num=92  a3=0x4 timeout=200000us
+tid=9  n=250    num=130 a3=0x3   (normal)
+```
+
+Everything else is idle and healthy. **tid=1 --- the guest thread running the R3000 --- issues
+`sys_ppu_thread_yield` 59,443 times while the instruction counter does not move.** That is the
+stall, measured on a run *confirmed* to be stalled rather than assumed.
+
+### Where it is, and why `lr` needs care
+
+`lr=0x00106824` is the return address of `bl 0x105fa8` at `0x00106820`:
+
+```
+001067F8  li   r0, 0xb
+001067FC  stw  r0, 0x138(r23)   ; reason = 0xB
+00106820  bl   0x105fa8         ; the event scheduler
+00106824  lwz  r4, 0x138(r23)   ; reason
+00106830  bne- cr7, 0x106904    ; reason != -1 -> leave the interpreter
+```
+
+But `func_00105FA8` spans `0x105FA8..0x106098` and contains **no `bl` and no `sc`**, and there is
+**no `sc` anywhere in the interpreter** (`0x1066A8..0x108348`) either. So the yield is executed by
+neither the interpreter nor the scheduler.
+
+The explanation is the dispatch mechanism: the interpreter reaches each R3000 opcode handler
+through **`bctr`** (the jump table at `0x1B37D4` --- the same table whose absence was the first
+bug fixed in this port). `bctr` does not write `lr`, so a handler inherits whatever the last `bl`
+left there. **An opcode handler is issuing the yield**, with `lr` still pointing at the scheduler
+call.
+
+> **Worth recording independently of this bug:** in this interpreter, `lr` on a syscall names the
+> last **call** the guest made --- never the code that made the syscall --- because every opcode
+> handler is *jumped* to. Reading it as a caller address, which this document has done
+> repeatedly, is wrong by construction.
+
+### So Bug 1 is
+
+An R3000 opcode handler, reached by `bctr`, yields repeatedly without retiring an instruction. It
+is now **reproducible on demand** (roughly one run in three; the catch script loops until the
+totals plateau) and isolated to a single thread in a process where nothing else is wedged.
+
+Finding *which* handler needs the dispatched target, not `lr`: the jump-table index comes from
+the opcode field of the instruction at the R3000 pc, and the pc lives in `r26` during the loop.
+Capturing `ctr` or the table index at the yield would name it outright.
