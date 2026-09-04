@@ -4506,3 +4506,61 @@ totals plateau) and isolated to a single thread in a process where nothing else 
 Finding *which* handler needs the dispatched target, not `lr`: the jump-table index comes from
 the opcode field of the instruction at the R3000 pc, and the pc lives in `r26` during the loop.
 Capturing `ctr` or the table index at the yield would name it outright.
+
+## BUG 1 CHARACTERISED: the R3000 is pinned on one `ADDIU`, budget never granted
+
+Caught a genuine stall (plateau at 13,658,112 instructions, non-zero, first attempt) and read
+the probes from **that** process:
+
+```
+[yieldop] 10800000 yields; ctr=0x000D2298; top R3000 opcodes: op09=200000
+[census]  47/8192 BIOS buckets; handles all zero;
+          I_STAT_or=00000001 I_MASK_or=00000009
+          SR_or=00410405 CAUSE_or=00000420 line_or=1
+totals    13658112 13658112 13658112 13658112
+```
+
+**Every yield is at R3000 opcode `0x09` --- `ADDIU`** --- 200,000 of 200,000 in every report,
+across 10.8 million yields, with the instruction counter frozen. Not a mix, not a distribution:
+one opcode, always.
+
+That is not a wait for anything external. The interpreter is repeatedly looking at the same next
+instruction --- a plain `ADDIU`, the simplest op there is --- and never executing it. Which points
+straight at the budget gate in its outer loop:
+
+```
+001068DC  bgt  cr7, 0x106890   ; budget > 0 -> execute instructions
+001067F8  li   r0, 0xb         ; else reason = 0xB
+00106820  bl   0x105fa8        ; ask the scheduler for a new budget
+                               ; -> yield, retry, forever
+```
+
+`func_00105FA8` is a leaf (no `bl`, no `sc`, `0x105FA8..0x106098`) that computes the budget from
+the event list. In a stalled run it returns zero every time, so the interpreter livelocks on the
+gate without ever retiring the instruction in front of it.
+
+### So Bug 1 is
+
+**In roughly one run in three, the R3000 event scheduler stops granting an instruction budget,
+and the interpreter livelocks on the budget gate.**
+
+"Budget 0" appeared in these notes many sections ago and was dismissed as a sampling artifact ---
+*correctly at the time*, because it was measured on healthy runs where budget 0 is a normal
+transient. On a confirmed stalled run it is the whole story. The same observation, worthless from
+one run class and decisive from the other.
+
+### A second difference, healthy versus stalled
+
+```
+healthy   SR_or=40410405   I_STAT_or=0000000D  (VBLANK|CDROM|DMA)
+stalled   SR_or=00410405   I_STAT_or=00000001  (VBLANK only)
+```
+
+The stalled run never sets **SR bit 30** (`0x40000000`, Cop0 CU2 --- the GTE enable) and never
+raises the CD interrupt. Whether the missing CU2 is cause or consequence is **not established**;
+it is a clean discriminator either way, and the first structural difference found between the two
+run classes.
+
+`ctr=0x000D2298` is constant in both classes and is **not** an opcode handler (those live at
+`0x106xxx`--`0x108xxx`). Like `lr`, `ctr` persists across `bctr`-free stretches, so it names some
+earlier indirect call, not the yielding code. Recorded so the next reader does not chase it.
