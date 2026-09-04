@@ -6160,3 +6160,59 @@ either would settle in one run whether MDEC ever has work in flight at all.
 That is the next measurement, and it is a small one. The addresses, the state
 struct, the handler, the branch targets and the event-list layout are all now
 written down.
+
+### The MDEC module, bounded --- four entry points, and it is running
+
+`PPU_RWATCH=2EC1FC,8` catches every read of the two event-node pointers.
+**146 hits in 240 s**, from three distinct functions:
+
+```
+func_000EA44C    72 reads
+func_000EAA88    65 reads
+func_000E9A18     9 reads     (the write handler, already identified)
+```
+
+Two things follow.
+
+**MDEC is active.** The nodes are read continuously through playback, so the
+event machinery is being exercised and the "both pointers NULL" reading from the
+previous section was exactly what it was flagged as --- a sample taken between
+operations, not evidence that scheduling never happens. Recording that caveat
+rather than the conclusion was the right call: the follow-up measurement
+contradicted the tempting reading, as it has fourteen times before in this file.
+
+**And the module is bounded.** With the two handlers from the I/O registration
+plus these, the MDEC implementation is:
+
+```
+func_000E9A18   MDEC register WRITE handler   (registered for 0x1F801820, size 0x10)
+func_000EA2F0   MDEC register READ handler    (same registration)
+func_000EA44C   reads the event nodes -- 72x
+func_000EAA88   reads the event nodes -- 65x
+```
+
+a contiguous block of code from roughly `0x000E9A18` to `0x000EAB00`, in a
+firmware with no `mdec` string, no `mdec.c` source name and no symbol for any of
+it. That is the module the remaining defect lives in.
+
+### Final state of this investigation
+
+```
+disc -> STR bitstream
+     -> [R3000 software Huffman]         VERIFIED CORRECT
+     -> [MDEC: E9A18 / EA2F0 / EA44C / EAA88]   *** 2-pixel pattern out ***
+     -> [SPU Host2Local_Body]            VERIFIED CORRECT
+     -> [DMA to PS1 VRAM]                VERIFIED CORRECT
+     -> [texture bind]                   VERIFIED CORRECT
+     -> [composite]                      VERIFIED CORRECT
+```
+
+The defect is inside a four-function module that is **running**, is handed
+**verified-correct input**, and whose **entire output path is verified correct**.
+It emits a repeating two-pixel pattern instead of decoded pixels, which is why
+the intro movie shows no picture, why the title never leaves playback, and why
+attract mode never begins.
+
+Fixing it means reading the arithmetic in those four functions --- the IDCT and
+the YUV-to-RGB conversion --- against the PS1 MDEC specification. That is
+implementation work, not measurement, and it is where this stops.
