@@ -5017,3 +5017,32 @@ there at all. Buffer 0 reinterpreted as 24-bit RGB shows a genuine frame
 VRAM -- partially. The next measurement is what fills the other two thirds:
 `SPU_WATCHEA` on an address inside a *known-blank* span, with the transfer
 geometry, says whether those bytes are written and skipped or never addressed.
+
+### The one-third fill has an exact arithmetic signature
+
+A 320-pixel 24-bit row is 960 bytes. PS1 CPU-to-VRAM transfers (GP0 `0xA0`)
+count their width in **16-bit halfwords**, so that row is **480 halfwords**.
+
+What lands is ~320 bytes = **160 halfwords**, and 160 = 320/2. That is the
+halfword count for a 320-pixel *15-bit* row. So the width is being computed as
+`pixels / 2` instead of `pixels * 3 / 2` --- correct for 16-bit, one third short
+for 24-bit. The measured fill and that arithmetic agree to within a few bytes.
+
+Two things this rules in and out:
+
+- **Buffer 0 does not hold a complete frame.** Reinterpreted as 320x240 24-bit
+  RGB it is coherent for ~104 pixels and pattern thereafter, so pointing the
+  display window at buffer 0 instead of buffer 1 would not fix the picture. The
+  blit is the bug, not the display offset --- which also means the experiment of
+  overriding that offset is not worth running.
+- **The transfer is not in the GP0 ring.** `PS1_GP0HIST` over the last 64
+  packets counts zero words in the `0xA0..0xBF` class across every sample, so
+  CPU-to-VRAM transfers are handled somewhere other than the ring the GPU SPUs
+  consume --- and that is where the width is computed.
+
+A method note: an automated detector written to find where the coherent region
+ends reported byte 960 (a full row) in all five dumps, contradicting the image.
+The detector was wrong --- it flagged bytes in a small value set, and `0x00` is
+ordinary in dark image data. The visual measurement stands; the automated one is
+discarded. Worth recording because it would have been the fourth confident
+wrong answer in this document had it been believed.
