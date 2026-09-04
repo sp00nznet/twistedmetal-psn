@@ -5046,3 +5046,59 @@ The detector was wrong --- it flagged bytes in a small value set, and `0x00` is
 ordinary in dark image data. The visual measurement stands; the automated one is
 discarded. Worth recording because it would have been the fourth confident
 wrong answer in this document had it been believed.
+
+### RETRACTION: the row is fully written, so "one third fill" was wrong
+
+The commit above concluded that the 24-bit transfer writes ~320 of the 960 bytes
+each row needs, with the tidy arithmetic `pixels/2` instead of `pixels*3/2`.
+**That is not supported.** It came from looking at one plane dump, at one
+moment, and reading where the coherent part of the picture ended.
+
+Write coverage measured directly (`SPU_ROWCOV`, counts per 64-byte block over a
+whole 2048-byte VRAM row):
+
+```
+writes per 64B block:  207 x20 blocks,  148 x10 blocks,  0 0
+byte at block start:   83E0 x20,        0000 F800 00F8 ...,  0000
+```
+
+Blocks 0..19 are bytes 0..1279 --- **640 pixels, the full display width** ---
+and every one is written ~207 times. The row is not one-third filled. It is
+fully written, and the content is wrong: every pixel is `0x83E0`.
+
+So the two symptoms are not "a short transfer". They are "the right amount of
+the wrong pixel". That is a different bug and the halfword arithmetic above,
+however neat, should be ignored.
+
+### And it is not a byte-order bug either
+
+The stored bytes are `83 E0`. As a little-endian PS1 halfword that is `0xE083`;
+the RSX reads A1R5G5B5 big-endian as `0x83E0` = R=1, G=31, B=0, which is exactly
+the green on screen. Tempting --- and wrong, for a reason worth writing down:
+
+- **white is invariant under channel permutation** (all three fields are 31)
+- **white is nearly invariant under a halfword byte swap** too: `0x7FFF`
+  swapped is `0xFF7F` = B=31, G=27, R=31, still near-white
+
+The BIOS boot screen (`PS1_FBDUMP`) renders its "Licensed by Sony Computer
+Entertainment of America" line in **blue**, where hardware shows white. Neither
+a permutation nor a byte swap can turn white into blue, so the stored values
+genuinely have low R and G. The ordering door is closed.
+
+### One local observation, explicitly not generalised
+
+Pixel values in that text band are `0x1111`, `0x1100`, `0x0011`, `0x1001`,
+`0x0100`, `0x1011` --- every one a combination of nibbles that are only 0 or 1,
+which is what 4-bit indexed (CLUT4) glyph data looks like packed four pixels to
+a halfword.
+
+Tested for generality before believing it: the same property holds for only
+**32%** of non-zero pixels sampled across `x >= 640`, and 12% below it. So this
+says the BIOS font lives in that area as a 4-bit texture --- ordinary for PS1
+VRAM --- and says nothing about VRAM as a whole. Recorded at its actual scope.
+
+It does undercut one long-standing note here, that "every pixel the PS1 draws
+lives at x >= 640 while columns 0..639 are black": `x >= 640` holds font and
+texture data, and the row coverage above shows `x < 640` being written 207 times
+per block. Which half the display window should be reading is now an open
+question rather than a settled one.

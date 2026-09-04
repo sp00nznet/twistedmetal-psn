@@ -191,7 +191,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Main menu renders and responds | ✅ **Done** — navigable from the keyboard; Enter advances several screens |
 | Intro FMV plays | ⬜ Missing entirely — no video at any point |
 | 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not |
-| **Bug 3**: 24-bit VRAM transfer | ⬜ **Quantified** — each row gets ~320 bytes of the 960 it needs; the rest is stale 15-bit content |
+| **Bug 3**: PS1 pixels come out green | ⬜ The row is **fully** written (207 writes/64B across 640 px) with `0x83E0` — wrong pixel, not short transfer; not a byte-order bug either |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
