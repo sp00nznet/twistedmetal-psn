@@ -5440,3 +5440,86 @@ timer that never fires, an input the attract timeout waits on) rather than a
 rendering one. Distinguishing them is cheap: reach gameplay by driving the menus
 with input and see whether `DrawEdge` starts being entered. If it does, the
 renderer was never the problem.
+
+## THE MAIN MENU RENDERS, AND THE POLYGON RASTERISER WORKS
+
+The reversal in the section above was right. The renderer was never the problem.
+
+`PAD_SCRIPT` (already in the runtime: `"<sec>:<mask>,..."`, masks packed as
+`(DIGITAL2 << 8) | DIGITAL1`) drives the title without a human at the pad. One
+script --- START at 105 s, then CROSS every ten seconds with a DOWN at 165 s ---
+and the picture changes completely.
+
+### The polygon rasteriser, before and after
+
+Same build, same binary, `SPU_PCHIST=1` both times:
+
+```
+                    sitting at the title      driven with PAD_SCRIPT
+DrawEdge                    0                 88,040 / 68,059 / 67,680 / 105,246
+DrawRect                  955                 103,966
+BlockClear              9,792                 2,403,747
+```
+
+`DrawEdge` --- the polygon rasteriser, zero entries across four SPUs for an
+entire undriven run --- takes **tens of thousands** of entries as soon as the
+game is driven off the title screen. So the earlier `DrawEdge=0` was **correct
+behaviour for a 2D phase**, exactly as the previous section guessed, and the
+whole "nothing rasterises" line of investigation was measuring a screen that
+genuinely had no polygons on it.
+
+### And the menu draws
+
+`scratch/seq/t125.png` from the driven run: **the Twisted Metal main menu**, its
+brick-wall background art rendering correctly, with the inner panel black where
+the menu's content belongs. That is the screen described from a live session as
+"clearly a menu, no 3D on top", now reproduced without a human and captured.
+
+Sequence now demonstrated, unattended:
+
+```
+t=25..50    black          BIOS + disc load
+t=75        intro cards    "Produced by Sony Interactive Studios America..."
+t=100       title screen   full colour
+t=125       MAIN MENU      background art correct, inner panel black
+t=150..275  blank grey     the screen after the menu selection
+```
+
+### A performance claim caught before it was published
+
+The driven runs end with the instruction counter at ~180-220 million against
+~4.2 billion for an undriven run, which reads as a 20x collapse the moment 3D
+rasterisation starts --- a tidy and completely wrong conclusion.
+
+The counter **resets**. In both driven runs, at heartbeat 57 of 59:
+
+```
+seq run:     4,253,258,101 -> 30,636,406
+pchist run:  4,285,016,511 -> 64,483,328
+```
+
+So the emulator runs to 4.25 billion at full speed, the PS1 core resets, and it
+carries on at full speed. Dividing the post-reset counter by the whole run
+duration produced the phantom slowdown. Rate before the reset is ~14 MIPS,
+unchanged.
+
+That the reset lands at the same point in both runs makes it **deterministic and
+caused by the input script**, not random --- the last presses select something
+that resets the core.
+
+### What is left, stated precisely
+
+| | |
+|---|---|
+| intro logos | render |
+| title screen | renders, full colour |
+| **main menu** | **renders** --- background art correct, inner panel black |
+| intro FMV | still never plays |
+| attract mode | not reached |
+| after the menu | blank grey, then a deterministic core reset |
+
+Two open threads, both narrow. **The black inner panel**: the menu background is
+a blit and arrives; the panel is where content is drawn, and `DrawEdge` is now
+active, so this is a drawing question that can be attacked with the symbol
+buckets. **The deterministic reset**: it is reproducible from a fixed
+`PAD_SCRIPT`, so bisecting the script says which press causes it.
