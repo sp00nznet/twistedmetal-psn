@@ -5572,3 +5572,70 @@ because what is being drawn is a flat pattern.
 That also explains why attract mode never appears: the title is still inside
 movie playback, feeding frames that carry no picture, and it has no reason to
 move on.
+
+### A value watch on the pattern word, and why its answer is not the answer
+
+`FLOW_WVAL=F8000000` catches any 32-bit guest store of the pattern's first word
+and prints the writing function. 208 hits, all of this shape:
+
+```
+[WVAL] write32 0x0076C088 = 0xF8000000
+   r3=7C000000  r23=0076C080  r17/r18=00770780
+   stack: func_001066A8 -> func_001056E4 -> func_000B66E0 -> func_000B3738 -> ...
+```
+
+**Read this carefully before believing it.** `r23 = 0x0076C080` is the R3000
+state block and `0x0076C088` is state+0x08, which is MIPS register **`$v0`**
+(register 2, at `reg*4`). `r3 = 0x7C000000` and the stored value is
+`0xF8000000` --- exactly `r3 << 1`. So these are the interpreter writing the
+result of an ordinary PS1 shift into a register file slot, and `func_001066A8`
+at the top of the stack is the interpreter itself.
+
+They are **not** stores of movie pixels into the command ring. The watch matches
+on *value*, and this value occurs in ordinary PS1 arithmetic. Filtering by value
+cannot find the ring writer; that needs a watch on the ring's *address*, and the
+ring rotates, so it needs the ring base resolved live first
+(`*(TOC-0x7918)` = `*(0x1BC418)`).
+
+What it does add, weakly: the pattern word appears inside R3000 register traffic
+in code reached through `func_000B66E0` / `func_000B3738`, so the PS1 side is
+handling values of this shape rather than the pattern being injected wholesale by
+the PS3 side. Consistent with the game reading MDEC output and getting constants
+back, but not evidence for it.
+
+## Where this port stands, and what the last link needs
+
+The chain from disc to screen is now measured end to end, and every link but one
+is confirmed faithful:
+
+```
+disc -> CD read           works (the FMV streams continuously)
+MDEC output               *** the pattern enters here ***
+PPU builds H2L command    carries the pattern inline at cmd+20
+SPU Host2Local_Body       correct: 24 px/chunk, 48 B DMA, mask test off, x wraps
+DMA to PS1 VRAM           correct: full row coverage measured
+texture bind              correct: single unit, offsets and formats measured
+composite / shaders       correct: screen reconstructed from VRAM bytes exactly
+```
+
+**The last link is MDEC**, the PS1 video decoder, on the PS3 side of the
+emulator. `ps1_netemu` carries no `mdec` string, no `mdec.c` among its embedded
+source filenames, and no symbols for it, so locating it means working from the
+PS1 hardware interface inwards: the MDEC registers at `0x1F801820`/`0x1F801824`
+and DMA channels 0 (MDEC-in) and 1 (MDEC-out), all of which appear in the PS1
+I/O handler map already documented in this file.
+
+That is a piece of work in its own right rather than another measurement, and it
+is the honest boundary of this session.
+
+### What the three goal elements need
+
+| element | state | what it is waiting on |
+|---|---|---|
+| intro videos | frames render and advance; picture degrades to pattern | MDEC output |
+| main menu | **renders**, reproducible unattended via `PAD_SCRIPT` | --- |
+| attract mode | never begins | the title stays inside movie playback because the movie carries no picture, so the same MDEC defect |
+
+Two of the three are reached. The third is blocked by the same single defect as
+the first, which is a better position than "three separate unknowns" --- but it
+is not the goal met, and it should not be written up as if it were.
