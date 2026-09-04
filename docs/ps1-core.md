@@ -4688,3 +4688,46 @@ lives at x >= 640 while columns 0..639 are black": `x >= 640` holds font and
 texture data, and the row coverage above shows `x < 640` being written 207 times
 per block. Which half the display window should be reading is now an open
 question rather than a settled one.
+
+### The renderer is faithful --- proven by reconstruction, not by elimination
+
+The striped screen has now been reproduced **from the VRAM bytes alone**. Taking
+the raw plane dump and sampling exactly what the guest's shader samples --- byte
+`0x3C0` onward, three bytes per output pixel, 320 wide --- reconstructs the
+on-screen picture pixel for pixel: same stripe period, same magenta dots, same
+black band down the left. (Channel order differs from the screen because the
+reconstruction assigns R,G,B directly and the guest's fragment program does its
+own packing; the structure is identical.)
+
+Two further facts from the same phase:
+
+- **The image is static.** Eight window captures taken back to back during the
+  striped phase are byte-identical, so this is not a double-buffer flicker with
+  one good frame and one bad.
+- **It is deterministic.** The same capture sizes recur across independent runs.
+
+So the renderer displays precisely what the guest put in VRAM, at the offset the
+guest asked for. Every remaining explanation on the PS3 side --- format, mip
+level, constants, byte order, surface aliasing, display offset --- is closed.
+The corruption is upstream, in what the PS1 side writes.
+
+### Cherry-picked from the flOw port: a pitch-linear texture has no mip chain
+
+`flow/live-draw` carries two renderer fixes that never reached this branch, and
+one of them describes our symptom almost word for word: flOw's EULA rendered as
+"banded olive stripes with a ghosted second copy of the page" because a
+pitch-linear texture declared 11 mip levels, so the decoder walked
+`off += pitch * mh` through whatever guest memory followed the base image and
+the minified draw sampled that garbage. The fix is `if (linear) n_mips = 1;`,
+and PS1 VRAM here is bound pitch-linear (`fmt 0xE2`/`0xE1` both carry
+`TEX_FMT_LINEAR`).
+
+Applied by hand at both mip-count sites (the cherry-pick conflicted on
+unrelated dump code). **It changed nothing visible** --- the captures are
+byte-identical --- so these textures evidently declare one level already. Kept
+anyway: it is the correct behaviour, it matches the sister port, and it removes
+a real trap for any future pitch-linear texture that does declare a chain. Not
+claimed as a fix for this symptom.
+
+Worth noting for the next lap: `6428a66 rsx: decode R5G5B5A1, and let a decoded
+texture be looked at` is also unmerged on this branch.
