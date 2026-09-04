@@ -3198,3 +3198,29 @@ Number 8 is the first that was **published as an explicit hypothesis and then fa
 purpose**, which is the only reason it lasted one commit instead of becoming load-bearing. The
 two tests that did it are the same shape as `LD_CLEAR_TEST` and `LD_FORCE_GREEN`: make the
 alternative happen and see whether it looks like the data.
+
+### The pattern, characterised exactly
+
+Looking at the PS1's 320x240 display region unstretched, it reads as strictly vertical stripes
+with no vertical structure --- which would have been a very specific bug signature (the
+destination Y being lost, so every write landing on one scanline). Checked before claiming it:
+
+```
+rows 0..239 identical to row 0        : 30 / 240
+rows 260..511 identical to row 300    :  1 / 252     (asset region, for contrast)
+row 0 exact horizontal period         : 24 pixels
+```
+
+So there *is* vertical variation --- only 30 of 240 rows repeat exactly --- and the eye-catching
+uniformity is a **24-pixel horizontal period**, not a single repeated scanline. The asset region
+varies normally, which independently confirms the VRAM read (pitch 2048) is correct.
+
+**What this is:** a 24-pixel-period pattern drawn from a six-entry palette, filling the whole
+320x240 display area, with limited vertical variation. Not a video frame, not a fill, not a lost
+Y coordinate. It looks like a small texture tiled across the framebuffer, or a CLUT lookup that
+collapses a real image onto a few entries at a fixed stride.
+
+**The next area** is the lifted SPU GPU code's texture and CLUT addressing: a 24-pixel period
+and six distinct output colours are what a wrong texture-page or CLUT base produces while the
+rasteriser itself runs correctly --- and the rasteriser demonstrably does run, because the
+framebuffer is the right size, in the right place, fully covered, and updating.
