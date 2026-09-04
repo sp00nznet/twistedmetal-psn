@@ -24,3 +24,6 @@ scratch/
 *.log
 *.obj
 *.map
+
+# LD_HLSL_DUMP writes these into the CWD
+hlsl_*.txt
