@@ -3620,3 +3620,61 @@ Stated as *consistent with* rather than established. Whether ps1_netemu is **sup
 that init, or supposed to intercept `CdReadSector` entirely, is the next thing to determine ---
 and that is a question about the firmware's design, answerable by reading how ps1_netemu handles
 A-table calls, rather than another guess about symptoms.
+
+## RETRACTION: `CdInit` does execute in some runs --- run variance was the real problem
+
+Extending the census to the BIOS call gates produced a result I was not looking for, and it
+retracts the two sections above:
+
+```
+[census] 600000 samples, 86/8192 BIOS buckets ever executed;
+         CdInit: BFC52B80=0 BFC52BC0=1 BFC52C00=0 BFC52C40=0
+         A-gate=0 B-gate=0 C-gate=0 other-low=0
+```
+
+**`BFC52BC0=1`.** That bucket spans `0xBFC52BC0..0xBFC52BFF` and contains:
+
+```
+BFC52BC0  jal  0xbfc58b30      ; OpenEvent (2nd call)
+BFC52BD0  sw   $v0, -0x4de8($at)
+BFC52BE0  jal  0xbfc58b30      ; OpenEvent (3rd call)
+BFC52BF0  sw   $v0, -0x4de4($at)
+```
+
+So `CdInit`'s `OpenEvent` calls and handle stores **do** execute. *"CdInit is never entered,
+measured two ways"* is wrong.
+
+### And the reason is the one I identified early and then kept forgetting
+
+This run reached **86** BIOS buckets; the previous reached **55**, and printed seven census lines
+against this one's single line. The two runs diverge in both how far they get and how much they
+execute.
+
+**Every "never happens" claim in this document was measured on one run, and the runs are not
+equivalent.**
+
+| claim | the run it was measured on |
+|---|---|
+| store watch shows only memset writes | a 55-bucket run, which plausibly never reached `CdInit` |
+| all four/five handle slots are zero | a different run, read at a fixed heartbeat |
+| `CdInit`'s buckets are never set | a third run |
+
+None of them is wrong *about the run it observed*. All of them were written up as properties of
+the port.
+
+### The honest state, narrower than claimed
+
+In at least some runs `CdInit` partially executes, and whether the CD handles end up valid is
+**run-dependent**. Establishing anything further requires capturing the census, the handle read
+and the store watch **in the same run** --- which is exactly the discipline that fixed the
+VRAM-versus-surface comparison earlier in this document, and which I did not carry forward to
+this question.
+
+### Why this one matters more than the others
+
+Sixth correction this session, and the only one whose cause is **general rather than local**:
+single-run absence claims are not sound in this port. The variance was documented in these notes
+*before* I started relying on single runs anyway.
+
+Anyone continuing here should treat every unqualified "never" above as "not in the run I
+sampled", and re-measure with all probes in one run before building on it.
