@@ -5349,3 +5349,45 @@ embedded source filenames, so the decoder lives inside one of the modules that d
 have names (`gpuio.cc` being the obvious candidate) or in code with no
 diagnostics at all. Finding it is the next job; the signature to look for is
 whoever fills the staging buffer that `Host2Local_Body` reads.
+
+### The blit is a read-modify-write whose merge contributes nothing
+
+`Host2Local_Body` computes its buffer address as
+`0x1D580 + (LS[0x24230] << 12)`, and the transfers measured earlier used
+`lsa=0x1D5B0 / 0x1D760 / 0x1D780` --- all in that range. Watching every DMA that
+touches LS `0x1D580` (`SPU_WATCHLSA=1D580`) shows what it is:
+
+```
+cmd=0x40 (GET) ea=0x4063C000    cmd=0x20 (PUT) ea=0x4066E000
+cmd=0x40 (GET) ea=0x40670000    cmd=0x20 (PUT) ea=0x40646000
+...
+```
+
+**VRAM addresses on both sides.** So LS `0x1D580` is a *destination read-back*
+buffer, not the pixel source: the SPU reads VRAM into it, merges, and writes it
+back. (spu4's entries at `ea=0x60000000` in the same watch are the audio ring ---
+a different module sharing the LS offset, and a reminder to filter by SPU.)
+
+Which explains a pairing this document noticed early and dismissed as
+"rasteriser granularity":
+
+```
+spu0 cmd=0x40 GET ea=0x40632030 size=48   -- read destination
+spu0 cmd=0x20 PUT ea=0x40632030 size=48   -- write it back
+     value at the watched word: unchanged
+```
+
+Put beside the row coverage --- hundreds of writes per 64-byte block while the
+bytes stay the same pattern --- these two say the same thing from different
+angles: **the writes are writing the old bytes back.** The read-modify-write
+runs, and for most of the row the merge contributes nothing.
+
+So the pattern in VRAM is not something being *written*; it is pre-existing
+content that never gets replaced. That is a better-supported statement than the
+previous section's "the source data is two-thirds pattern", and it narrows the
+question usefully: not "who writes the pattern" but **"why does the merge keep
+the destination for two thirds of each row"** --- a mask, a coverage test, or a
+source pointer that is short.
+
+Two independent measurements support it (unchanged RMW values; static content
+under hundreds of writes), which is worth more than either alone.
