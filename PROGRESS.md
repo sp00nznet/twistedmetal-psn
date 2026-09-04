@@ -6463,3 +6463,60 @@ The specific question to answer first: does the MDEC0 path accumulate a full
 block and run an IDCT, or does it return a constant/placeholder? A repeating
 two-pixel output is what a colour conversion fed constant coefficients would
 produce, so the DC-coefficient handling in `0xE9AD4` is the place to start.
+
+### The MDEC0 path is event-driven --- and it uses the scheduler read at the top of this file
+
+Disassembling the MDEC0 branch of `func_000E9A18`:
+
+```
+000E9AD4  lwz    r6, -0x7bc8(r2)        ; MDEC state struct
+000E9ADC  lwz    r0, 0x810(r6)          ; status word
+000E9AE0  rlwinm r0, r0, 0, 1, 1        ; isolate bit 30 (0x40000000)
+000E9AE8  beq    cr7, 0xe9c6c           ; clear -> other path
+000E9AEC  lwz    r7, 0x82c(r6)          ; an event node pointer
+000E9AF0  lwz    r30, 0x814(r6)
+000E9AF8  beq    cr7, 0xe9d24           ; null -> skip
+000E9B00  lwz    r29, -0x7b80(r2)
+000E9B04  stw    r3, 0x82c(r6)
+000E9B08  lwz    r8, 4(r10)             ; ---- unlink r7 from its list ----
+000E9B0C  lwz    r0, 0(r10)
+000E9B18  stw    r0, 0(r11)
+000E9B20  stw    r8, 4(r9)
+000E9B24  lwz    r11, 0x544(r29)        ; ---- re-insert at the list tail ----
+000E9B2C  stw    r11, 4(r10)
+000E9B34  stw    r0, 0(r10)
+000E9B3C  stw    r7, 0(r9)
+000E9B40  stw    r7, 4(r11)
+000E9B44  lwz    r7, 0x830(r6)          ; a SECOND node, identical treatment
+```
+
+`r29 = *(TOC-0x7B80)` and the list it links onto is at **`+0x544`**. The R3000
+event list head is at **`state+0x540`**, and `+0x544` is its tail pointer ---
+exactly the structure decoded from `func_00105FA8` at the very top of this
+document, with nodes shaped
+
+```
++0x00 next   +0x04 prev   +0x08 due time   +0x0C callback OPD   +0x10 arg
+```
+
+So **MDEC register writes schedule R3000 events**: the handler takes two
+preallocated nodes from its own state (`+0x82C` and `+0x830`), unlinks each from
+wherever it sits, and appends it to the scheduler's queue. Those are the MDEC
+completion / DMA-interrupt events, and they are dispatched by the same
+`func_00105FA8` loop whose `bctrl` at `0x106050` fires event callbacks --- the
+loop that the GETLLAR deadlock fixed at the start of this session was found
+inside.
+
+That is a useful connection rather than a coincidence: the MDEC data path,
+the event scheduler, and the callback that spins on spu4 are all one mechanism,
+and this port already has the scheduler read instruction by instruction and the
+node layout confirmed by live dumps.
+
+**Where that leaves the next attempt.** `func_000E9A18` handles MDEC0 by
+scheduling events; the actual coefficient consumption and IDCT must therefore
+live either in the callback those nodes point at (`+0x0C` of each node, readable
+live from `state+0x540` with the console) or behind the `0xE9C6C` / `0xE9D24`
+branches taken when the status bit or a node pointer is clear. Dumping the two
+nodes at MDEC-state `+0x82C` and `+0x830` names their callbacks outright, and
+the machinery to do it --- `PS3_DEBUG`'s `mem`, plus the node layout --- is
+already in place and used elsewhere in this file.
