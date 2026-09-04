@@ -170,6 +170,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | R3000 starts executing | ✅ Done — the opcode dispatch table was never lifted; see below |
 | Emulator front-end renders | ✅ Done — `DRAW_ARRAYS` at 720x512, shaders compiled, ~205 fps |
 | R3000 executes the BIOS | ✅ Done — reset vector → `0xBFC4B844` by 10,000 instructions |
+| **PS1 leaves the BIOS, runs game code** | ✅ **Done** — live pc moves to main RAM `0x30000..0x3E000` and keeps advancing |
+| PS1 I/O handler map complete | ✅ Done — all 12 windows registered, including every DMA channel |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, user-command handler reached |
 | R3000 runs continuously | 🟨 Partly — **1.1 billion instructions (~14 MIPS)** in a good run; some runs wedge early |
 | Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |

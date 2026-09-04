@@ -3400,3 +3400,72 @@ producer (`func_0010F658` is called from `0x10C5F0` and `0x10CA4C`, both inside
 
 **Which puts the whole remaining question in one place:** does the R3000 store to `0x1F801810`,
 and if it does, why does the I/O dispatch (`func_000C26E4`) not reach `func_0010C48C`?
+
+## The PS1 is running game code in main RAM, and the I/O map is complete
+
+Two things established, and one of my own suspicions killed.
+
+### The R3000's live program counter
+
+The state block's pc at `+0x108` is useless --- the interpreter loads it on entry and writes it
+back only in its epilogue, and it never returns. It keeps the live pc in **r26**, and it calls
+`sys_ppu_thread_yield` from inside its own loop millions of times, so the guest context arriving
+at that syscall carries r26 for free (`PS1_R3000_PC=1`):
+
+```
+ 20000 yields:  0x80037000 38.7%   0xBFC58000 38.4%   0x001A4000 15.2%
+200000 yields:  0x80037000 33.4%   0x00037000 29.2%   0x00001000 11.7%
+400000 yields:  0x0003E000 33.2%   0x00001000  4.6%   0x00000000  3.0%
+```
+
+**The BIOS region disappears after the first report.** `0xBFCxxxxx` is BIOS ROM; from the second
+report on it is all main RAM --- `0x00030000..0x0003E000`, the kernel/exception area at
+`0x0000..0x1000`, and `0x80037000`, the KSEG0 mirror of `0x00037000`. The hot bucket also
+*moves* between reports.
+
+So the PS1 has left the BIOS, is executing code loaded into main RAM, and is **progressing
+rather than spinning**. That kills two readings that were live in this document: *"the BIOS gets
+stuck after the logo"* and *"the R3000's billion instructions are a wait loop"*.
+
+### And the I/O registration map is complete
+
+With no drawing commands reaching the ring, the obvious guess was that PS1 games send display
+lists by **DMA** rather than by GP0 stores, and that the GPU DMA channel had no handler.
+Scanning for inline `lis 0x1f80 / ori` immediates found no `0x10A0` --- which looked like
+confirmation.
+
+**Wrong instrument, and the same mistake yet again: an absent immediate is not an absent
+registration.** Enumerating the actual callers of the I/O registrar `func_000C23E0` and reading
+each base and size gives the real map:
+
+| base | size | covers |
+|---|---|---|
+| `0x1F801040` | `0x10` | pad |
+| `0x1F801050` | `0x10` | SIO |
+| `0x1F801070` | `0x10` | I_STAT / I_MASK |
+| **`0x1F801080`** | **`0x80`** | **all DMA channels + DPCR + DICR** |
+| `0x1F8010B0` | `0x10` | DMA3 again (narrower, redundant) |
+| `0x1F801100` / `0x1F801110` / `0x1F801120` | `0x10` | timers 0, 1, 2 |
+| `0x1F801800` | `0x10` | CD-ROM |
+| `0x1F801810` | `0x10` | GP0 **and GP1** |
+| `0x1F801820` | `0x10` | MDEC |
+| `0x1F801C00` | `0x400` | SPU |
+
+`0x1F801080` with size `0x80` spans `0x1080..0x10FF` --- **every** DMA channel including DMA2
+(GPU) at `0x10A0`, plus DPCR and DICR. GP0's 16-byte window likewise covers GP1 at `0x1814`.
+Nothing is missing.
+
+### So where it stands
+
+The PS1 runs game code. Every I/O window has a handler. And still only type-8 sync packets reach
+the GP0 ring.
+
+Two possibilities remain:
+
+1. **the program has not reached its drawing code yet** --- still loading, which the progression
+   `0xBFC58000` -> `0x00037000` -> `0x0003E000` is consistent with
+2. **the I/O dispatch inside `func_000C26E4` does not find these registrations** --- the
+   registrations are proven present, so this would be a lookup or range-check fault
+
+Rule out (1) first, because it is cheap: watch whether the hot pc bucket keeps moving over a
+longer run, or settles. Only then read the dispatch.
