@@ -3059,3 +3059,74 @@ establishing that the measurement could have seen the alternative.**
 Two of the seven (6 and 7) were caused by the probe itself. The rule that catches all of them,
 and the reason `LD_CLEAR_TEST` and `LD_FORCE_GREEN` exist: **before concluding "X never
 happens", make X happen on purpose and check the probe reports it.**
+
+## Located: the display framebuffer holds 24-bit data read as 15-bit
+
+The composite shader was the prime suspect and is innocent. `hlsl_06` --- the only fragment
+program that samples the 1024-wide PS1 VRAM texture --- looked like an arithmetic bit-unpacker:
+
+```
+r0 = sample(tex0, tc0 * (1/1024, 1/512))
+r0 = r0 * fp_constants[0].x + fp_constants[0].y
+r0 = floor(r0) / 8.0
+r0 = sign-preserving truncate
+r0 = r0 * fp_constants[1].x + fp_constants[1].y
+```
+
+The constants say otherwise:
+
+```
+[uvdbg] fp_const count=2 mode=B c0=(255.0 0.5 0 0) c1=(0.031373 -0.001961 0 0)
+```
+
+`0.031373` is `8/255` and `-0.001961` is `-0.5/255`, so per channel it computes
+`trunc(floor(v*255 + 0.5)/8) * 8/255 - 0.5/255` --- an 8-bit channel rounded to **5 bits**. It
+is a **colour-depth quantiser**, reducing the upscaled output to PS1 15-bit colour, and it
+reproduces faithfully whatever it samples.
+
+So the entire PS3 side is now verified correct, and what it samples really does contain the
+pattern.
+
+### The two halves of PS1 VRAM
+
+Counting the dump at 186,988 non-zero words:
+
+| region | non-zero | content |
+|---|---|---|
+| rows 0..245 (display area) | 157,800 | a regular stripe pattern |
+| rows 246..511 (asset area) | 145,625 | **recognisable** --- car sprites, vehicle art, title letters |
+
+The asset half is plainly correct PS1 texture data. The display half is a stripe with a
+**three-pixel period**:
+
+```
+(0,57,197) (0,0,0) (246,0,0) (0,57,197) (0,0,0) (246,0,0) ...
+```
+
+A three-pixel period is the signature of **24-bit data read as 16-bit**: 6 bytes is 2 source
+pixels and 3 destination pixels. The PS1's 24-bit display mode is its **MDEC / FMV path** ---
+which is exactly the intro video this port is trying to reach.
+
+### The reading, and what is actually measured
+
+**Best-supported hypothesis:** the intro video is playing, into a 24-bit framebuffer, and
+everything downstream of it treats that memory as 15-bit.
+
+**What is measured**, and separated from the hypothesis on purpose:
+
+* the three-pixel period, and the exact repeating triple
+* the two VRAM regions and their non-zero counts
+* that the asset half decodes to recognisable game art
+* that the composite shader and its two constants are correct
+* that the draws reach the GPU and cover the surface (`LD_FORCE_GREEN`)
+* that the readback can see non-black pixels when there are any (`LD_CLEAR_TEST`)
+
+### Where that leaves the port
+
+Everything from the R3000 through the GPU SPUs, PS1 VRAM, the texture upload, the composite
+shader, the draws and the presented surface is verified working. The remaining gap is a
+**display-mode** one: 24-bit PS1 output needs unpacking three bytes per pixel rather than two,
+and nothing in this path does that yet.
+
+That is a well-bounded piece of work, and it is the last thing between here and a visible intro
+video.

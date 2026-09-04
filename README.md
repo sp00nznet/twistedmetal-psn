@@ -178,7 +178,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | **PS1 renders (BIOS boot screen in VRAM)** | ✅ **Done** — dumped and read: PlayStation logo + SCEA licence text |
 | **PS1 game runs and loads its art** | ✅ **Done** — VRAM holds Twisted Metal car sprites and title letters |
 | **Renderer produces a picture** | ✅ **Done** — 89% of the presented 1280x720 surface is drawn |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — the composite samples the wrong VRAM region (asset data, not the display buffer) |
+| Whole PS3-side render path verified | ✅ Done — draws, shader, constants, upload, readback all correct |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — PS1 24-bit display mode: the framebuffer holds 3-byte pixels, read as 2 |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
