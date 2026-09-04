@@ -2924,3 +2924,65 @@ Does the R3000 write GP0 (`0x1F801810`) at all, and if it does, why does `func_0
 turn that into type-2/3 packets? `func_000C26E4` is the PS1 I/O write handler and is the place
 to look. This is the same shape of question as the semaphore and the user command --- each of
 which turned out to be exactly one missing link.
+
+### Confirmed from the other side: the SPUs are idle, not stalled
+
+`PS3_SAMPLE=5`, independent of the ring contents:
+
+```
+[samp] --- report at t=4000ms ---
+[samp] 1597 samples, 70 in guest code (4.4%)
+[samp]    41.4%  spu_LS_00001268  (29)
+[samp]    21.4%  spu_LS_00000100  (15)
+[samp]     7.1%  spu_LS_00001290  (5)
+```
+
+`spu_LS_00001268` and `spu_LS_00001290` are the two halves of the GPU SPUs' steady-state poll
+loop --- the one comparing its own local store at `0x15010` against the last ring offset it
+consumed. Nearly half of all guest time is spent there.
+
+So the SPUs are **idle, not stalled**. Not blocked on a channel, not waiting on a DMA, not stuck
+mid-rasterisation: round the "is there new work?" loop, find a sync packet, round again. Two
+independent measurements now agree --- the ring contents (type 8 only) and where the time goes.
+
+*(The profiler's exact mode is blind here --- `pdata self-check: func_000C2368 -> NO .pdata
+entry` --- so these are nearest-symbol attributions over a merged PPU+SPU map. Sound for SPU
+local-store addresses, which are dense and unambiguous. `func_00013040` at 8.6% in the same
+report is a mis-attribution to a one-instruction function and should be ignored; that heuristic
+already misled this port once.)*
+
+### The ten ring producers, and which one runs
+
+Scanning for every load of the ring-offset pointer (`TOC-0x794C`, displacement `0x86B4`) finds
+ten producer functions. Their packet types:
+
+| producer | type | runs? |
+|---|---|---|
+| `func_0010F83C` | 1 | no |
+| `func_0010F6E0` | 2 | no |
+| `func_0010F658` | 3 | no --- the GP0 drawing path |
+| `func_0010F7D0` | 4 | no |
+| `func_0010F768` | 7 | no |
+| **`func_0010F5FC`** | **8** | **yes --- the only one** |
+| `func_0010F390` | 0xB | no |
+
+`func_0010F5FC` has exactly one caller, `0x0010B23C`, and writes `r3` to `+0x10` --- which is
+precisely the packet shape observed (`type=8`, one payload word alternating 0/1, rest zero).
+
+And the GP0 registration is present and correct. At `0x108518`:
+
+```
+00108518  lwz  r6, -0x79bc(r2)     ; the GP0 handler OPD (func_0010C48C)
+00108520  lwz  r5, -0x79c0(r2)
+00108524  lis  r3, 0x1f80
+0010852C  ori  r3, r3, 0x1810      ; 0x1F801810 -- GP0
+00108534  li   r4, 0x10            ; a 16-byte window
+0010853C  bl   0xc23e0             ; register it
+```
+
+So the handler is registered for GP0 with a 16-byte window, and it is wired to the type-3
+producer (`func_0010F658` is called from `0x10C5F0` and `0x10CA4C`, both inside
+`func_0010C48C`). The registration is fine; the handler simply never fires.
+
+**Which puts the whole remaining question in one place:** does the R3000 store to `0x1F801810`,
+and if it does, why does the I/O dispatch (`func_000C26E4`) not reach `func_0010C48C`?
