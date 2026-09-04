@@ -3428,3 +3428,44 @@ DMA registers are already mapped (`0x1F801080 +0x80` covers every channel plus D
 Being explicit that this supersedes my own framing twice over: the CD events are a red herring
 for the actual stall, and the "`CdInit` never runs" finding --- while correct --- describes a
 routine nobody is currently waiting for.
+
+### CORRECTION: class `0xF0000009` is the SPU interrupt, not `HwDMAC`
+
+The section above called the one open event `HwDMAC`, from memory of the PS1 event-class list.
+Wrong --- and it did not need to be a guess, because the BIOS's own interrupt dispatcher states
+the mapping. At `0xBFC046A0` it reads I_STAT and I_MASK (`$a2` = `0x1F801070`, +0 and +4), ANDs
+them, and tests bits:
+
+```
+andi $t9, $t8, 4      ; I_STAT bit 2  (CDROM) -> ori $a0,$a0,3     class 3
+andi $t3, $t2, 0x200  ; I_STAT bit 9  (SPU)   -> ori $a0,$a0,9     class 9
+andi $t7, $t6, 2      ; I_STAT bit 1  (GPU)   -> ori $a0,$a0,2     class 2
+andi $t1, $t0, 0x400  ; I_STAT bit 10 (PIO)   -> ori $a0,$a0,0xa   class A
+```
+
+Bit 2 mapping to class 3 independently confirms the earlier CD identification, since the CD
+event registration used class `0xF0000003`.
+
+PS1 I_STAT bit 9 is the **SPU interrupt**. So the single open, enabled, polled event this title
+waits on is the **SPU interrupt event** --- not DMA.
+
+Each dispatch site delivers with `$a1 = 0x1000` (`jal 0xb0001b28` is `DeliverEvent`, in the
+kernel image at RAM `0x1B28`), while the open event's spec is `0x20`. Whether that is a genuine
+mismatch or a second delivery site is **not established**, and is flagged rather than asserted.
+
+### The target, again on something checkable
+
+Does the SPU emulation ever raise I_STAT bit 9? The SPU register window is registered
+(`0x1F801C00 +0x400`) and the BIOS clearly installs a handler for the interrupt. If bit 9 is
+never set, an `EvMdNOINTR` waiter on class 9 polls forever --- the observed shape.
+
+### Three guesses in a row, all corrected by reading the image
+
+| I guessed | the image said |
+|---|---|
+| the framebuffer holds 24-bit data | six palette entries; reading as 24-bit shows no image |
+| the stalled waiter is the CD driver | the only open event is not a CD event |
+| class `0xF0000009` is `HwDMAC` | the BIOS dispatcher maps it to I_STAT bit 9 = SPU |
+
+Each took a single disassembly to settle, and each had been stated from recall instead. That is
+the cheapest lesson available in this port and it took three repeats to land.

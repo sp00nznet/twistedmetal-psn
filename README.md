@@ -182,7 +182,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | **Renderer produces a picture** | ✅ **Done** — 89% of the presented 1280x720 surface is drawn |
 | Whole PS3-side render path verified | ✅ Done — draws, shader, constants, upload, readback all correct |
 | PS1 display framebuffer placed correctly | ✅ Done — 320x240 block, native resolution, right position |
-| Intro video → menu → attract mode | ⬜ **ROOT CAUSE** — the PS1 waits on an open `HwDMAC` event that is never delivered |
+| Intro video → menu → attract mode | ⬜ **ROOT CAUSE** — the PS1 waits on the SPU-interrupt event (class 9 = I_STAT bit 9); never delivered |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
