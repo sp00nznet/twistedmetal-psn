@@ -6276,3 +6276,89 @@ Watching `$a0` across iterations would say immediately whether the bitstream is
 advancing. `PS1_R3000_PC`'s register dump already prints every GPR; it just needs
 to be sampled inside this loop specifically rather than at yields, which is a
 gate on `pc` in the range `0x80164F00..0x80165000`.
+
+## THE BOUNDARY, FOUND: the R3000 feeds MDEC correctly and MDEC returns a pattern
+
+Two measurements close this out, and they also correct the two commits before
+them.
+
+### The decode loop is not stuck, and not broken
+
+`PS1_LOOPWATCH=80164F00` samples the R3000 register file only when the pc is
+inside that 256-byte window:
+
+```
+n=1  pc=0x80164FDC a0=E9C48800 a1=801DFFB4 a3=8018C61C
+n=2  pc=0x80164F90 a0=33409800 a1=801E012E a3=80180A9C
+n=3  pc=0x80164FB0 a0=553F7600 a1=801E0402 a3=80182774
+...
+n=340000 pc=0x80164F28 a0=32F33900 a1=801D16BA a3=8017D714
+```
+
+`$a0` --- the packed bitstream word the `srl 19` / `srl 22` extractions read ---
+**changes on every sample**. `$a1`, the output cursor, advances. `$a3` varies per
+code, so it is a per-entry table pointer rather than a fixed base.
+
+So the loop is **consuming a real bitstream and producing output**, continuously.
+It is not an infinite loop and it is not waiting: both of the previous two
+sections' framings were wrong, and for the same reason each time --- a loop that
+runs forever looks identical to a loop that is stuck unless you watch its inputs
+change.
+
+### And its output is well-formed MDEC input
+
+The output lands around PS1 `0x801E0400` = guest `0x00950B82`. Read live during
+playback:
+
+```
+0x00950B80  02 04 01 00 02 04 FE 03 FB 07 01 00 01 00 01 00
+0x00950BB0  00 FE 10 1B FE 03 01 00 FD 03 FF 03 FF 03 FF 03
+0x00951010  FF 37 00 FE 18 10 01 00 FF 03 01 00 FF 17 00 FE
+0x00951020  ED 13 FF 03 FF 03 FF 03 FF 1B 00 FE 5B 12 FF 07
+```
+
+`00 FE` little-endian is **`0xFE00` --- the MDEC end-of-block code** --- and it
+recurs throughout, separating runs of 16-bit values. That is exactly the shape of
+an MDEC input stream: run/level coefficient pairs, one `0xFE00` per block.
+
+**So this loop is the software Huffman/RLE stage that produces MDEC *input*, not
+MDEC output.** The PS1 pipeline is:
+
+```
+disc -> STR bitstream -> [R3000 software Huffman]  -> coefficient blocks
+     -> [MDEC: IDCT + YUV->RGB]                    -> 24-bit pixels
+     -> [blit to VRAM] -> display
+```
+
+and the measurement above verifies the **first** stage: the R3000 emits
+well-formed blocks with correct terminators, continuously.
+
+### Which places the defect exactly, with the input verified
+
+Everything downstream of MDEC was already measured correct in earlier sections
+--- the blit (read as code), the DMA, VRAM coverage, the texture bind, the
+composite (reconstructed pixel-for-pixel). Now the stage **upstream** of MDEC is
+verified correct too.
+
+**The defect is MDEC itself** --- the IDCT and YUV-to-RGB stage --- which is
+emulated on the PS3 side. It is handed valid coefficient blocks and returns a
+two-pixel repeating pattern. That is why the FMV has no picture, and why the
+title never leaves playback.
+
+This is the same conclusion reached several sections ago by elimination, but it
+now rests on a positive measurement of MDEC's input rather than on having ruled
+out everything else. The two are worth different amounts.
+
+### For whoever picks this up
+
+`ps1_netemu` has no `mdec` string, no `mdec.c` among its embedded source
+filenames and no symbol for it, so it must be found from the hardware interface
+inwards. The handles now available:
+
+- the coefficient stream is at PS1 `0x801E0000`-ish (guest `0x00950780`-ish) and
+  is verifiably correct, so it can be used as a known-good input
+- MDEC control and data registers are PS1 `0x1F801820` / `0x1F801824`
+- MDEC-in is DMA channel 0, MDEC-out is DMA channel 1, both already in the PS1
+  I/O handler map recorded earlier in this file
+- `PPU_RWATCH` on the coefficient buffer names the PPC function that reads it ---
+  which *is* the MDEC front end, whatever it is called
