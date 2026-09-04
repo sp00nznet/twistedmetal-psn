@@ -3288,3 +3288,53 @@ The gap is now specific and upstream of everything the previous sections were in
 question is what their handshake is waiting for before it starts producing --- the same shape of
 question as the semaphore and the user command, both of which turned out to be one missing link
 each.
+
+## ROOT CAUSE: the GP0 ring carries only sync packets
+
+Why the four GPU SPUs consume every packet and emit no pixels: **there is nothing to draw.**
+
+`PS1_RINGDUMP=1` prints the last few packets. Every one is the same shape:
+
+```
+[ring] pkt@0x00D71480 type=8: 00000000 00000000 00000000 ... (11 more zeros)
+[ring] pkt@0x00D71580 type=8: 00000001 00000000 00000000 ... (11 more zeros)
+[ring] pkt@0x00D71680 type=8: 00000000 00000000 00000000 ... (11 more zeros)
+```
+
+Type 8, one payload word alternating 0/1, everything else zero. That is a vblank or
+field/buffer-index toggle --- a **sync** packet. No geometry, no colours, no texture
+coordinates, no GP0 opcodes.
+
+### It identifies the producer by elimination
+
+`func_0010F658` writes **type 3** (at `0x10F658`) and **type 2** (its variant at `0x10F6E0`).
+Those are the drawing paths, reached from the PS1 GP0 handler `func_0010C48C` at `0x10C5F0` and
+`0x10CA4C`. **Neither type appears in the ring.** A third producer emits type 8, and the drawing
+producers never run.
+
+### The chain, reduced
+
+```
+the R3000 executes 1.1 billion instructions at ~14 MIPS
+  -> its GP0 writes never reach the emulated GPU
+     -> only type-8 sync packets enter the ring
+        -> the GPU SPUs consume them, exchange handshakes, and rasterise nothing
+           -> PS1 VRAM's display region never receives an image
+              -> the composite faithfully draws whatever is there instead
+```
+
+Everything downstream of the first arrow is verified: the ring advances, the SPUs consume in
+step, the texture uploads, the composite shader and its two constants are correct, the draws
+cover the surface, and the readback sees them.
+
+This also finally disposes of the 24-pixel-period six-colour pattern. With no drawing commands,
+nothing the GPU cores do can put an image in the display region --- so that pattern belongs to
+some other path entirely and was never worth decoding. Three sections of this document spent
+effort on it.
+
+### Next
+
+Does the R3000 write GP0 (`0x1F801810`) at all, and if it does, why does `func_0010C48C` not
+turn that into type-2/3 packets? `func_000C26E4` is the PS1 I/O write handler and is the place
+to look. This is the same shape of question as the semaphore and the user command --- each of
+which turned out to be exactly one missing link.
