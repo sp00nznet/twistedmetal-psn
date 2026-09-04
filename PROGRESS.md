@@ -6227,3 +6227,52 @@ Recorded as a correction rather than an edit, because the wait framing was
 published one section above and someone reading forward should see why it was
 wrong: disc reads stopping means no new data is arriving, which is equally
 consistent with a decoder chewing on data it already has.
+
+### The decoder is table-driven, and its table is intact
+
+`$a3 = 0x8017E47C` is the pointer the hot loop reads (`lhu $v0, 4($a3)`), and it
+does **not** advance inside the loop --- so it is a table base, not a bitstream
+cursor. PS1 `0x8017E47C` maps to guest `0x00770780 + 0x17E47C` =
+**`0x008EEBFC`**, read live over the `PS3_DEBUG` console during playback:
+
+```
+0x008EEBFC  0A 00 FF 1B 01 00 00 00   0C 00 FF 1B 01 00 00 FE
+0x008EEC0C  0C 00 FF 1B 01 00 00 FE   0D 00 FF 1B 01 00 01 00
+0x008EEC1C  0D 00 FF 1B 01 00 FF 03   0A 00 FF 1B FF 03 00 00
+...
+0x008EEC6C  0D 00 02 04 1F 7C 00 00   07 00 02 04 00 00 00 00
+```
+
+Eight-byte records, little-endian, of the shape
+`(u16 length, u16 mask, u16 a, u16 b)`:
+
+```
+(0x000A, 0x1BFF, 0x0001, 0x0000)     length 10
+(0x000C, 0x1BFF, 0x0001, 0xFE00)     length 12  <- 0xFE00 present
+(0x000D, 0x1BFF, 0x0001, 0x03FF)     length 13
+(0x000D, 0x0402, 0x7C1F, 0x0000)     length 13  <- 0x7C1F present
+```
+
+First fields of 10, 12, 13 with bit masks are **Huffman code lengths** --- this is
+a table-driven variable-length decoder, which is what the `srl $a0, 19` and
+`srl $a0, 22` bit-field extractions in the loop are feeding.
+
+**And both terminators the loop tests for are present in the table**: `0xFE00`
+(MDEC end-of-block) and `0x7C1F` (the magenta key). So "the decoder never finds
+its terminator because the table lacks it" --- the natural next guess after the
+previous section --- is **dead**. The table is intact and contains exactly the
+values the loop compares against.
+
+That closes the fifth explanation for this defect in as many sections. What
+remains unexplained is narrow and precise: a table-driven Huffman decoder, with a
+valid table containing valid terminators, that nonetheless emits a repeating
+two-pixel pattern and does not terminate. The remaining candidates are the
+**bitstream it is reading** (wrong, empty, or not advancing) and the **bit-field
+extraction** feeding the table lookup --- and the loop's own registers are the
+place to look: `$a0` is the packed word being shifted, `$s2 = 0x007FFFFF` a
+23-bit mask, `$a1` the output cursor at `0x801E6AFC`.
+
+Watching `$a0` across iterations would say immediately whether the bitstream is
+advancing. `PS1_R3000_PC`'s register dump already prints every GPR; it just needs
+to be sampled inside this loop specifically rather than at yields, which is a
+gate on `pc` in the range `0x80164F00..0x80165000`.
