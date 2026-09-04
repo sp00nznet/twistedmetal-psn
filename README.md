@@ -176,7 +176,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | R3000 runs continuously | 🟨 Partly — **1.1 billion instructions (~14 MIPS)** in a good run; some runs wedge early |
 | Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |
 | RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
-| PS1 GPU handoff (PPU → 4 SPUs) | 🟨 Partly — **21,206 packets consumed**, but the SPUs emit no pixels |
+| PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — packets consumed **and rasterised**; the intro renders from PS1 VRAM |
 | **PS1 renders (BIOS boot screen in VRAM)** | ✅ **Done** — dumped and read: PlayStation logo + SCEA licence text |
 | **PS1 game runs and loads its art** | ✅ **Done** — VRAM holds Twisted Metal car sprites and title letters |
 | **Renderer produces a picture** | ✅ **Done** — 89% of the presented 1280x720 surface is drawn |
@@ -185,9 +185,12 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | PS1 CD events opened correctly | ✅ Done — `CdInit` runs; handles `F1000007..F100000B` all valid |
 | PS1 CD interrupt raised + unmasked | ✅ Done — `I_STAT_or=0x0D`, `I_MASK_or=0x0D` (bits 0,2,3) |
 | Init ordering deterministic | ✅ Done — 15 markers, identical sequence in 3 runs; no init race |
-| **Bug 1**: early hard stall | ⬜ 1 run in 3 — **root cause**: an always-due event; `func_00105FA8` loops firing it and never returns |
-| **Bug 2**: CD wait (healthy runs) | ⬜ 5 `HwCdRom` events never leave `EvStACTIVE`; the game never resumes |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — by both; fix Bug 1 first (a third of measurements come from a dead process) |
+| **Bug 1**: PPU/SPU deadlock | ⬜ **Both sides measured** — PPU waits for spu4 to consume item N; spu4 holds a reservation on the line and waits for it to change again |
+| **Bug 2**: CD wait | 🔁 **Withdrawn** — the CD loop is left; the census that supported this no longer reproduces |
+| Intro logos render | ✅ **Done** — both Sony title cards, photographed at t=75s and t=90s |
+| Main menu renders and responds | ✅ **Done** — navigable from the keyboard; Enter advances several screens |
+| Intro FMV plays | ⬜ Missing entirely — no video at any point |
+| 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not; deeper screens go black |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

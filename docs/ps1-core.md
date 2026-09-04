@@ -4217,3 +4217,188 @@ code:
 The list head is at `state+0x540`. Dumping the head node's due time and callback OPD on a caught
 stall names the culprit outright, and the OPD maps straight to a function through the existing
 lookup.
+
+## IT BOOTS TO A PLAYABLE MENU --- and Bug 1 is a PPU/SPU deadlock, not an event
+
+Two things changed at once: the port got a lot further than these notes said,
+and the stall that hides behind it is now measured on both sides.
+
+### What it actually does now
+
+Screenshots taken from the running window (`tools/shotseq.sh`, 15 s apart):
+
+```
+t=15..60s   black --- the BIOS and the disc load
+t=75s       "Produced by Sony Interactive Studios America.
+             Published by Sony Computer Entertainment America."
+t=90s       "Interactive Entertainment / Developed by..."
+```
+
+The emulated R3000 runs at roughly 14 MIPS against the PS1's 33, so the intro
+arrives at about 0.4x wall speed. Everything that sampled the window earlier
+than ~70 s saw black and concluded, wrongly, that nothing rendered.
+
+Driven live from the keyboard, it goes considerably further than that: **the
+intro logos play, the main menu appears and is navigable, and Enter advances
+through several screens** before the picture goes black where a 3D scene should
+be. No intro FMV plays at any point. So the shape of what is left is:
+
+```
+intro logos        WORKS
+intro FMV          MISSING entirely
+main menu (2D)     WORKS, and responds to input
+3D on top of it    MISSING
+deeper screens     advance, then go black
+```
+
+That is three separate problems, and only the first was in these notes.
+
+### Bug 1, measured on both sides
+
+**Retraction first.** The previous section says `func_00105FA8` loops forever
+firing an always-due event. It does not. The scheduler fires the event ONCE and
+the event's *callback* never returns. Every symptom attributed to the loop ---
+total frozen, millions of yields, one opcode --- is produced by the callback.
+The disassembly in that section is right; the conclusion is not. That makes
+three published-then-retracted claims about this one bug.
+
+The callback is `func_000D2298` (`ctr` = `0x000D2298` on every caught stall, and
+`lr` = `0x00106824` is the scheduler's own return address --- the two fit
+together only this way), and it spins:
+
+```
+000D22C0  lwz  r31, 0(r30)      ; r30 = *(TOC-0x7D4C) = 0x002DEF80
+000D22C4  lwz  r0,  0x88(r30)
+000D22D8  beq  cr7, 0xd22f4     ; equal -> done waiting
+000D22E4  sc   (43 = yield)
+000D22F0  bne  cr7, 0xd22e0     ; still unequal -> yield again
+```
+
+Read out of the live context rather than derived (`PS1_SPINWAIT=1`):
+
+```
+r30=002DEF80  w0=0000009F  w88=0000009E        one short, forever
+```
+
+`+0x00` is produced by the PPU; `+0x88` is consumed by an SPU.
+`SPU_WATCHEA=2DF008` names the writer outright: **spu4**, cmd `0x22`, 128 bytes
+to `ea=0x002DF000` from LS `pc=0x09BDC`.
+
+And the other side, from `SPU_WHOPOLLS` (per-SPU polling with the channel state
+each poll tests) at the same freeze:
+
+```
+spu0..3  pc=0x00F98  mask=0                     the GPU cores, idle and healthy
+spu4     pc=0x09C84  ev[st=00000000 mask=00000400]  sig[0 0]  inmbox=0
+         resv[v=1 ea=0x002DEF80 diff=0]
+         ls[0x10880: ... 0000009E ...]          what spu4 BELIEVES it consumed
+         line[0000009F ...]                     what spu4 CAN SEE was produced
+         ch0=1.58e9  ch4=1.58e9
+```
+
+So:
+
+| side | waiting for | has |
+|---|---|---|
+| PPU (`func_000D2298`) | spu4 to consume item `0x9F` | `0x9E` |
+| spu4 | the line holding `0x9F` to change **again** | a reservation on it, snapshot already `0x9F` |
+
+Both wait; neither moves. spu4 has polled `rchcnt` **1.58 billion** times.
+
+### The SPU code, from the lifted image
+
+`spu4` is the audio core (image 2 = the `spu1` lifted module). Its wait, read
+straight out of `src/spu_gen/spu1/spu_recomp.c`:
+
+```c
+/* arm: mask Lr, then GETLLAR the line INTO THE MIRROR */
+gpr[9] = 0x2300;                    /* LS destination = mirror base */
+gpr[8] = 1024;                      /* 0x400 = MFC_LLR_LOST_EVENT */
+wrch(SPU_WrEventMask, 0x400);
+wrch(MFC_LSA, gpr[90] + 0x2300);
+wrch(MFC_Cmd, 0xD0);                /* GETLLAR */
+/* 0x8934: */ if (rchcnt(SPU_RdEventStat)) goto handle_lost;
+/* 0x893C: */ produced = LS[gpr[90] + 0x2300];
+              consumed = LS[gpr[90] + 0x2388];   /* +0x88 */
+              if (produced == consumed) goto idle;   /* -> 0x9BA8 -> 0x9C84 */
+              ... do the work, then PUT consumed at 0x09BDC ...
+```
+
+The mirror is at LS `0x10800` (`gpr[90]` = `0xE500`), which is also where the
+3 KB `GET` at LS `pc=0x0CC88` lands. So the loop re-reads the mirror on every
+pass, and GETLLAR refreshes it --- which is why the reservation snapshot holds
+the fresh `0x9F`.
+
+**The open question is now exactly one word wide:** the snapshot says `0x9F` and
+`resv[diff=0]`, so memory and snapshot agree; yet the compare at `0x893C` keeps
+taking the equal branch. Either the mirror word the compare reads is not the one
+GETLLAR refreshed, or our GETLLAR updates the snapshot but not the local store.
+Dumping LS `0x10800` at a freeze (`SPU_LSDUMP=10800`) separates those two, and
+they need opposite fixes.
+
+The suspicion to test alongside it: hardware **latches** reservation-lost as a
+sticky event bit, while `spu_resv_lost_poll` **reconstructs** it by comparing the
+line against a snapshot --- so a GETLLAR issued after the PPU's write silently
+erases evidence hardware would have kept.
+
+### What is NOT the cause, each checked before publishing
+
+| ruled out | how |
+|---|---|
+| a lost signal to spu4 | `SPU_SIGSTAT`: SigNotify2 writes keep arriving through the freeze (107,520 and climbing) |
+| a starved event queue | `PS3_EVQSTAT`: q4 pushed 125,842, **pending 0** --- the servicing thread runs the whole time |
+| the RSX user command | only **4** in an entire run, all early; `0xEB00` is not the per-frame mechanism |
+| `SPU_DMA_REPEAT_LIMIT` halting spu4 | that calls `spu_halt()` and logs a line; the line never appears |
+| a dropped counter PUT | with `SPU_WATCHEA_EVERY=1` the sequence is monotonic `0x12 0x13 0x14 ...` with no gap |
+
+The last one carries a warning: logging every hit changes the timing enough to
+stop the freeze happening at all. Three observer effects in this port now.
+
+### Rows in the milestone table that were wrong
+
+- *"the SPUs emit no pixels"* --- they do; the intro renders.
+- *"5 `HwCdRom` events never leave `EvStACTIVE`"* --- today's census reads
+  classes 2 and 9 active and three slots at status `0x0000`, and `in_cdloop`
+  stops advancing, i.e. the CD loop is **left**. Bug 2 as written is not
+  supported by the current measurements and is withdrawn pending a fresh one.
+
+### New diagnostics (all off by default)
+
+| knob | what it answers |
+|---|---|
+| `PS1_SPINWAIT=1` | who is yielding: `lr`/`ctr`/`r2`/`r30` and both counter words |
+| `SPU_WHOPOLLS=<n>` | per-SPU `rchcnt` tally, pc, event/signal/mailbox/reservation state, the reserved line |
+| `SPU_LSDUMP=<hex>` | 8 words of that SPU's local store, beside the reserved line |
+| `SPU_WATCHEA=<hex>` | every DMA covering one word, with the value after it |
+| `SPU_WATCHEA_EVERY=<n>` | sampling stride for the above (default 64) |
+| `SPU_SIGSTAT=<n>` | per-SPU signal-notification writes and last value |
+| `PS3_EVQSTAT=<n>` | per-queue push count **and pending count** |
+| `PS1_GP0HIST=1` | GP0 primitive classes in the last 64 ring packets --- polygons vs rectangles |
+| `PS3_DEBUG=<file>` | live console into a running title: `threads`, `mem`, `poke32`, `stat`, `knobs` |
+
+`SPU_CHHIST` sums every SPU into one histogram, which is the one shape that
+cannot show a two-party deadlock; `SPU_WHOPOLLS` exists because of that.
+
+### The GP0 ring carries real drawing commands now
+
+An earlier note in this document says the ring only ever carries type-8 sync
+packets. That is stale. Sampled from a live, interactive session:
+
+```
+[ring] pkt@0x00FC5680 type=11: 64000000 00000000 00000001 00000280 00078A80
+                               00000000 00000000 00000000 43900000 3F800000
+                               00000000 42400000
+```
+
+`0x64` is the GP0 opcode for a **textured rectangle, variable size, opaque,
+texture-blended** --- the 2D the menu is made of --- and the payload carries
+floats (`0x43900000` = 288.0, `0x3F800000` = 1.0, `0x42400000` = 48.0)
+alongside the command. So the earlier "type 8 only" reading was taken from the
+first three packets of a run, before the game drew anything.
+
+Which sharpens the missing-3D question: PS1 polygons are GP0 `0x20..0x3F`
+(`0x30` shaded triangle, `0x38` shaded quad, `0x2C` textured quad). If those
+never appear in the ring, the geometry is lost upstream in the R3000; if they
+appear and no pixels follow, it is the rasteriser or the composite.
+`PS1_GP0HIST=1` histograms exactly those classes over the last 64 packets, which
+is the next measurement to take against a black 3D screen.
