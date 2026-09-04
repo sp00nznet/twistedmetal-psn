@@ -3724,3 +3724,45 @@ the ROM, so it is reached through the kernel's A/B/C jump tables at `0xA0`/`0xB0
 which makes this a question about that dispatch, or about whether the game ever asks for it.
 Both are answerable by watching the R3000's pc for entry to `0xBFC52B9C`, and the
 `PS1_R3000_PC` probe already has the machinery.
+
+### Store watch: the slots are written only by `memset`, always to zero
+
+A store watch on the five `HwCdRom` handle slots (PS1 kernel `0xB218..0xB228` = guest
+`0x0077B998`, watching `0x0077B990 +0x30`):
+
+```
+[ww] 0x0077B998 <- 0x0 (w4) guest-fn=0x000A7FB4
+[ww] 0x0077B99C <- 0x0 (w4) guest-fn=0x000A7FB4
+[ww] 0x0077B990 <- 0x0 (w4) guest-fn=0x000A7FB4
+...  the same block again, repeatedly  ...
+```
+
+Every write is zero, every writer is `func_000A7FB4` --- **memset** --- and the burst repeats.
+So PS1 kernel RAM around the event table is cleared over and over, and nothing ever writes a
+real handle there. That closes the loop with the earlier read: all five slots are zero because
+the only thing that ever touches them is a memset.
+
+### Methodology, because I nearly published the opposite
+
+The first run of this watch printed **nothing**, and I was about to record *"no writes at
+all"* --- which would have pointed the whole investigation somewhere else.
+
+Before writing it down I pointed the same watch at the R3000's instruction counter --- a field
+I had watched climb past a billion, so it is certainly written. **That printed nothing either.**
+The probe, not the system.
+
+The fault was mine and trivial: the watch prints `[ww]` and I was grepping for `[WW]`. A
+case-sensitive grep, and it would have become the tenth entry in the table above. The control
+run cost sixty seconds and caught it.
+
+That is the discipline this port has been paying for all session, working correctly for once:
+**before concluding "X never happens", make X happen on purpose and check the probe reports
+it.**
+
+### Still open
+
+Which routine issues the memset, and whether it is the emulator re-initialising the PS1 kernel
+area *periodically* --- which would wipe any events `CdInit` had opened --- or simply the
+one-time boot clear, observed repeatedly across the watch window. `LBP_WW_CHAIN` did not produce
+a caller chain under the tag tried; finding the right one is the next step rather than another
+guess.
