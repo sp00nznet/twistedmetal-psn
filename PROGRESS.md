@@ -3933,3 +3933,50 @@ reading the code.
 That is worth more to whoever picks this up than any single address in these notes: the
 measurements in this document are reliable, and the causal claims connecting them should each be
 re-derived before being trusted.
+
+## `CdInit` is never entered --- measured, not inferred
+
+"`CdInit` never ran" had been *deduced* from the fact that its five stores never land. Sound but
+indirect, and indirect is exactly what produced the last four corrections. So it is now measured
+directly: a flag per 64-byte bucket across the whole BIOS (`PS1_PC_CENSUS=1`).
+
+```
+[census] 4200000 samples, 55/8192 BIOS buckets ever executed;
+         CdInit: BFC52B80=0 BFC52BC0=0 BFC52C00=0 BFC52C40=0
+```
+
+`CdInit` spans `0xBFC52B9C..0xBFC52C60`, which is those four buckets. **None is ever set**, across
+4.2 million samples and roughly two minutes.
+
+**Two independent measurements now agree** and neither leans on the other:
+
+| measurement | result |
+|---|---|
+| uncapped store watch on its five slots | 24 hits, all memset, all zero --- its writes never happen |
+| pc census over the BIOS | its four buckets are never executed |
+
+### A second result, unlooked for and more useful than the first
+
+**Only 55 of 8192 BIOS buckets are ever executed** --- about 3.5 KB of a 512 KB ROM --- and that
+count is **constant from the first report onward**. The set does not grow.
+
+So after boot the R3000 runs a tiny, fixed slice of the BIOS: the poll loop, its interrupt
+handler, and nothing else. That is a considerably stronger statement than "the pc is hot at
+`0xBFC53840`", because it rules out other BIOS work proceeding somewhere the top-N report was not
+showing.
+
+### The honest caveat
+
+Sampling at yields cannot prove absence in general --- a short routine could execute entirely
+between two samples. What makes it convincing here is scale plus corroboration: 4.2 million
+samples, `CdInit` contains five `jal` calls into `OpenEvent` (each a substantial kernel routine),
+and the store watch independently shows its writes never happen.
+
+### Established twice over, by different means
+
+```
+BIOS CdInit is never entered
+  -> all five HwCdRom handles stay zero
+     -> the CD wait loop at 0xBFC5384C polls null handles with TestEvent
+        -> it can never succeed; the game never resumes or draws
+```
