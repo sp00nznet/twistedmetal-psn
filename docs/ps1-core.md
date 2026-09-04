@@ -6216,3 +6216,44 @@ attract mode never begins.
 Fixing it means reading the arithmetic in those four functions --- the IDCT and
 the YUV-to-RGB conversion --- against the PS1 MDEC specification. That is
 implementation work, not measurement, and it is where this stops.
+
+### The MDEC handlers contain no arithmetic --- the decode runs through DMA
+
+Checked before assuming: an IDCT is vector or float work, so if our lifting of a
+vector instruction were wrong that would explain a constant output. It is not
+that. Instruction mixes across `func_000E9A18`, `func_000EA2F0`,
+`func_000EA44C`, `func_000EAA88` and their three callees
+(`func_000D0C8C`, `func_000D02A4`, `func_000D060C`) contain **no vector, no
+float, and no load/store-vector instructions at all** --- only integer loads,
+stores, compares and branches.
+
+So these functions are plumbing, and the callees say what kind:
+
+```
+000D02A4  slwi   r0, r3, 6        ; r3 * 64
+000D02AC  slwi   r3, r3, 3        ; r3 * 8
+000D02B4  subf   r0, r3, r0       ; -> r3 * 0x38, a per-channel stride
+000D02B8  add    r0, r0, r9       ; + base from *(TOC-0x7D88)
+000D02C0  lwz    r9, 0x20(r11)
+000D02C4  cmpwi  cr7, r9, 1
+000D02CC  lwz    r0, 0x30(r11)
+000D02D0  cntlzw r10, r0
+000D02D4  srwi   r10, r10, 5      ; -> boolean "is +0x30 zero"
+```
+
+A **DMA channel status query** over 0x38-byte per-channel records, called eight
+times from the MDEC module. So the MDEC path is: register writes set up state and
+schedule events, and the actual pixel movement happens through the **DMA
+channels** --- MDEC-in on channel 0 and MDEC-out on channel 1, both already in
+the PS1 I/O window map recorded earlier.
+
+That is where the remaining work is, and it is worth being precise about what
+kind of work: the firmware's MDEC is correct code that runs on real hardware, so
+a two-pixel pattern coming out of it means **this port** mishandles something it
+does --- most plausibly one of those DMA channels, since that is the mechanism
+the handlers actually rely on and the one thing in the chain not yet verified.
+
+The per-channel record base is `*(TOC-0x7D88)` and the fields the query reads are
+`+0x20` (a mode/state) and `+0x30` (a count or busy flag). Dumping channel 0 and
+channel 1 records during playback is a small measurement, and it is the one this
+investigation would take next.
