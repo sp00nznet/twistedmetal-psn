@@ -4893,3 +4893,80 @@ because the measurement that "refuted" it was of a different mode entirely.
 Recorded this way because it is the same error as the ten before it: comparing
 two facts gathered at different moments, this time different *modes* rather than
 different runs.
+
+## THE SPU GPU SHIPS WITH SYMBOLS --- and the rasteriser never runs
+
+### The symbol tables were there the whole time
+
+Both SPU modules embedded in `ps1_netemu` carry a `.symtab`. The copies under
+`analysis/spu/` are truncated exactly where their symtab begins (the extractor
+keeps only the loadable image), which is why this went unnoticed --- read the
+ELFs where they live instead, at firmware **file** offsets `0x171100` and
+`0x18A200` (found by scanning for the ELF magic with `e_machine == 23`).
+`scratch/spusyms.py` does it.
+
+The GPU module's map, C++ names demangled by hand:
+
+```
+LS 0x00188   456 B  BlockClear(GpuBlockClearCmd const*)
+LS 0x00350   776 B  Host2Local_Body(GpuH2LBodyCmd const*)
+LS 0x00758   464 B  Host2Local(GpuH2LCmd const*)
+LS 0x00928  1440 B  Local2Local(GpuL2LCmd const*)
+LS 0x010F8 16148 B  main
+LS 0x051E8  3668 B  DrawRect<3>(Code, int)
+LS 0x06040  4232 B  DrawRect<2>(Code, int)
+LS 0x070C8  4296 B  DrawRect<1>(Code, int)
+LS 0x08190  1388 B  DrawRect<0>(Code, int)
+LS 0x08700 .. 0x1493B  DrawEdge<0..3, 0..4>   -- 20 template variants
+LS 0x14E10   512 B  gpuCmdFetchBuffer
+LS 0x23580/0x23590/0x23800  _prepTxResult / _prepTxLoading / _prepClutLoading
+```
+
+That immediately names the two VRAM writers measured earlier from bare
+addresses: `pc=0x002E0` is inside **`BlockClear`**, and `pc=0x004DC` /
+`pc=0x00598` are inside **`Host2Local_Body`**. So the flat `0x83E0` field is a
+block clear --- correct per-frame behaviour --- and the partial 24-bit picture is
+the host-to-VRAM blit.
+
+### The measurement that matters
+
+`SPU_VRAMPC=1` buckets every DMA write into PS1 VRAM by the symbol its LS pc
+falls in. One run, 3.74 million writes:
+
+```
+Host2Local_Body = 3,735,322   (170 MB)
+BlockClear      =     4,532   (1 MB)
+Local2Local     =       240   (150 KB)
+DrawRect        =         0
+DrawEdge        =         0
+```
+
+**The rasteriser never runs.** Not one write from `DrawRect` or `DrawEdge` in an
+entire run, while 3.7 million come from the blit path. The PS1 GPU emulation is
+moving memory and never drawing a primitive.
+
+That single fact accounts for everything still missing:
+
+| symptom | explanation |
+|---|---|
+| no 3D over the menu | no primitive is ever rasterised |
+| the display area is one flat colour | `BlockClear` runs, nothing draws over it |
+| screens go black deeper in | same, with a black clear colour |
+| intro logos and title screen DO appear | they are `Host2Local_Body` blits, not geometry |
+
+The last row is the tell: everything that works is a **transfer**, and everything
+missing is a **draw**. Ten laps of chasing the composite were chasing the half of
+the pipeline that already works.
+
+### Where that points
+
+`main` (LS 0x010F8) is the SPU's command dispatcher and `gpuCmdFetchBuffer`
+(LS 0x14E10, 512 bytes) is the ring it reads --- the thing these notes have been
+calling "the ring" all along, now with its real name. The question is now narrow:
+does `main` receive draw commands and fail to dispatch them, or do draw commands
+never arrive?
+
+An old note here --- "of ten GP0 ring producers only `func_0010F5FC` (type 8,
+sync) ever runs" --- points at the second, and it is testable directly:
+instrument `main`'s dispatch, or count the packet types reaching
+`gpuCmdFetchBuffer` against the types `DrawRect` / `DrawEdge` are reached from.
