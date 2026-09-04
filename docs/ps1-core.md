@@ -5948,3 +5948,27 @@ inwards. The handles now available:
   I/O handler map recorded earlier in this file
 - `PPU_RWATCH` on the coefficient buffer names the PPC function that reads it ---
   which *is* the MDEC front end, whatever it is called
+
+### Correction to the handles above: the coefficient buffer moves
+
+The previous section offered "the coefficient stream is at PS1 `0x801E0000`-ish
+(guest `0x00950780`-ish), so it serves as a known-good input". That address is
+where it happened to be in one sample. `PPU_RWATCH=950B80,256` over a 250 s run
+caught **no reads at all**.
+
+The reason is in the loop's own register trace, one section above: the output
+cursor `$a1` ranges over `0x801CExxx` to `0x801E7xxx` --- roughly **100 KB** ---
+so a fixed 256-byte watch window almost never coincides with wherever the decoder
+is currently writing. The buffer is a rotating pool, not a fixed address.
+
+So the negative result says nothing about who reads the coefficients. Recorded
+because the handle as written would send the next reader after a watch that
+cannot fire, and because it is the same error as everything else here in a new
+costume: a value sampled once, generalised into a constant.
+
+**A watch that would work** has to follow the cursor rather than guess it: gate
+on the PS1 pc being inside the decode loop, read `$a1` from the register file at
+that moment, and arm the read watch on *that* address --- or widen the watch to
+the whole `0x801C0000..0x801F0000` span if the volume is tolerable. Neither is
+difficult; the point is that the fixed-address version is not the same
+experiment.
