@@ -191,7 +191,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Main menu renders and responds | ✅ **Done** — navigable from the keyboard; Enter advances several screens |
 | Intro FMV plays | ⬜ Missing entirely — no video at any point |
 | 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not |
-| **Bug 3**: the SPU rasteriser never runs | ⬜ **Measured by symbol** — 3.7M VRAM writes from `Host2Local_Body`, 4.5k from `BlockClear`, **zero** from `DrawRect`/`DrawEdge` |
+| **Bug 3**: no polygon is ever drawn | ⬜ `DrawRect` entered 955x per SPU, `DrawEdge` (polygons) **0x** — may be correct for a 2D phase, so the question may be why attract mode is never reached |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

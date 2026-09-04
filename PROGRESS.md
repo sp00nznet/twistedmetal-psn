@@ -5384,3 +5384,59 @@ An old note here --- "of ten GP0 ring producers only `func_0010F5FC` (type 8,
 sync) ever runs" --- points at the second, and it is testable directly:
 instrument `main`'s dispatch, or count the packet types reaching
 `gpuCmdFetchBuffer` against the types `DrawRect` / `DrawEdge` are reached from.
+
+### CORRECTION: `DrawRect` does run --- and only `DrawEdge` never does
+
+The section above says "the rasteriser never runs", inferred from VRAM *writes*.
+Too strong. Counting **entries** instead of writes (`SPU_PCHIST=1`, one bucket
+increment per trampoline hop, extents taken from the embedded `.symtab`):
+
+```
+spu0  main=4,282,665,386  H2L_Body=239,674,208  Local2Local=7,145,459
+      BlockClear=9,792    DrawRect=955          DrawEdge=0
+spu1  main=4,342,051,716  Local2Local=7,144,258
+      BlockClear=9,792    DrawRect=955          DrawEdge=0
+spu2  main=4,328,871,061  ... identical ...
+spu3  main=4,380,463,921  ... identical ...
+```
+
+So:
+
+- **`DrawRect` IS dispatched**, 955 times on every SPU.
+- **`DrawEdge` is never entered at all** --- zero, on all four.
+
+`DrawRect` running while writing no VRAM does not mean it draws nothing: the
+symbol list includes `fbCacheData` and `tbCacheData`, so the rasteriser plausibly
+composites into a local-store framebuffer cache that other code flushes
+(`Local2Local` takes 7.1M hops). Attributing pixels by the DMA that carries them
+therefore cannot see rasterised output at all. That is the flaw in the previous
+section's reasoning, and it is the same shape as the earlier mistakes: a
+measurement of one thing (writes) used to settle a question about another
+(drawing).
+
+The identical counts across spu0..3 are worth noting too --- `BlockClear=9792`,
+`DrawRect=955` and `Local2Local~7.14M` match to the digit on all four, with only
+`H2L_Body` concentrated on spu0. That is four cores each rasterising the same
+command stream over its own slice of the screen, which is how the PS1 GPU is
+parallelised here.
+
+**What survives, and it is the important part:** `DrawEdge` --- the polygon
+rasteriser, all 20 template variants --- is **never entered**. No polygon is ever
+submitted for drawing. That is measured by entry count, not inferred from
+writes, so it stands.
+
+### Which raises a possibility this document has not considered
+
+The title screen and menus are 2D. Twisted Metal draws polygons in *gameplay*
+and in the *attract demo*, neither of which has been reached. So `DrawEdge=0`
+may be the correct behaviour for the phase the emulator is actually in, and the
+missing 3D may be a **consequence** of never reaching attract mode rather than
+its cause.
+
+That reverses the direction of the search. If it is right, the question is not
+"why does nothing rasterise" but "why does the game never leave the title
+screen" --- a game-logic or timing question (a CD read that never completes, a
+timer that never fires, an input the attract timeout waits on) rather than a
+rendering one. Distinguishing them is cheap: reach gameplay by driving the menus
+with input and see whether `DrawEdge` starts being entered. If it does, the
+renderer was never the problem.
