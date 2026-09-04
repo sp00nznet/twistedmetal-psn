@@ -4249,3 +4249,55 @@ sits squarely in the interpreter.
 Eighth correction --- and the first time the instrument was chosen for **not perturbing the thing
 it measures**. That is what finally made the whole picture visible in one report, after three
 separate observer-effect artifacts (the framebuffer dump, the surface dumps, and this).
+
+## RETRACTION, ninth: the interrupt path is complete, and I probed the wrong ISR copy
+
+Two things, both caught **before** publishing this time.
+
+### The interrupt path is fully implemented
+
+*"The R3000 never takes the interrupt"* is wrong. The assert path in `func_001063AC` is only half
+of it --- the interpreter's own `mtc0 $12` (Cop0 SR) handler re-checks:
+
+```
+00108168  stw    r9, 0xb0(r23)            ; SR = new value
+0010816C  cmpwi  cr7, r0, 0               ; r0 = SR & 1 (IEc)
+00108170  beq    cr7, 0x106888            ; disabled -> continue
+00108174  and    r0, r10, r9              ; CAUSE & SR
+00108178  rlwinm r9, r0, 0, 0x10, 0x17    ; (SR & CAUSE) >> 8 & 0xFF
+0010817C  cmpwi  cr7, r9, 0
+00108180  beq    cr7, 0x106888            ; nothing pending -> continue
+00108194  stw    r0, 0x138(r23)           ; reason = 0
+00108198  b      0x106800                 ; exit to take the interrupt
+```
+
+So a CD interrupt asserted while interrupts were masked is **not** lost --- writing SR to
+re-enable them re-evaluates it. I was about to commit *"nothing re-checks, so the interrupt is
+dropped"*; searching for other copies of the `SR & CAUSE` test found this one, plus copies at
+`0x00106614`, `0x00106674` and `0x00105858`. The mechanism is present in every place it needs to
+be.
+
+### And my own measurement was invalid
+
+The census probes `0xBFC04680`/`0xBFC046A0` --- the **BIOS ROM** copy of the interrupt
+dispatcher. The PS1 kernel **copies its exception handler into low RAM** at boot, and the copy
+that runs is the RAM one.
+
+So *"BFC046A0=0, the ISR's CD branch never executes"* says nothing at all --- it was always going
+to be zero. And `0x00000080`, the PS1 general exception vector in RAM, measured hot at 1.8% in an
+earlier run, so exceptions **are** being taken and the handler **is** running.
+
+**The specific lesson is new: probing a ROM address for code that runs from a RAM copy is
+guaranteed to read zero.** The same trap applies to every BIOS-ROM bucket in the census --- "55
+to 87 of 8192 ever executed" is a count of *ROM* execution only, and the kernel's RAM-resident
+routines are invisible to it. Several conclusions in this document rest on that count.
+
+### What survives
+
+Exactly one fact, and it is still the right target:
+
+**All five `HwCdRom` events stay `EvStACTIVE` (`0x2000`) and never reach `EvStALREADY`
+(`0x4000`). `DeliverEvent` is not firing them.**
+
+Everything built around it --- `CdInit` never running, the interrupt never raised, the interrupt
+never taken, the ISR never dispatching --- has now been retracted in turn.
