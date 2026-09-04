@@ -4301,3 +4301,58 @@ Exactly one fact, and it is still the right target:
 
 Everything built around it --- `CdInit` never running, the interrupt never raised, the interrupt
 never taken, the ISR never dispatching --- has now been retracted in turn.
+
+## THE ACTUAL OBSTACLE: run variance, not the CD, the GPU, or the events
+
+Conditioning the R3000 register read on the pc actually being inside `CdReadSector`
+(`0xBFC5361C..0xBFC538B0`) gives:
+
+```
+in_cdloop=0  ev[cls/status]: 3/2000 3/2000 3/2000 3/2000 3/2000
+```
+
+**Zero samples inside the loop** --- in a run where the five CD events exist and are
+`EvStACTIVE`. But an earlier run measured **4.4% of samples at `0xBFC53840`**, which is inside
+that exact range.
+
+So *"the PS1 is stuck in the CD poll loop"* is also run-dependent. It is the tenth observation
+this session that held for the run it was taken on and not in general.
+
+### The pattern, stated as the conclusion it deserves
+
+| run | BIOS ROM buckets | CD handles | in CD loop | VRAM non-zero |
+|---|---|---|---|---|
+| A | 23--24 | zero | --- | --- |
+| B | 55 | zero | --- | 75,527 |
+| C | 79--87 | `F1000007..B` | yes (4.4%) | --- |
+| D | 85 | `F1000007..B` | **no (0)** | --- |
+
+Same binary, same command line, no input. **Four materially different behaviours.**
+
+Every root cause proposed and retracted in this document --- `CdInit` never runs, the interrupt
+is never raised, the interrupt is never taken, the ISR never dispatches, the framebuffer is
+24-bit, the waiter is the SPU event --- was a single-run observation generalised. Nine
+retractions, one cause.
+
+### So the next piece of work is not another diagnosis
+
+It is either making the port deterministic, or characterising the variance well enough that a
+measurement can be attributed to a run class. Until then every *"X never happens"* costs a lap
+and yields a retraction, which is empirically what the last ten laps produced.
+
+Concrete first steps, in order:
+
+1. **Log a run-class fingerprint** at startup and on each census line --- thread creation order,
+   the order the SPUs reach their first mailbox, whether `ISO.BIN.EDAT.dec` opened before or
+   after `cellGcmInit`. The runs differ from early on; the divergence point is findable.
+2. **Serialise the identified race.** The prime suspects are already documented in these notes:
+   five raw SPUs racing their init handshake, and the RSX ISR queue being published
+   (`sys_rsx.c`) concurrently with the guest's ISR thread starting.
+3. **Only then** resume the CD event question --- with all probes in one run, each self-validated.
+
+### The one instrument this session got right first time
+
+`PS1_R3000_PC=1` + `PS1_PC_CENSUS=1` now latches the CD loop's registers **only** on samples
+taken inside the loop, and prints `s1!=1, PROBE INVALID` if the register offset is ever wrong
+(the loop sets `$s1 = 1`, so a correct read must show 1). It rejected its own first output. Every
+probe in this port should have been built that way.

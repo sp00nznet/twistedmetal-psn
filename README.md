@@ -184,7 +184,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | PS1 display framebuffer placed correctly | ✅ Done — 320x240 block, native resolution, right position |
 | PS1 CD events opened correctly | ✅ Done — `CdInit` runs; handles `F1000007..F100000B` all valid |
 | PS1 CD interrupt raised + unmasked | ✅ Done — `I_STAT_or=0x0D`, `I_MASK_or=0x0D` (bits 0,2,3) |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — the 5 `HwCdRom` events never leave `EvStACTIVE`; `DeliverEvent` does not fire them |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — **run variance**: identical runs diverge into 4 distinct behaviours; fix that first |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker
