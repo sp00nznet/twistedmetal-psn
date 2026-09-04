@@ -179,7 +179,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | **PS1 game runs and loads its art** | ✅ **Done** — VRAM holds Twisted Metal car sprites and title letters |
 | **Renderer produces a picture** | ✅ **Done** — 89% of the presented 1280x720 surface is drawn |
 | Whole PS3-side render path verified | ✅ Done — draws, shader, constants, upload, readback all correct |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — PS1 24-bit display mode: the framebuffer holds 3-byte pixels, read as 2 |
+| PS1 display framebuffer placed correctly | ✅ Done — 320x240 block, native resolution, right position |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — the SPU rasteriser's output collapses to 6 palette entries |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

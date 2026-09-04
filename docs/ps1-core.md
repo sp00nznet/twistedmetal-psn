@@ -2716,3 +2716,71 @@ and nothing in this path does that yet.
 
 That is a well-bounded piece of work, and it is the last thing between here and a visible intro
 video.
+
+## REFUTED: the stripes are not 24-bit data. They are six palette entries.
+
+The section above put forward "the intro video is playing into a 24-bit framebuffer and
+everything downstream treats it as 15-bit" as the best-supported hypothesis. It is wrong. It was
+labelled a hypothesis precisely so it could be killed, and two tests killed it.
+
+**Re-reading as 24-bit produces no image.** Reconstructing the raw VRAM bytes and reading the
+display region as 3-byte pixels gives a *different* regular stripe, not a picture. If the data
+were 24-bit misread as 16-bit, reading it as 24-bit would have shown the frame.
+
+**And the pixels are six palette entries, not image data.** The entire 320x240 display region
+contains exactly six distinct 16-bit words:
+
+```
+0x0000  24315   black
+0x00D7  22560   blue
+0x7400  19200   red
+0x00DF   4485   bright blue
+0x7FFF   3315   white
+0x7EE0   2925   orange
+```
+
+Six values. A decoded video frame has thousands; a memset has one. Rows are *near* period-3 but
+not exactly --- 0 of 240 rows are exactly period-3 across their width --- so this is structured
+output, not a fill.
+
+### A methodology error worth naming
+
+The VRAM dump and the surface dump compared in the previous section **came from different runs**,
+and run content varies. That is not a small slip: it is the same class as the seven mistakes
+tabulated above, and it made a mismatch look like a conclusion.
+
+Capturing both on the same VRAM-ready gate in one run also corrected which surface matters: the
+actual composite target is **slot 1 (offset `0x0`)**, not slot 2, and it holds content in a
+**320x240 block** --- the PS1's native resolution, correctly placed and correctly sized.
+
+### Where this actually leaves the port
+
+The PS1's own 320x240 display framebuffer holds structured output drawn from a six-entry
+palette, while the texture/CLUT half of VRAM decodes to recognisable game art --- car sprites,
+vehicle art, title letters.
+
+So asset upload works and the rasteriser runs, but **what it rasterises collapses to a handful of
+palette entries in a repeating arrangement**. That is the signature of a texture or CLUT lookup
+going wrong inside the lifted SPU GPU code.
+
+That is the next area, and it is on the **PS1 side**, not the PS3 side. Everything from the R3000
+through the GPU SPUs' packet consumption, PS1 VRAM, the texture upload, the composite shader and
+its constants, the draws, and the presented surface remains verified.
+
+### The count is now eight
+
+| # | what looked true | why it was not |
+|---|---|---|
+| 1 | sem 1 never posted | log capped at 40 lines |
+| 2 | 24 posts to sem 1 | `grep` matched `sem=10` too |
+| 3 | `GetPcmItem` never called | it had no log line |
+| 4 | SPUs blocked forever on `rdch` | a transient during init |
+| 5 | the SPU kick is lost | local store is aliased; correct writes log nothing |
+| 6 | runs vary 0..75,527 VRAM words | my own per-heartbeat dump caused it |
+| 7 | all surfaces black | dumped before the PS1 had drawn |
+| 8 | the framebuffer holds 24-bit data | six palette entries; reading it as 24-bit shows no image |
+
+Number 8 is the first that was **published as an explicit hypothesis and then falsified on
+purpose**, which is the only reason it lasted one commit instead of becoming load-bearing. The
+two tests that did it are the same shape as `LD_CLEAR_TEST` and `LD_FORCE_GREEN`: make the
+alternative happen and see whether it looks like the data.
