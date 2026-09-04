@@ -4092,3 +4092,54 @@ single-run absence claims are not sound in this port. The variance was documente
 
 Anyone continuing here should treat every unqualified "never" above as "not in the run I
 sampled", and re-measure with all probes in one run before building on it.
+
+## RETRACTION, seventh: the CD event handles are VALID. `CdInit` runs fine.
+
+Reading the five handles from the **same report as the pc census** --- rather than from the
+render heartbeat on another thread at another moment --- gives:
+
+```
+[census] 600000 samples, 79/8192 BIOS buckets ever executed;
+         CdInit: BFC52B80=0 BFC52BC0=1 ...
+         handles: F1000007 F1000008 F1000009 F100000A F100000B
+```
+
+Five well-formed PS1 event handles, `0xF1000000|index`, indices 7..0xB --- five consecutive EvCB
+entries. **`CdInit` ran and opened all five `HwCdRom` events. It works.**
+
+### What that invalidates in this document
+
+* *"the three descriptors the BIOS polls are all ZERO"*
+* *"all five `CdInit` slots are zero --- it never ran at all, not partially"*
+* *"`CdInit` is never entered --- measured, not inferred"*
+* *"the event system works: one event is open, and it is `HwDMAC`"* --- that read saw one entry
+  because it ran *before* `CdInit` had opened the CD five
+* the entire *"`CdInit` never runs"* root-cause chain built on top of them
+
+Every one of those reads came from the **render heartbeat**, which runs on the present thread on
+its own schedule and in practice fires **early**, before the guest reaches `CdInit`. The store
+watch agreed with them for the same reason: it only ever saw the boot-time memset.
+
+The fix was to read the handles from the same probe, at the same instant, as the census --- the
+discipline the previous section identified as necessary, and which had already worked once in
+this document for the VRAM-versus-surface comparison. **One run, one moment, all facts together.**
+
+### The actual state
+
+```
+CdInit runs; all five HwCdRom events are open and enabled
+  -> CdReadSector (A(0xA5)) polls them with TestEvent
+     -> they are never DELIVERED, so the poll never succeeds
+        -> the game never resumes, never draws
+```
+
+Which puts the target back where it briefly was many sections ago, before the derail: **the
+CD-ROM interrupt.** I_STAT bit 2 must set, the BIOS ISR must run, and it must call
+`DeliverEvent(0xF0000003, spec)`. The events exist and are waiting; nothing fires them.
+
+### The lesson, stated once more because it has now cost seven retractions
+
+Reading two facts from two different probes on two different schedules is not one observation. It
+produced: the VRAM/surface mismatch, the "all surfaces black" artifact, the "24-bit framebuffer"
+hypothesis, the `HwDMAC` misidentification, the CD-handles-are-zero chain, and this. **Put every
+probe that must be compared into one report at one instant, or do not compare them.**
