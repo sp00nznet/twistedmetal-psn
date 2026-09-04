@@ -5248,3 +5248,62 @@ stack frame) that works from `*(TOC-0x7E50)` = `0x0015F840` and
 `*(TOC-0x7E4C)` = `0x002DC274`. What quirk id 2 with value 28 actually changes
 is still unread; that means reading that function, which is a job of its own
 rather than a measurement.
+
+## The composite is one of seven Cg programs --- and the two measurements reconcile
+
+### What the firmware says about its own display path
+
+The `fp_*` names found earlier are not config keys. They are **Cg shader
+names**, and there are seven of them:
+
+```
+CG_vpshader   CG_fpshader
+CG_fp_gradient   CG_fp_orientation   CG_fp_mofix   CG_fp_smart
+CG_fp_upscale    CG_fp_upscale_smart CG_fp_sharpen
+```
+
+with the uniform and attribute names beside them: `texture0`, `texture1`,
+`hwidth`, `xyz`, `rgba`, `tex0`. So the emulator picks a display fragment
+program from seven variants, and at least one variant takes **two** textures
+plus a width uniform. `CG_fp_mofix` is presumably the movie path.
+
+That mattered because it undercut the earlier "the renderer is faithful"
+conclusion: that was proven by reconstructing the screen from **one** texture at
+the offset measured on unit 0, which quietly assumed there was no second one.
+
+**Measured (`LD_UNITS=1`, every enabled unit on any draw that samples PS1 VRAM,
+once per distinct combination):**
+
+```
+draw sampling PS1 VRAM: u0[1:0x00400000 fmt=0xE2 1024x512 p=2048]
+draw sampling PS1 VRAM: u0[1:0x004003C0 fmt=0xE1 2048x512 p=2048]
+draw sampling PS1 VRAM: u0[1:0x00400000 fmt=0xE1 2048x512 p=2048]
+```
+
+**Only unit 0 is ever enabled.** So the two-texture variants are not the ones in
+use here, and the reconstruction stands: the renderer reads the bytes the guest
+points it at. The caveat is resolved in favour of the original conclusion.
+
+It also turns up a third bind that had not been seen before: **24-bit at offset
+0** as well as at `0x3C0`. So the emulator displays *both* 24-bit buffers, buffer
+0 and buffer 1, alternately.
+
+### Reconciling "one third coherent" with "the row is fully written"
+
+Those two measurements looked contradictory and the second was used to retract
+the first. Both are right; they were taken in **different display modes**:
+
+| measurement | mode | result |
+|---|---|---|
+| plane dumps (`LD_PLANE_DUMP`, fires on a B8 decode) | **24-bit** | ~1/3 of the row coherent image, 2/3 pattern |
+| row coverage (`SPU_ROWCOV`) | a **15-bit** phase | full 640-pixel width written, every pixel `0x83E0` |
+
+So the retraction over-reached. What was genuinely unsupported was the
+*explanation* --- the tidy `pixels/2` vs `pixels*3/2` halfword arithmetic --- and
+the claim that the row was not fully **written**. The observation that only about
+a third of a 24-bit row carries coherent image data was never contradicted,
+because the measurement that "refuted" it was of a different mode entirely.
+
+Recorded this way because it is the same error as the ten before it: comparing
+two facts gathered at different moments, this time different *modes* rather than
+different runs.
