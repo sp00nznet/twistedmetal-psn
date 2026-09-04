@@ -185,7 +185,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | PS1 CD events opened correctly | ✅ Done — `CdInit` runs; handles `F1000007..F100000B` all valid |
 | PS1 CD interrupt raised + unmasked | ✅ Done — `I_STAT_or=0x0D`, `I_MASK_or=0x0D` (bits 0,2,3) |
 | Init ordering deterministic | ✅ Done — 15 markers, identical sequence in 3 runs; no init race |
-| **Bug 1**: early hard stall | ⬜ 1 run in 3 — the R3000 scheduler stops granting a budget; interpreter livelocks pinned on one `ADDIU` |
+| **Bug 1**: early hard stall | ⬜ 1 run in 3 — **root cause**: an always-due event; `func_00105FA8` loops firing it and never returns |
 | **Bug 2**: CD wait (healthy runs) | ⬜ 5 `HwCdRom` events never leave `EvStACTIVE`; the game never resumes |
 | Intro video → menu → attract mode | ⬜ **BLOCKED** — by both; fix Bug 1 first (a third of measurements come from a dead process) |
 | Twisted Metal renders | ⬜ |

@@ -4564,3 +4564,70 @@ run classes.
 `ctr=0x000D2298` is constant in both classes and is **not** an opcode handler (those live at
 `0x106xxx`--`0x108xxx`). Like `lr`, `ctr` persists across `bctr`-free stretches, so it names some
 earlier indirect call, not the yielding code. Recorded so the next reader does not chase it.
+
+## BUG 1 ROOT CAUSE: an always-due event --- the scheduler never returns, it loops
+
+Reading `func_00105FA8` in full (72 instructions, a leaf) corrects the section above and finishes
+Bug 1.
+
+```
+00105FBC  lwzu r6, 0x540(r30)   ; r6 = event list head
+00105FC0  lwz  r0, 0x124(r3)    ; total
+00105FCC  subf r29, r4, r0      ; now = total - consumed
+00105FD8  lwz  r9, 8(r7)        ; head event's DUE TIME
+00105FE0  subf r3, r29, r9      ; time until due
+00105FE8  bgt  cr7, 0x106070    ; > 0 -> return it as the budget
+; else, from 0x105FF0: unlink the node, then
+00106000  stw  r9, 0x124(r31)   ; total := the event's due time
+00106008  stw  r28, 0x120(r31)  ; budget := 0
+00106050  bctrl                 ; fire the event's callback
+00106064  subf r3, r29, r9      ; recompute against the NEW head
+0010606C  ble  cr7, 0x105ff0    ; still due -> loop and fire again
+00106070  ...                   ; return r3 (always > 0 here)
+```
+
+**The scheduler cannot return zero.** It exits only via `0x106070`, and both paths there require
+`r3 > 0`. So *"the scheduler stops granting a budget"* --- the previous section's conclusion ---
+is not the mechanism. **It never returns at all.**
+
+### The real mechanism
+
+An event whose due time never advances past `now`. The loop at `0x105FF0..0x10606C` unlinks it,
+sets total to its due time, fires its callback, re-reads the head, finds it still due, and goes
+round again. Forever.
+
+Which matches the measured signature point for point:
+
+| measured | explained by |
+|---|---|
+| total **frozen** at 13,658,112 | `0x106000` assigns `total = due time` every iteration, pinning it to that event's timestamp |
+| millions of yields | the callback at `0x106050` yields; the loop calls it without limit |
+| every yield at the same opcode (`ADDIU`) | the pc never moves, so the instruction in front of the interpreter is always the same one |
+
+The opcode was never the point --- it was a symptom of the pc being frozen.
+
+### And it vindicates a hypothesis I refuted fifteen sections ago
+
+*"An always-due event in the scheduler"* was proposed early in this document, then dismissed
+with *"refuted by timestamps: ~1.8 MIPS for 30 ms then a hard stop"*. **That refutation used a
+healthy run**, where the scheduler behaves normally.
+
+The hypothesis was right for stalled runs the whole time, and the measurement that killed it came
+from the wrong class of run. Same mistake as everything else here --- but this one cost the most,
+because it discarded a correct answer and sent the investigation into the GPU, the CD and the
+event system for twenty laps.
+
+### What remains for Bug 1, and it is narrow
+
+**Which event, and why does its due time not advance?** The node layout is now known from this
+code:
+
+```
++0x00  next        +0x0C  flag cleared on fire
++0x04  prev        +0x10  callback OPD
++0x08  due time
+```
+
+The list head is at `state+0x540`. Dumping the head node's due time and callback OPD on a caught
+stall names the culprit outright, and the OPD maps straight to a function through the existing
+lookup.
