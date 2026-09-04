@@ -4406,3 +4406,48 @@ Why runs advance at such different rates in the same wall-clock window, and whet
 frozen-instruction-count runs recorded earlier are a genuine stall or just the slow end of that
 spread. That is answerable by plotting `+0x124` against wall time across several runs, and needs
 no new instrumentation.
+
+## TWO SEPARATE BUGS: an early hard stall (1 run in 3), and the CD wait in healthy runs
+
+Plotting instructions retired (`+0x124`) against wall time across three runs finally separates
+what this document has been conflating throughout:
+
+```
+run1  5.6M 16.4M 27.7M 39.0M ... 196.7M 208.0M    linear, no stall
+run2  5.1M 13.2M 13.2M 13.2M ... 13.2M  13.2M     HARD STALL at 13.2M
+run3  5.1M 15.8M 27.2M 38.5M ... 195.6M 206.9M    linear, no stall
+```
+
+Two clean classes, **not** a spectrum:
+
+* **Class A (2 of 3)** --- continuous, ~11.3M instructions per 5-second heartbeat, dead steady in
+  both runs, past 200M and still climbing at timeout. Never stalls.
+* **Class B (1 of 3)** --- advances to ~13.2M then **freezes**: the same value for 17 consecutive
+  heartbeats, about 85 seconds. A genuine deadlock, not slowness. That answers the question the
+  previous section left open.
+
+### And it reconciles every flipping measurement in this document
+
+The stall at 13.2M lands **early** --- well before the point where `CdInit` runs and the CD
+handles get filled. So:
+
+| run class | what it looks like | which of my readings came from it |
+|---|---|---|
+| stalled (13.2M, 23--55 ROM buckets, handles zero) | deadlocked before reaching the CD code | *"the handles are zero"*, *"CdInit never runs"*, *"the events are never opened"* |
+| healthy (200M+, 85 ROM buckets, handles `F1000007..B`) | reaches the CD wait | the `EvStACTIVE` events, the type-8-only GP0 ring |
+
+I had been sampling both classes interchangeably and treating the results as one system.
+**That is the single mechanical cause behind nine retractions, and it took one plot to see.**
+
+### So there are two bugs, needing separate work
+
+1. **An early hard deadlock at ~13.2M R3000 instructions**, reproducible in roughly one run in
+   three. Diagnosable now: loop the run until the totals plateau, then inspect *that* process ---
+   host stacks for every thread, the R3000 pc, the SPU channel states. Every probe needed already
+   exists; what was missing was knowing which runs to point them at.
+2. **In healthy runs, the game reaches `CdReadSector` and its five `HwCdRom` events never leave
+   `EvStACTIVE`.** That is the real content of the earlier root-cause chain, and it stands ---
+   but only for class A runs.
+
+**Bug 1 first.** It is reproducible, it is a hard deadlock with a known signature to trigger on,
+and until it is fixed a third of all measurements are taken from a dead process.
