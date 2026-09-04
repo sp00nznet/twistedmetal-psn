@@ -191,7 +191,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Main menu renders and responds | ✅ **Done** — navigable from the keyboard; Enter advances several screens |
 | Intro FMV plays | ⬜ Missing entirely — no video at any point |
 | 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not |
-| **Bug 3**: 24-bit display buffer | ⬜ **Localised** — the stripes are in PS1 VRAM; buffer 0 is filled, buffer 1 is displayed and never written |
+| **Bug 3**: 24-bit VRAM transfer | ⬜ **Quantified** — each row gets ~320 bytes of the 960 it needs; the rest is stale 15-bit content |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

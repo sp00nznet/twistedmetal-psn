@@ -4521,3 +4521,40 @@ DCT block, which is what an unfilled or half-decoded frame buffer looks like.
 (Copy Rectangle, CPU to VRAM) and the display-area register writes. If every
 `0xA0` lands in one buffer while the display flips between two, the flip target
 is never being written --- and that is the whole bug.
+
+### Quantified: the 24-bit transfer fills exactly one third of each row
+
+Offline analysis of the dumped plane, no further runs needed.
+
+Non-zero byte density per 64-byte column block, sampled over 240 rows:
+
+```
+bytes    0.. 319   ~3800/3840   dense  -- real 24-bit image data
+bytes  320.. 959   ~1500-1700   the pattern (2 of every 6 bytes)
+bytes  960..1087   0            untouched
+bytes 1088..1855   ~1275-1350   the pattern again
+bytes 1856..2047   ~3835        dense
+```
+
+The pattern has a **period of 48 bytes** and its bytes read
+`F8 00 00 00 00 F8` repeating --- and it is NOT a constant fill (only 14 of 239
+rows match row 0). `0x00F8` is a 15-bit PS1 pixel. So those bytes are **older
+16-bit content still sitting in VRAM**, read back as 24-bit triples, which is
+what turns them into saturated red/blue columns and then green/magenta on
+screen.
+
+Reinterpreting buffer 0 as 320x240 24-bit RGB confirms it: the left ~104 pixels
+are a real FMV frame (architecture and rubble, clearly legible), and the rest is
+the pattern. 104 pixels x 3 bytes = ~312 bytes.
+
+**So each row receives ~320 bytes of real data where a 320-pixel 24-bit row
+needs 960 --- exactly one third.** The other two thirds are whatever the 15-bit
+path left behind. Both remaining symptoms follow from that one number: the FMV
+never appears because only a third of each row arrives, and the "stripes" are
+stale 16-bit pixels, not a decode failure.
+
+Where to look: the CPU-to-VRAM transfer path for 24-bit data. A 320-pixel
+24-bit row is 960 bytes = 480 halfwords, and PS1 GP0 transfers are counted in
+16-bit words --- a width taken in the wrong unit, or a destination advanced by
+one byte per source halfword instead of three, produces exactly a one-third
+fill.
