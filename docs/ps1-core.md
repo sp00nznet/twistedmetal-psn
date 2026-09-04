@@ -5748,3 +5748,68 @@ pair each waiting for the other, resolved by finding the one signal that never
 fired. The instruments for that already exist here (`PS1_SPINWAIT`,
 `SPU_WHOPOLLS`, `PPU_RWATCH`, `PS3_EVQSTAT`) and none of them has yet been
 pointed at the R3000's view of MDEC.
+
+### CORRECTION: the R3000 is not waiting --- it is looping in a decoder
+
+The previous section concluded "the game is waiting -- spinning in a playback
+loop while something it expects never arrives", from the fact that disc reads
+stop. The disc observation is right; the conclusion drawn from it is not.
+
+`PS1_R3000_PC` during the endless playback:
+
+```
+pc~0x801645C0  52669 (1.1%)     pc~0x80156C80  15361 (0.3%)
+pc~0x8015F140  22395 (0.4%)     pc~0x80164F00  15213 (0.3%)
+pc~0x80164600  19603 (0.4%)     pc~0x8015F180  12173 (0.2%)
+```
+
+No bucket takes more than **1.1%**. A spin pins one bucket at nearly 100% ---
+that is exactly how the deadlock at the top of this session was found. The R3000
+is spread across many addresses, i.e. **executing real code**, not waiting.
+
+And the hot loop is legible. `[r3000mem]` at `0x80164F80`:
+
+```
+94E20004  lhu   $v0, 4($a3)          ; read a 16-bit code
+24A50002  addiu $a1, $a1, 2
+3043FFFF  andi  $v1, $v0, 0xFFFF
+A4A20000  sh    $v0, 0($a1)          ; store it out
+34027C1F  ori   $v0, $zero, 0x7C1F   ; compare against marker 0x7C1F
+1062001C  beq   $v1, $v0, +0x1C
+28627C20  slti  $v0, $v1, 0x7C20
+10400005  beq   $v0, $zero, +5
+1060FFBA  beq   $v1, $zero, -70      ; loop back
+000414C2  srl   $v0, $a0, 19
+080593F0  j     0x164FC0
+3402FE00  ori   $v0, $zero, 0xFE00   ; compare against marker 0xFE00
+1062FFDF  beq   $v1, $v0, -33        ; loop back
+00041D82  srl   $v0, $a0, 22
+```
+
+A loop that reads 16-bit codes, writes them out, and tests each against two
+terminator constants, with shifts of `$a0` by 19 and 22 (bit-field extraction
+from a packed word). That is a **run-length / bitstream unpacker**, and the two
+constants are meaningful:
+
+- **`0xFE00`** is the PS1 MDEC **end-of-block** code.
+- **`0x7C1F`** is 15-bit R=31 G=0 B=31 --- magenta, the conventional colour key.
+
+Registers at the same instant: `$a3=0x8017E47C` (source), `$a1=0x801E6AFC`
+(destination, incrementing by 2), `$s2=0x007FFFFF` (a 23-bit mask),
+`$ra=0x80164824`.
+
+**So the title is decoding, indefinitely.** The natural reading is a decoder
+whose input never yields its terminator: it consumes, emits, and loops, which is
+exactly what produces an ever-climbing blit count, no new frame clears, no
+geometry, and a destination buffer that fills with a repeating two-pixel pattern
+rather than a picture.
+
+That is a materially different bug shape from "waiting on an event", and it is
+better supported --- the PC distribution rules the wait out directly. It also
+brings the FMV defect and the attract-mode blocker together in one place: **the
+same decoder loop both fails to produce a picture and fails to terminate.**
+
+Recorded as a correction rather than an edit, because the wait framing was
+published one section above and someone reading forward should see why it was
+wrong: disc reads stopping means no new data is arriving, which is equally
+consistent with a decoder chewing on data it already has.
