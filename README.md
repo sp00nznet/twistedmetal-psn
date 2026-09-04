@@ -189,7 +189,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | **Bug 2**: CD wait | 🔁 **Withdrawn** — the CD loop is left; the census that supported this no longer reproduces |
 | Intro logos render | ✅ **Done** — both Sony title cards, photographed at t=75s and t=90s |
 | Main menu renders and responds | ✅ **Done** — reproduced unattended via `PAD_SCRIPT`; background art correct, inner panel black |
-| Intro FMV plays | ⬜ Missing entirely — no video at any point |
+| Intro FMV plays | 🟨 **Partly** — a decoded video frame reaches the screen; each row gets ~312 of the 960 bytes it needs |
 | 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not |
 | Polygon rasteriser works | ✅ **Done** — `DrawEdge` 0 → **88,040** entries/SPU once driven off the title screen; the 2D phase simply had no polygons |
 | **Bug 3**: menu inner panel is black | ⬜ Background blit arrives; the panel content does not |

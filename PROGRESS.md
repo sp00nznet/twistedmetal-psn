@@ -5523,3 +5523,77 @@ a blit and arrives; the panel is where content is drawn, and `DrawEdge` is now
 active, so this is a drawing question that can be attacked with the symbol
 buckets. **The deterministic reset**: it is reproducible from a fixed
 `PAD_SCRIPT`, so bisecting the script says which press causes it.
+
+## THE INTRO FMV IS PLAYING --- caught on screen, partially drawn
+
+Every capture pass so far sampled the window every 15--35 s. At ~0.4x emulation
+speed that is wide enough to miss an event that lasts seconds. `tools/burstseq.sh`
+samples a window densely instead (every 4 s from t=58 to t=150), and it caught
+the thing this port has been declared to be missing all session:
+
+```
+t=058   92 KB    intro card
+t=062..078  500 KB   pattern
+t=082..086  912 KB   pattern (full-screen)
+t=090..118  1.99 MB  title screen
+t=122   1.35 MB  <-- THE FMV: a decoded video frame, left third of the screen
+t=126..146  500 KB   pattern
+```
+
+`scratch/burstseq/t122.png` is a real decoded video frame --- rubble and
+architecture, clearly legible --- occupying the left ~104 of the 320-pixel display
+width, with vertical colour fringing, and stale pattern across the remaining two
+thirds. **The intro FMV is decoded and displayed. It is not missing; it is
+partially drawn.**
+
+So MDEC works, the CD delivers the stream, `Host2Local_Body` blits it, and the
+composite shows it. What is wrong is the *extent* of each row.
+
+### The width, from two independent directions
+
+```
+on screen        the image covers ~1/3 of the 320-px window   -> ~104 px
+from the bytes   104 px x 3 bytes per pixel                    -> 312 of 960
+```
+
+Both agree, and 960 bytes is exactly a 320-pixel 24-bit row. **Each FMV row
+receives about a third of its bytes.**
+
+### Which means an earlier retraction here was itself wrong
+
+This document retracted the "one third fill" observation on the strength of a
+row-coverage measurement showing a row fully written. That row-coverage run was
+in a **15-bit** phase --- already noted two sections above --- so it never
+addressed the 24-bit case. The one-third observation stands, now confirmed
+on-screen rather than from a single dump. What was genuinely wrong was only the
+*explanation* offered for it (the `pixels/2` vs `pixels*3/2` arithmetic).
+
+### Hypotheses tested and killed in this pass
+
+| tested | result |
+|---|---|
+| the FMV frame is really 15-bit data shown as 24-bit (320 px x 2 B = 640 B, and 640/3 = 213 px, suspiciously close to what is on screen) | **dead** --- reinterpreting the same bytes as 15-bit, both endiannesses, gives psychedelic garbage while the 24-bit reading gives a clean image |
+| only spu0 transfers, so the other three SPUs' slices are never written | **dead** --- `LS 0x150A0` holds each SPU's own index (0,1,2,3) and `Host2Local_Body` returns early unless it is 0. One transfer master is deliberate design |
+| the frames were caught mid-blit by the dumper | **dead** --- the partial frame is what is *on screen*, in a window capture, not in a probe dump |
+
+### Where the next lap starts, with real names
+
+`Host2Local_Body` (LS 0x00350, 776 bytes) reads its command block at LS
+`0x24210`. Measured during playback on spu0:
+
+```
+0x24210  0x000002A0 / 0x150 / 0xD8   varies per command
+0x24214  0x000000F0  = 240           the row count -- a full PS1 frame height
+0x24218  same as +0x00
+0x2421C  0x00000030  = 48            matches the 48-byte DMA writes measured
+0x24220  0x00000000                  the value clamped against at 0x350
+0x24224  0x00000018  = 24
+0x2422C  0x00000001
+```
+
+The height is right (240 rows), the DMA unit is right (48 bytes), and the
+function clamps a per-command count against `LS 0x24220`. Reading that clamp
+correctly out of the lifted SPU bit-ops (`cgt` / `selb` / `ai` / `ceqi`) is the
+next job --- and it is code reading on a 776-byte function with its real name and
+its inputs already measured, which is a far better position than any lap before
+it.
