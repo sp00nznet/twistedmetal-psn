@@ -3766,3 +3766,38 @@ area *periodically* --- which would wipe any events `CdInit` had opened --- or s
 one-time boot clear, observed repeatedly across the watch window. `LBP_WW_CHAIN` did not produce
 a caller chain under the tag tried; finding the right one is the next step rather than another
 guess.
+
+### Uncapped: confirmed, and "repeatedly" corrected to "twice"
+
+That store watch ran with `LBP_WW_MAX=40`, and memset bursts of 12 words could easily have
+consumed the cap before any real handle write --- which would have made *"nothing ever writes a
+real handle"* a cap artifact rather than a reading. Re-run uncapped:
+
+```
+total watch hits: 24
+NON-ZERO writes:  (none)
+distinct writers: 24  guest-fn=0x000A7FB4
+```
+
+24 hits in the entire run, every one from memset, every one zero. **The conclusion survives, and
+this time it is established rather than assumed.**
+
+It also corrects the previous section's own wording. It said the region is cleared "over and
+over" and that the burst "repeats" --- but 24 hits over a `0x30` window is exactly **two** passes
+of 12 words. The region is memset twice, during init, and never touched again. What looked like a
+repeating pattern was two bursts read as many, from a truncated head of the log.
+
+### Established, uncapped
+
+```
+the region is cleared twice at init and never written again
+  -> all five HwCdRom handles are zero for the whole run
+     -> CdInit never runs at all
+        -> the game's BIOS CD wait polls null handles with TestEvent
+           -> it can never succeed; the game never resumes or draws
+```
+
+Both of the last two findings needed a control or an uncapped re-run to stand, and in both cases
+the check changed something: the first found the probe silent because of a case-sensitive grep,
+this one narrowed "repeatedly" to "twice". Neither changed the conclusion --- which is the useful
+outcome --- but neither was safe to publish without it.
