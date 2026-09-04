@@ -196,10 +196,21 @@ cmake --build build
 
 ## ⚖️ Legal
 
-This repository contains **no game code, no assets, no firmware, no encryption keys** ---
-only analysis notes, configuration and recompilation tooling. You must supply your own
-legally obtained console firmware and your own copy of the game. `fw/`, `pkg/`,
-`extracted/`, `extracted_crack/` and `vfs/` are git-ignored.
+This repository distributes **no game code, no assets, no firmware, no encryption keys**
+--- only analysis notes, configuration and recompilation tooling. You must supply your
+own legally obtained console firmware and your own copy of the game. `fw/`, `pkg/`,
+`extracted/`, `extracted_crack/`, `vfs/` and the lifted output (`src/recomp/`,
+`src/spu_gen/`) are git-ignored.
+
+To be explicit about what the notes *do* contain: the write-ups quote **excerpts of
+disassembly** from `ps1_netemu` --- roughly 500 lines across `docs/` and `PROGRESS.md`
+--- together with function addresses and reverse-engineered structure layouts. That is
+the analysis itself, and a reverse-engineering write-up cannot exist without it. The
+cryptographic constants in `src/ecdsa_probe.c` and `docs/disc-body.md` are
+**verification-side only**: published curve parameters, a public key, and one signature
+with its hash taken from the disc header. There is no private key, no ERK, no
+klicensee and no RAP anywhere in this repository or its history --- nothing that
+decrypts or forges anything.
 
 **The screenshots and the recording** in `docs/img/` are frames of the running game. The imagery in them ---
 Twisted Metal, its characters and its video --- belongs to its rights holders (Sony
