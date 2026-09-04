@@ -182,7 +182,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | **Renderer produces a picture** | ✅ **Done** — 89% of the presented 1280x720 surface is drawn |
 | Whole PS3-side render path verified | ✅ Done — draws, shader, constants, upload, readback all correct |
 | PS1 display framebuffer placed correctly | ✅ Done — 320x240 block, native resolution, right position |
-| Intro video → menu → attract mode | ⬜ **ROOT CAUSE** — the GP0 ring carries only type-8 sync packets; no drawing commands |
+| Intro video → menu → attract mode | ⬜ **ROOT CAUSE** — the PS1 calls back into the BIOS (`0xBFC50000..0xBFC58000`) and stays there |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

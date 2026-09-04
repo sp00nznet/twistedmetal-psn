@@ -3469,3 +3469,55 @@ Two possibilities remain:
 
 Rule out (1) first, because it is cheap: watch whether the hot pc bucket keeps moving over a
 longer run, or settles. Only then read the dispatch.
+
+## The PS1 returns to the BIOS and stays there
+
+Ruling out "the program has not reached its drawing code yet" turned into a positive result.
+`PS1_R3000_PC=1` over 1.2 million interpreter yields, hottest 4 KB pc bucket per report:
+
+```
+  20000   0x80037000 49.0%   0xBFC58000 32.4%   0x001A4000  8.7%
+ 200000   0x80037000 36.6%   0x00037000 25.8%   0x00001000 11.6%
+ 400000   0x0003E000 32.0%   0x00001000  4.8%   0x00000000  3.0%
+ 600000   0xBFC50000 32.1%   0x0003E000  1.2%   0xBFC4C000  0.0%
+ 800000   0xBFC50000  6.9%   0xBFC53000  6.8%   0x00000000  4.3%
+1000000   0xBFC53000  8.1%   0xBFC58000  4.0%   0x00000000  3.4%
+1200000   0xBFC53000  5.8%   0xBFC58000  5.0%   0x00000000  2.2%
+```
+
+The shape is unambiguous. Four phases:
+
+1. **boot** in BIOS ROM (`0xBFC58000`) with early RAM code
+2. **game code in main RAM** --- `0x00037000`, `0x00031000`, plus the kernel/exception area at
+   `0x0000..0x1000`
+3. **further into RAM** --- `0x0003E000` becomes the hot bucket
+4. **back into BIOS ROM** at `0xBFC50000`, and it **stays** in `0xBFC50000..0xBFC58000` for the
+   remaining two thirds of the run
+
+So the PS1 does reach its own code, and it does not stop there --- it calls back into the BIOS
+and does not come out. That is what a game does when it asks the BIOS to load its next stage
+from CD, and it fits everything else: the title/intro assets are already sitting in VRAM (car
+sprites, vehicle art, title letters), and no drawing command has been issued since.
+
+### This reframes the question, and more usefully than before
+
+It is **not** "why does the GP0 handler never fire". The PS1 simply is not drawing, because it
+is inside a BIOS routine waiting for something. What to identify is what lives at
+`0xBFC50000..0xBFC58000` in this firmware's PS1 BIOS image, and what it polls.
+
+**The CD-ROM is the first candidate.** The game had just finished loading its title assets;
+`0x1F801800` and DMA3 are both registered; and the syscall histogram shows real storage traffic
+(540: 3,265 calls, 604: 281) rather than none --- so the path is live but may not be completing.
+
+### What this supersedes
+
+Three earlier readings in these notes are now wrong:
+
+| earlier claim | what the pc trace shows |
+|---|---|
+| "the BIOS gets stuck after the logo" | it gets much further, into game code, *then* returns |
+| "the billion instructions are a wait loop" | the pc migrates through four distinct phases |
+| "the remaining question is the GP0 dispatch" | the dispatch is never reached because nothing is drawn |
+
+The last one matters most: several sections above were investigating a dispatch that was never
+going to fire, because the question was one layer too low.
