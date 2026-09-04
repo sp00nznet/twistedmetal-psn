@@ -173,7 +173,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | **PS1 leaves the BIOS, runs game code** | ✅ **Done** — live pc moves to main RAM `0x30000..0x3E000` and keeps advancing |
 | PS1 I/O handler map complete | ✅ Done — all 12 windows registered, including every DMA channel |
 | RSX interrupt thread + flip handshake | ✅ Done — `handler_queue` published, user-command handler reached |
-| R3000 runs continuously | 🟨 Partly — **1.1 billion instructions (~14 MIPS)** in a good run; some runs wedge early |
+| R3000 runs continuously | ✅ **Done** — **4.2 billion instructions** in a 360 s run, ~14 MIPS, no plateau |
 | Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |
 | RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
 | PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — packets consumed **and rasterised**; the intro renders from PS1 VRAM |
@@ -185,12 +185,13 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | PS1 CD events opened correctly | ✅ Done — `CdInit` runs; handles `F1000007..F100000B` all valid |
 | PS1 CD interrupt raised + unmasked | ✅ Done — `I_STAT_or=0x0D`, `I_MASK_or=0x0D` (bits 0,2,3) |
 | Init ordering deterministic | ✅ Done — 15 markers, identical sequence in 3 runs; no init race |
-| **Bug 1**: PPU/SPU deadlock | ⬜ **Both sides measured** — PPU waits for spu4 to consume item N; spu4 holds a reservation on the line and waits for it to change again |
+| **Bug 1**: PPU/SPU deadlock | ✅ **FIXED** — `GETLLAR` read guest memory twice; a PPU store between the two reads left the SPU stale and its reservation fresh |
 | **Bug 2**: CD wait | 🔁 **Withdrawn** — the CD loop is left; the census that supported this no longer reproduces |
 | Intro logos render | ✅ **Done** — both Sony title cards, photographed at t=75s and t=90s |
 | Main menu renders and responds | ✅ **Done** — navigable from the keyboard; Enter advances several screens |
 | Intro FMV plays | ⬜ Missing entirely — no video at any point |
-| 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not; deeper screens go black |
+| 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not |
+| **Bug 3**: 24-bit display buffer | ⬜ **Localised** — the stripes are in PS1 VRAM; buffer 0 is filled, buffer 1 is displayed and never written |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

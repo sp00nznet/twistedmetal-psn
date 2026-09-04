@@ -4402,3 +4402,122 @@ never appear in the ring, the geometry is lost upstream in the R3000; if they
 appear and no pixels follow, it is the rasteriser or the composite.
 `PS1_GP0HIST=1` histograms exactly those classes over the last 64 packets, which
 is the next measurement to take against a black 3D screen.
+
+## FIXED: the stall was a GETLLAR that read guest memory twice
+
+One line, and the stall that has dominated this port is gone:
+
+```c
+-   memcpy(ls, mem, MFC_ATOMIC_LINE);
+-   memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);
++   memcpy(ls, mem, MFC_ATOMIC_LINE);
++   memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);
+```
+
+`GETLLAR` copied guest memory **twice** --- once into the SPU's local store,
+once into the reservation snapshot. A PPU store landing *between* the two reads
+gives the SPU a **stale line** and a **fresh snapshot**, and then both halves of
+the wait fail:
+
+- the SPU compares its stale copy, finds `produced == consumed`, decides there
+  is nothing to do, and sleeps on `MFC_LLR_LOST_EVENT`
+- `spu_resv_lost_poll` compares memory against the snapshot --- which already
+  holds the new value --- finds no difference, and never raises the event
+
+Nobody wakes anybody. Hardware cannot reach that state: `GETLLAR` is a single
+atomic 128-byte read, so the reserved data and the reservation come from the
+same instant. Taking the snapshot from `ls` restores that property; a store that
+lands after the read now leaves **both** stale, which is exactly what makes the
+lost-reservation event fire.
+
+### How it was cornered
+
+Every wrong answer cost a build, so the order matters:
+
+| step | result |
+|---|---|
+| `resv_line` writers, whole runtime | exactly **one** --- this GETLLAR |
+| `SPU_LLARWATCH`: every GETLLAR on the line, at the moment it runs | correct: `lsa=0x10800`, and the word that lands equals memory |
+| histogram of those GETLLARs' LSAs | **630,785** of them, `lsa=0x10800` every single time |
+| `SPU_WATCHLSA`: DMAs writing LS `0x10800` | exactly **one** in a whole run, the 3 KB `GET` at startup |
+
+So the snapshot and the local store are written by the same function, from the
+same source, microseconds apart --- and still disagree. Only the gap *between*
+the two reads was left.
+
+One near-miss worth recording: reading `ctx->mfc_lsa` from a later poll showed
+`0x1D580` and pointed at a wrong LSA. That was wrong --- by then the SPU has
+issued other DMA and overwritten the field. Same compare-two-moments mistake as
+the ten retractions above, caught this time *before* publishing.
+
+### Verified
+
+Before, a stalled run gives 18 heartbeats with 2--3 distinct instruction
+totals --- a plateau. After:
+
+```
+run 1: 23 heartbeats, 23 distinct, total=1,677,230,592
+run 2: 23 heartbeats, 23 distinct, total=1,759,231,488
+long:  360 s unattended,           total=4,210,050,368
+```
+
+Every heartbeat a different total, ~14 MIPS sustained, both rendering
+(`vram nonzero=186,727/262,144`). **The Twisted Metal title screen renders in
+full colour**, and the game runs past it.
+
+Two intermittent early failures remain, both predating this fix: over five short
+runs, four reached ~635 M instructions in 45 s and one reached 108 M; a separate
+class never starts the R3000 at all (`total=0`, VRAM zero, SPUs started).
+
+## The green stripes are IN PS1 VRAM, not in the composite
+
+Past the title screen the picture becomes green/magenta vertical stripes. The
+composite was the obvious suspect and is innocent. Two experiments, both
+negative, then the measurement that settled it.
+
+**What changes at that moment** --- the emulator rebinds PS1 VRAM:
+
+```
+fmt=0xE2  1:0x400000  1024x512   15-bit A1R5G5B5 -- title screen, correct
+fmt=0xE1  1:0x4003C0  2048x512   B8, same bytes  -- 24-bit display mode
+```
+
+with texel-space UVs `0..319` x `1..239` and `fp_const c0=(3,0,0,0)`: three
+bytes per pixel, gathered from three consecutive B8 texels. That is how the PS1
+emulator presents 24-bit colour, which is what PS1 FMV and this game's title
+bitmap use.
+
+**Ruled out:**
+
+| tried | result |
+|---|---|
+| B8 decode forcing alpha to 255 instead of the byte | frames **byte-identical** --- alpha is not what drives the green |
+| `YZ_RSX_FP_CONSTANT_MODE=literal` (bypasses the constant buffer) | identical stripes; confirmed `mode=literal` in the log |
+
+**What settled it:** `LD_PLANE_DUMP` writes the bound B8 plane out as a PGM ---
+PS1 VRAM exactly as the guest laid it down, no D3D involved. During the stripe
+phase it contains:
+
+```
+bytes 0 .. ~620      a real image (the title art, legible)
+bytes ~960 .. ~1920  THE STRIPE PATTERN, already there
+```
+
+The stripes are in VRAM. The renderer is faithfully displaying what the PS1
+wrote. And the display window points at byte **0x3C0 = 960**, which at three
+bytes per pixel is **x = 320** --- the *second* 320-wide framebuffer.
+
+So: the PS1 fills buffer 0 correctly and displays buffer 1, which was never
+filled. That is a double-buffer problem upstream of the renderer, and it
+explains both symptoms at once --- the missing FMV and the striped screens
+after the title.
+
+An earlier note in this document called this "a 24-pixel-period pattern from a
+six-entry palette" and treated it as a composite artifact. It was right about
+the pattern and wrong about the place: 24 bytes is 8 pixels at 24-bit, i.e. one
+DCT block, which is what an unfilled or half-decoded frame buffer looks like.
+
+**Next measurement, and it is specific:** watch the destination of GP0 `0xA0`
+(Copy Rectangle, CPU to VRAM) and the display-area register writes. If every
+`0xA0` lands in one buffer while the display flips between two, the flip target
+is never being written --- and that is the whole bug.
