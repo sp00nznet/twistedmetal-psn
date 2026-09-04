@@ -6520,3 +6520,57 @@ branches taken when the status bit or a node pointer is clear. Dumping the two
 nodes at MDEC-state `+0x82C` and `+0x830` names their callbacks outright, and
 the machinery to do it --- `PS3_DEBUG`'s `mem`, plus the node layout --- is
 already in place and used elsewhere in this file.
+
+### The MDEC event nodes, and what one sample of them does and does not prove
+
+`*(TOC-0x7BC8)` resolves to MDEC state **`0x002EB9D0`**, and `*(TOC-0x7B80)` to
+**`0x0076C080`** --- the R3000 state block, which independently confirms the
+`+0x544` in the disassembly really is that block's event-list tail.
+
+So the two node pointers are at `0x002EC1FC` and `0x002EC200`. Read live, 200 s
+into a run, mid-playback:
+
+```
+0x002EC1F0  00 00 00 00 00 00 00 C0 00 00 00 04 00 00 00 00
+0x002EC200  00 00 00 00 00 00 0B 00 00 00 00 00 00 00 00 00
+             ^^^ +0x82C = 00000000        ^^^ +0x830 = 00000000
+```
+
+**Both NULL**, and the handler branches on exactly that:
+
+```
+000E9AEC  lwz   r7, 0x82c(r6)
+000E9AF4  cmpwi cr7, r7, 0
+000E9AF8  beq   cr7, 0xe9d24        ; NULL -> skip
+```
+
+and `0xE9D24` turns out to be only
+
+```
+000E9D24  lwz r29, -0x7b80(r2)
+000E9D28  b   0xe9b44               ; skip to the SECOND node's block
+```
+
+--- a skip, not an allocator. The second node is NULL too, so its block is
+skipped as well. On this path, **nothing is scheduled.**
+
+**What that does not prove.** The block being skipped *unlinks* a node and
+*appends* it to the tail --- that is a **re-schedule** of an already-queued
+event, not a first-time enqueue. So NULL most likely means "no MDEC event
+currently in flight", which is unremarkable in itself, and the code that first
+creates these events is elsewhere.
+
+And it is **one sample**, taken at one instant. Sampling a pointer once and
+concluding it is always null is precisely the error that has produced fourteen
+retractions in this document. It is recorded here as an observation with its
+caveat attached, not as a cause.
+
+**What it is worth.** Both nodes null *during active movie playback* is at least
+suggestive: if MDEC were mid-operation, one would expect an event pending. Making
+that solid needs the pointers sampled repeatedly --- e.g. `PPU_RWATCH` on
+`0x002EC1FC` to catch every read, or the console polled across the phase --- and
+either would settle in one run whether MDEC ever has work in flight at all.
+
+That is the next measurement, and it is a small one. The addresses, the state
+struct, the handler, the branch targets and the event-list layout are all now
+written down.
