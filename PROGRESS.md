@@ -4356,3 +4356,53 @@ Concrete first steps, in order:
 taken inside the loop, and prints `s1!=1, PROBE INVALID` if the register offset is ever wrong
 (the loop sets `$s1 = 1`, so a correct read must show 1). It rejected its own first output. Every
 probe in this port should have been built that way.
+
+## Init ordering is DETERMINISTIC --- the variance is progress rate, not a race
+
+The section above proposed serialising an init race as the next step. That was a guess, and
+measuring it first says **there is no ordering race to serialise.**
+
+Three runs, marker sequence extracted from the existing logs --- no code change needed:
+
+```
+ 1  sys_rsx] gcm ISR queue          9  spu-raw] create -> raw spu 3
+ 2  spu-raw] create -> raw spu 0   10  spu-raw] spu3 START
+ 3  intr] tag 0x52000002           11  spu-raw] create -> raw spu 4
+ 4  spu-raw] spu0 START            12  intr] tag 0x52000402
+ 5  spu-raw] create -> raw spu 1   13  spu-raw] spu4 START
+ 6  spu-raw] spu1 START            14  cellAdec] Open(
+ 7  spu-raw] create -> raw spu 2   15  ISO.BIN.EDAT.dec
+ 8  spu-raw] spu2 START
+```
+
+**Byte-identical ordering in all three.** RSX ISR queue publication, all five raw SPU creations
+and starts, both interrupt tag establishments, cellAdec Open and the disc open happen in the same
+sequence every time. The only difference is that one run also reached a census line.
+
+### So the four "distinct behaviours" are probably one trajectory sampled at different depths
+
+| run | state | position |
+|---|---|---|
+| A | 23--24 buckets, no CD handles | earliest |
+| B | 55 buckets, no handles, VRAM 75k | middle |
+| C | 79--87 buckets, handles valid, in CD loop | late |
+| D | 85 buckets, handles valid, not in loop | late, different instant |
+
+Ordered that way it reads as **progress, not divergence**. And it makes the CD-loop finding
+recoverable rather than refuted: `in_cdloop=0` in run D is consistent with sampling a late run at
+a moment when the pc happened to be elsewhere, not with the loop being absent.
+
+### Which also kills my own proposed next step
+
+*"Serialise the SPU init handshake race"* and *"serialise the RSX ISR queue publication"* were
+both named as prime suspects one section ago. **Neither is supported** --- those events are
+ordered identically every run. Proposing them was the same error as everything else in this
+document: a plausible mechanism asserted without measuring it. It took one zero-code measurement
+to rule out.
+
+### What is actually still open
+
+Why runs advance at such different rates in the same wall-clock window, and whether the
+frozen-instruction-count runs recorded earlier are a genuine stall or just the slow end of that
+spread. That is answerable by plotting `+0x124` against wall time across several runs, and needs
+no new instrumentation.
