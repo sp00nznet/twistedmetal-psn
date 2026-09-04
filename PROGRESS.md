@@ -6671,3 +6671,65 @@ The per-channel record base is `*(TOC-0x7D88)` and the fields the query reads ar
 `+0x20` (a mode/state) and `+0x30` (a count or busy flag). Dumping channel 0 and
 channel 1 records during playback is a small measurement, and it is the one this
 investigation would take next.
+
+## PROVEN AT THE SOURCE: MDEC writes the pattern into PS1 RAM
+
+The DMA channel records resolve from `*(TOC-0x7D88)` = `0x002DEDE8`, 0x38 bytes
+per channel. Read twice during playback, both MDEC channels are **live**:
+
+```
+ch0 (MDEC-in)   +0x10: 001D61B4 -> 001E88B4     source, inside the coefficient range
+ch1 (MDEC-out)  +0x10: 001F5530 -> 001F5230     destination
+                +0x24/28/2C: 001B5DE8 / 001B5DE0 / 001B5E18   callback OPDs
+```
+
+Addresses advance between samples, so both channels are transferring. Channel 0's
+source lies exactly in the range the Huffman stage writes to (`0x801Cxxxx` --
+`0x801E7xxx` physical `0x1Cxxxx`--`0x1E7xxx`), which independently confirms the
+coefficient buffer feeds MDEC-in.
+
+Channel 1's destination is MDEC's **output**: PS1 `0x001F5530` = guest
+`0x00965CB0`. Read live:
+
+```
+0x00965C00  F8 00 00 F8 00 FF FF FF 00 F8 00 00 F8 00 00 F8
+0x00965C10  00 00 F8 00 00 F8 00 00 F8 00 FF 00 FF FF FF FF
+0x00965C20  00 F8 00 00 F8 00 00 F8 00 00 F8 00 00 F8 00 00
+```
+
+As 24-bit triples: `(F8,00,00)` red, `(00,F8,00)` green, with occasional
+`(FF,FF,FF)` white. **That is the pattern, in MDEC's own output buffer, before
+any blit touches it.**
+
+### The chain is now closed with a positive measurement at every stage
+
+```
+disc -> STR bitstream
+     -> [R3000 software Huffman]   VERIFIED CORRECT   (well-formed blocks, 0xFE00)
+     -> [DMA ch0 MDEC-in]          VERIFIED ACTIVE    (source advancing, in range)
+     -> [MDEC]                     *** WRITES THE PATTERN ***  (measured here)
+     -> [DMA ch1 MDEC-out]         VERIFIED ACTIVE    (destination advancing)
+     -> [SPU Host2Local_Body]      VERIFIED CORRECT   (read as code)
+     -> [DMA to PS1 VRAM]          VERIFIED CORRECT   (full row coverage)
+     -> [texture bind]             VERIFIED CORRECT   (single unit, formats)
+     -> [composite]                VERIFIED CORRECT   (screen rebuilt from bytes)
+```
+
+No stage is inferred any more. The defect is **inside MDEC**, proven by reading
+its output buffer rather than by eliminating everything else.
+
+### What the pattern says about the fault
+
+Saturated primaries --- pure red, pure green, pure white --- are what a
+YUV-to-RGB conversion produces when its inputs are extreme or constant: a
+luma/chroma pair that never varies, or coefficients that clip. It is not noise
+and it is not stale memory; it is arithmetic on wrong values.
+
+That is the shape of the remaining bug, and it sits in the four-function MDEC
+module (`func_000E9A18`, `func_000EA2F0`, `func_000EA44C`, `func_000EAA88`) whose
+handlers contain no arithmetic themselves --- so the conversion happens in code
+those functions reach through the DMA callbacks at channel-record `+0x24`,
+`+0x28` and `+0x2C`: OPDs `0x001B5DE8`, `0x001B5DE0` and `0x001B5E18`.
+
+Those three OPDs are the next thing to resolve, and resolving an OPD is one
+lookup. That is where this investigation ends and the fix begins.

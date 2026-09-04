@@ -191,7 +191,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Main menu renders and responds | ✅ **Done** — reproduced unattended via `PAD_SCRIPT`; background art correct, inner panel black |
 | Intro FMV plays | 🟨 **Partly** — frames render and advance (logo reveal captured); rows are written in full but ~2/3 of the SOURCE is a 2-pixel red/green pattern, so the defect is in MDEC decode |
 | 3D on top of the menu | ✅ **Done** — `DrawEdge` reaches VRAM once past the movie (93k entries, 4.5k VRAM writes) |
-| **Bug 6**: MDEC returns a pattern | ⬜ **Bounded to four functions** — `func_000E9A18`/`EA2F0`/`EA44C`/`EAA88`, running, verified-correct input, verified-correct output path; blocks the FMV picture **and** attract mode |
+| **Bug 6**: MDEC writes the pattern | ⬜ **Proven at MDEC’s own output buffer** (guest `0x00965CB0`): saturated red/green/white, before any blit. Every other stage positively verified |
 | Polygon rasteriser works | ✅ **Done** — `DrawEdge` 0 → **88,040** entries/SPU once driven off the title screen; the 2D phase simply had no polygons |
 | **Bug 3**: menu inner panel is black | ⬜ Background blit arrives; the panel content does not |
 | **Bug 4**: core reset at 2^32 cycles | ⬜ Counter wrap at ~4.27B (2^32 = 4.295B) — happens undriven too; input is not involved |
