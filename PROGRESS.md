@@ -4972,3 +4972,48 @@ Where to look: the CPU-to-VRAM transfer path for 24-bit data. A 320-pixel
 16-bit words --- a width taken in the wrong unit, or a destination advanced by
 one byte per source halfword instead of three, produces exactly a one-third
 fill.
+
+### Who actually writes PS1 VRAM, and where it lives
+
+Two corrections to long-standing notes, both from direct measurement.
+
+**PS1 VRAM is at guest `0x40600000`.** It was assumed to be `0xC0400000` --
+`cellGcmSys`'s `localAddress` (`0xC0000000`) plus the texture offset
+`0x400000`. Watching that address caught no writes at all from either the PPU
+store path or SPU DMA, which reads exactly like a finding and was simply the
+wrong address. The heartbeat now prints the real EA once
+(`[ps1] VRAM guest EA = 0x40600000`), so nobody derives it again.
+
+**The GPU SPUs do write VRAM.** An earlier note recorded "spu1..3 writing only
+bucket 0 and spu0 buckets 1..3, with nothing in bucket 4 -- where the composite
+samples PS1 VRAM". Against the correct address, `SPU_WATCHEA` on one VRAM byte
+returns 218 transfers in 120 s:
+
+```
+spu2  cmd=0x20 (PUT)  ea=0x40632000  size=256  lsa=0x24100  pc=0x002E0
+spu0  cmd=0x40 (GET)  ea=0x40632030  size=48   lsa=0x1D5B0  pc=0x00598
+spu0  cmd=0x20 (PUT)  ea=0x40632030  size=48   lsa=0x1D5B0  pc=0x004DC
+```
+
+spu2 writes 256-byte blocks; spu0 does 48-byte **read-modify-write** pairs --
+and 48 bytes is exactly the period of the stripe pattern measured above.
+
+The pixels in the striped region decode as PS1 15-bit values, and the run of
+them at one address is `0x0000 -> 0x00F8 -> 0x83E0`. `0x83E0` is R=0, G=31, B=0
+with bit 15 set: **pure green with the mask bit marked**. That is the green.
+
+**A hypothesis tested and dropped:** the repeated GET/PUT of an unchanged
+`0x83E0` looked like PS1 mask-bit (STP) rejection discarding every later write
+to that region -- which would have been a clean explanation. It is not: the
+value at that address *does* change across the run. The 48-byte block is simply
+the rasteriser's granularity, and only some pixels inside it are covered by any
+one primitive. Recorded because it was one step from being published as a cause.
+
+**What is still open:** the region the 24-bit display window points at holds
+about one third real image data and two thirds older 15-bit content. Both facts
+are now measured; what is not established is whether the game intends an FMV
+there at all. Buffer 0 reinterpreted as 24-bit RGB shows a genuine frame
+(architecture and rubble) for its first ~104 pixels, so MDEC output does reach
+VRAM -- partially. The next measurement is what fills the other two thirds:
+`SPU_WATCHEA` on an address inside a *known-blank* span, with the transfer
+geometry, says whether those bytes are written and skipped or never addressed.
