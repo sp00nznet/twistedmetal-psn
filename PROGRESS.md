@@ -5216,3 +5216,35 @@ knowing, because it would sidestep the SPU rasteriser entirely.
 `gpuCmdFetchBuffer` is almost certainly the GP0 ring these notes have been
 calling "the ring", and `gpuVramEx` / `gpuStateEx` name the VRAM and GPU-state
 structures --- useful handles for the next lap.
+
+### CLOSED: the quirk lookup works --- it finds this game and reads its parameters
+
+Measured with a new PPU read watch (`PPU_RWATCH=<hex>[,len]`), because a lookup
+only *reads* and every existing watch in the runtime is a store watch:
+
+```
+PPU_RWATCH=1B324C,16   (Twisted Metal's record)
+  [rwatch] n=1 read4 0x001B324C guest-fn=0x000BD428    <- serial pointer
+  [rwatch] n=2 read4 0x001B3250 guest-fn=0x000BD428    <- parameter count
+  [rwatch] n=3 read4 0x001B3254 guest-fn=0x000BD428    <- parameter pointer
+
+PPU_RWATCH=172624,8    (its (2, 0x1C) parameter blob)
+  [rwatch] n=1 read4 0x00172624 guest-fn=0x000BD428
+  [rwatch] n=2 read4 0x00172628 guest-fn=0x000BD428
+```
+
+`func_000BD428` reads exactly the three record fields and then both words of the
+parameter pair, once, at init. So:
+
+- the emulator **does** identify this disc as `SCUS_943.04`
+- it **does** read the quirk this title is listed with
+- the argv-vs-`SYSTEM.CNF` serial-format worry was unfounded
+
+The lookup is not the bug. It also confirms the record layout inferred from the
+image was right, since precisely `+0x00`, `+0x04` and `+0x08` are the words read.
+
+`func_000BD428` is the quirk consumer --- a large init routine (0x1D40-byte
+stack frame) that works from `*(TOC-0x7E50)` = `0x0015F840` and
+`*(TOC-0x7E4C)` = `0x002DC274`. What quirk id 2 with value 28 actually changes
+is still unread; that means reading that function, which is a job of its own
+rather than a measurement.
