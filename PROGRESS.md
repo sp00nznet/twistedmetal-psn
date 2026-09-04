@@ -5145,3 +5145,74 @@ claimed as a fix for this symptom.
 
 Worth noting for the next lap: `6428a66 rsx: decode R5G5B5A1, and let a decoded
 texture be looked at` is also unmerged on this branch.
+
+## The firmware carries a 349-title quirk table --- and Twisted Metal is in it
+
+`ps1_netemu` ships a per-title compatibility table, and this game has its own
+entry. Found by pulling readable strings out of the image, which also yields the
+emulator's internal module and thread names.
+
+### The table
+
+349 sixteen-byte records at vaddr **`0x001B1E5C .. 0x001B341C`**:
+
+```
++0x00  char*  PS1 disc serial, e.g. "SCUS_943.04"   (strings at 0x00172C08..0x00174198)
++0x04  u32    count of parameter pairs
++0x08  u32*   pointer to the parameter blob
++0x0C  u32    hash / checksum
+```
+
+Twisted Metal's record:
+
+```
+rec[319] @0x001B324C   SCUS_943.04
+         count=00000001   params=0x00172624   hash=2C9D6E1E
+   params: (2, 0x1C)      -- one pair: id 2, value 28
+```
+
+Neighbours for scale: `SCUS_943.09`, `SCUS_943.02`, `SCUS_943.01`,
+`SCUS_943.56`, `SCUS_943.55` all carry count=1; `SLUS_000.42` carries 3. So the
+blob is a list of (id, value) quirks and most titles need exactly one.
+
+**Why this matters:** if the emulator looks a title up by the serial from its
+disc and applies these quirks, then a lookup that fails leaves the title running
+unpatched. Whether ours matches is not yet established --- the run passes
+`SCUS94304` in argv while the table is keyed `SCUS_943.04`, which is the form
+taken from the disc's own boot filename, so the comparison is presumably against
+`SYSTEM.CNF` rather than argv. Confirming it is the next thing to do, and it is
+cheap: a read watch on `0x001B324C` or on the string at `0x00173FC8` says
+outright whether the lookup reaches this game's record.
+
+The consumer was not located statically. The base is not held in any word of
+the image, is not built by any `lis`, and is not formed by
+`addis rX, r2, -2` + `addi` (all three searched), so it is reached some other
+way --- a runtime read watch is the cheaper route than continuing to guess.
+
+### The emulator's own names, free from the same strings
+
+```
+gpuio.cc: gpuCmdInterruptHandlerThread    gpusoft.cc      sgpu_spu.elf
+gpu1InSpuIO / gpu1InSpuIO_Ptr             gpuStateEx      gpuVramEx
+gpuCmdFetchBuffer                         spu.c           cell/xspu.cc
+```
+
+And the guest thread names, via `PS3_GUEST_PROF`:
+
+```
+tid=2  _gcm_intr_thread                tid=8   _xcdrom_thread
+tid=5  gpuCmdInterruptHandlerThread    tid=9   xPadThread
+tid=6  _xSPUWaveOut                    tid=10  _xMcThread
+tid=7  SPUCxInterruptHandlerThread     tid=11  _PSPiStorageThread
+```
+
+Two of these settle open questions. **`_xSPUWaveOut` is tid 6** --- the thread
+that receives on queue 4 and signals spu4 --- which confirms spu4 is the audio
+core and that the GETLLAR deadlock fixed above lived in the *audio* pipeline.
+And **`gpusoft.cc` exists**, so the firmware contains a software GPU path
+alongside `sgpu_spu.elf`; whether it can be selected is unknown and worth
+knowing, because it would sidestep the SPU rasteriser entirely.
+
+`gpuCmdFetchBuffer` is almost certainly the GP0 ring these notes have been
+calling "the ring", and `gpuVramEx` / `gpuStateEx` name the VRAM and GPU-state
+structures --- useful handles for the next lap.
