@@ -193,7 +193,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not |
 | Polygon rasteriser works | ✅ **Done** — `DrawEdge` 0 → **88,040** entries/SPU once driven off the title screen; the 2D phase simply had no polygons |
 | **Bug 3**: menu inner panel is black | ⬜ Background blit arrives; the panel content does not |
-| **Bug 4**: deterministic core reset | ⬜ After the menu, at ~4.25B instructions, reproducible from a fixed `PAD_SCRIPT` |
+| **Bug 4**: core reset at 2^32 cycles | ⬜ Counter wrap at ~4.27B (2^32 = 4.295B) — happens undriven too; input is not involved |
+| **Bug 5**: blank screen after the FMV | ⬜ No polygon is drawn and the attract demo never begins; driven runs go blank after the menu too |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

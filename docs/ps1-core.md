@@ -5183,3 +5183,57 @@ correctly out of the lifted SPU bit-ops (`cgt` / `selb` / `ai` / `ceqi`) is the
 next job --- and it is code reading on a 776-byte function with its real name and
 its inputs already measured, which is a far better position than any lap before
 it.
+
+## The core reset is a 32-bit counter wrap, not the input script
+
+### Correction
+
+The previous section called the post-menu core reset "deterministic and caused by
+the input script, not random", on the evidence of two driven runs resetting at
+the same point. An **undriven** 400 s run resets at the same point too:
+
+```
+seq run      (driven)    4,253,258,101 -> 30,636,406
+pchist run   (driven)    4,285,016,511 -> 64,483,328
+undriven                 4,271,258,880 -> 50,554,333
+```
+
+All three land just under **2^32 = 4,294,967,296**. The reset is a **32-bit wrap
+of the R3000 instruction counter**, and input has nothing to do with it. Two
+driven samples looked like a pattern; the third sample, from the other run class,
+killed it. Eleventh instance of the same mistake in this document, and the first
+one caught within a lap of making it.
+
+`state+0x124` is the 32-bit counter the scheduler compares event due times
+against (`func_00105FA8`, disassembled earlier). ~2^32 cycles is ~127 s of PS1
+time, so every run of more than about two emulated minutes crosses it. Whether
+`ps1_netemu` handles the wrap and this port breaks it, or the reset is the
+emulator's own deliberate resynchronisation, is not yet established --- but it is
+now a specific thing to look at, in a function already read.
+
+### Attract mode does not start on its own
+
+Same 400 s undriven run, `SPU_PCHIST=1`, sampling the window every 10 s from
+t=120 to t=390:
+
+```
+26 captures, ALL 8342 bytes -- identical, blank
+DrawEdge: absent from the histogram entirely (zero, all four SPUs)
+DrawRect: 413,410     BlockClear: 11,655     H2L_Body: 798,687,868 (spu0)
+```
+
+So without input the sequence is:
+
+```
+intro cards -> title screen -> intro FMV (partial) -> BLANK, indefinitely
+```
+
+The screen goes blank after the FMV and never recovers, and no polygon is ever
+drawn, so the attract demo never begins. VRAM still holds 151,084 non-zero words
+and the guest keeps executing (79 heartbeats, counter still climbing after the
+wrap), so this is not a hang of the emulator --- it is the title sitting on a
+screen it never draws.
+
+With input the sequence instead reaches the main menu, and there too the screen
+goes blank after the selection. **Both paths end blank**, which points at one
+mechanism rather than two.
