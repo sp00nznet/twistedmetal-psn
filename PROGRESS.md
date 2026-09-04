@@ -3521,3 +3521,70 @@ Three earlier readings in these notes are now wrong:
 
 The last one matters most: several sections above were investigating a dispatch that was never
 going to fire, because the question was one layer too low.
+
+## ROOT CAUSE: the PS1 BIOS is spinning in a three-event `TestEvent` poll loop
+
+Refining the pc probe from 4 KB to 64-byte buckets names the loop. Steady-state hot spots:
+
+```
+pc~0xBFC53840  4.4%      pc~0x00001EC0  1.9%
+pc~0xBFC58B40  4.0%      pc~0x00000080  1.8%    (PS1 general exception vector)
+pc~0xBFC53880  3.4%      pc~0xBFC51940  1.6%
+```
+
+`0xBFC58B60` is a PS1 BIOS syscall trampoline, in the classic form:
+
+```
+BFC58B60  addiu $t2, $zero, 0xb0
+BFC58B64  jr    $t2
+BFC58B68  addiu $t1, $zero, 0xb       ; B-table function 0x0B = TestEvent
+```
+
+and `0xBFC53840` calls it three times, over three different event descriptors:
+
+```
+BFC53850  lw   $a0, -0x4de4($a0)      ; event 1 (kernel data, 0xA001xxxx)
+BFC53854  jal  0xbfc58b60             ; TestEvent
+BFC5385C  bne  $v0, $s1, 0xbfc5386c
+BFC53870  lw   $a0, -0x4dd8($a0)      ; event 2
+BFC53874  jal  0xbfc58b60             ; TestEvent
+BFC5387C  beq  $v0, $s1, 0xbfc5365c
+BFC53888  lw   $a0, -0x4ddc($a0)      ; event 3
+BFC5388C  jal  0xbfc58b60             ; TestEvent
+```
+
+**Three kernel events, polled in a loop, forever.** The neighbouring hot bucket `0xBFC58B40` is
+the same trampoline block (its entries are `$t1` = `0x0C` EnableEvent, `9` CloseEvent, `0x0B`
+TestEvent), and `0x00000080` being hot is the PS1 general exception vector --- interrupts are
+being taken normally, so the machine is healthy and simply **waiting**.
+
+### The complete chain
+
+```
+the PS1 boots the BIOS, loads the game, runs its own code in main RAM
+  -> the game calls a BIOS service
+     -> the BIOS parks polling three kernel events with TestEvent
+        -> those events are never delivered
+           -> the game never resumes, so it never draws again
+              -> only type-8 sync packets reach the GP0 ring
+                 -> the GPU SPUs idle in their poll loop
+                    -> the display framebuffer never receives an image
+```
+
+The question this document spent several sections on --- *"why does the GP0 handler never
+fire?"* --- was **two layers too low.** The handler is registered correctly and the dispatch is
+fine; nothing is being drawn to dispatch.
+
+### The CD-ROM is the strongest candidate
+
+Stated as a candidate, not a conclusion:
+
+* three events polled together is the shape of the BIOS CD driver's wait (complete /
+  data-ready / error)
+* the game had just finished loading its title and intro assets into VRAM --- car sprites,
+  vehicle art, title letters --- so a *further* read is exactly what it would do next
+* the storage path is live but may not be completing (syscall 540: 3,265 calls, 604: 281)
+
+Confirming it means reading which event **classes** those three descriptors hold. Those are
+runtime values in PS1 kernel RAM around `0xA000B21C`, so it is a memory read rather than a
+disassembly --- and the PS1 CD event class is `0xF0000003`.
