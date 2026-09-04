@@ -3883,3 +3883,53 @@ never set, an `EvMdNOINTR` waiter on class 9 polls forever --- the observed shap
 
 Each took a single disassembly to settle, and each had been stated from recall instead. That is
 the cheapest lesson available in this port and it took three repeats to land.
+
+## RETRACTION: the blocked waiter is the CD loop, not the SPU event
+
+The two sections above claimed the party actually blocked is waiting on the SPU interrupt event,
+on the strength of it being the only open event in the EvCB table. **That was a conflation of
+two different facts and it is wrong.**
+
+The loop the pc actually sits in closes back on itself:
+
+```
+BFC5384C  lui   $a0, 0xa001
+BFC53850  lw    $a0, -0x4de4($a0)     ; CD event slot 0xB21C (zero)
+BFC53854  jal   0xbfc58b60            ; TestEvent
+...
+BFC53888  lw    $a0, -0x4ddc($a0)     ; CD event slot 0xB224 (zero)
+BFC5388C  jal   0xbfc58b60            ; TestEvent
+BFC538A4  bgtz  $s0, 0xbfc5384c       ; <- branches back to the first one
+```
+
+`0xBFC5384C`, `0xBFC53880` and the `0xBFC58B40` trampoline block are exactly the three hottest
+64-byte pc buckets, so **this** loop is where the R3000 is. It polls the CD handles, and those
+are zero.
+
+*"The only event open in the table"* and *"the event being waited on"* are not the same claim,
+and I treated the first as the second. The single open event (class 9, I_STAT bit 9 = SPU) is
+almost certainly a normal, healthy SPU init leftover and has nothing to do with the stall.
+
+### The root cause reverts to this, and it was right before
+
+```
+BIOS CdInit never runs
+  -> all five HwCdRom handles stay zero
+     -> the BIOS CD wait loop at 0xBFC5384C polls null handles with TestEvent
+        -> it can never succeed; the game never resumes or draws
+```
+
+### The pattern, which is now the main finding of the session
+
+This is the **fourth consecutive** conclusion corrected, and this one was mine end to end ---
+not a misremembered table but an unjustified inference laid on top of a good measurement. The
+EvCB dump was worth doing and its result (one open event, class 9) is solid; what I built on it
+was not.
+
+**Every time I moved from "here is what I measured" to "therefore the cause is X" without
+measuring X itself, X was wrong.** Four times in a row, each caught only by going back and
+reading the code.
+
+That is worth more to whoever picks this up than any single address in these notes: the
+measurements in this document are reliable, and the causal claims connecting them should each be
+re-derived before being trusted.
