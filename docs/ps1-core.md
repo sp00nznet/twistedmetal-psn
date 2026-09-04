@@ -2570,3 +2570,78 @@ quad samples from x = 0, that is the whole story, and it is a texture-coordinate
 pipeline one.
 
 The next step is one log line: the vertex UVs of the draw that binds `1:0x00400000`.
+
+## The renderer produces a picture. It draws the wrong data.
+
+This section corrects the two before it, and both corrections come from the same
+mistake made a seventh time.
+
+### "All surfaces black" was an early-boot artifact
+
+`LD_SURF_DUMP` fired at a frame number, so every dump was a snapshot of framebuffers the PS1 had
+not drawn into yet. `nonblack=0` was the correct reading of an empty source. Gating the dump on
+PS1 VRAM actually holding a drawn frame (`LD_SURF_DUMP_ON_VRAM=1`, `PS1_VRAM_READY=150000`)
+instead:
+
+```
+slot=1 0:0x00000000 720x512  nonblack=72687
+slot=2 0:0x00A20000 720x512  nonblack=326656    (89% of 368,640)
+slot=5 0:0x01401C00 1280x720 nonblack=817920
+slot=6 0:0x00310000 1280x720 nonblack=817920    (89% of 921,600, PRESENTED)
+slot=8 0:0x00694000 1280x720 nonblack=817920
+```
+
+**The renderer produces a picture covering 89% of the presented surface.** Every "the screen is
+black" claim in this repo applies to the first ten seconds of boot and to nothing else.
+
+### Two experiments that made this reachable
+
+Neither is a fix. Both replaced an argument with a measurement, and without them the artifact
+above would still be sitting in the docs as a conclusion.
+
+* **`LD_CLEAR_TEST=1`** clears to magenta. It proved the readback can see a non-black pixel
+  (293,194 on a 720x512 surface) *before* anything was concluded from zeros.
+* **`LD_FORCE_GREEN=1`** makes every fragment program return solid green. It filled every
+  surface to exactly 368,640 (720x512) and 921,600 (1280x720) --- proof that the draws reach the
+  GPU and write every pixel.
+
+### What it draws is wrong
+
+Both the 720x512 composite and the 1280x720 upscale come out as **uniform green with a regular
+pattern of magenta and blue dots**. That is the signature of CLUT-indexed texture data read as
+15-bit direct colour --- exactly how the asset regions of PS1 VRAM look in a `PS1_FBDUMP`.
+
+So the composite samples plausible but wrong data, and everything around it is verified good:
+
+| checked | result |
+|---|---|
+| the UVs | the guest's own: x=1..638, y=2..474 of the 1024x512 texture at `0x400000` |
+| GPU state | viewport 0,0 720x512, scissor full, depth off, colour mask all, blend off, cull off |
+| the decode | `remap=0xAA6C` forces no channel to zero; decoded non-black climbs 0 -> 3,135 as VRAM fills |
+| the draws | reach the GPU and cover the surface (`LD_FORCE_GREEN`) |
+| the readback | sees non-black when there is non-black (`LD_CLEAR_TEST`) |
+
+**The remaining question:** which VRAM region holds the *rendered* PS1 framebuffer? The
+composite samples `0x400000` rows 2..474, and that is asset data. PS1 VRAM is 1024x512 with the
+display buffer and the texture/CLUT pages sharing it, so a PS1_FBDUMP taken at
+`PS1_VRAM_READY=150000` --- when non-zero words reach 182,968 of 262,144 and `first=+0x0` ---
+read against the sampled rect will say directly whether the display buffer is somewhere else.
+
+### The count of this mistake
+
+Seven times now, one shape: **treating a measurement as a property of the system without first
+establishing that the measurement could have seen the alternative.**
+
+| # | what looked true | why it was not |
+|---|---|---|
+| 1 | sem 1 never posted | log capped at 40 lines |
+| 2 | 24 posts to sem 1 | `grep` matched `sem=10` too |
+| 3 | `GetPcmItem` never called | it had no log line |
+| 4 | SPUs blocked forever on `rdch` | a transient during init |
+| 5 | the SPU kick is lost | local store is aliased; correct writes log nothing |
+| 6 | runs vary 0..75,527 VRAM words | my own 1.5 MB-per-heartbeat dump caused it |
+| 7 | all surfaces black | dumped before the PS1 had drawn |
+
+Two of the seven (6 and 7) were caused by the probe itself. The rule that catches all of them,
+and the reason `LD_CLEAR_TEST` and `LD_FORCE_GREEN` exist: **before concluding "X never
+happens", make X happen on purpose and check the probe reports it.**

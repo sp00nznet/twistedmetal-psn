@@ -177,7 +177,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — verified: **21,206 packets consumed** in step with production |
 | **PS1 renders (BIOS boot screen in VRAM)** | ✅ **Done** — dumped and read: PlayStation logo + SCEA licence text |
 | **PS1 game runs and loads its art** | ✅ **Done** — VRAM holds Twisted Metal car sprites and title letters |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — one question left: which part of VRAM the composite quad samples |
+| **Renderer produces a picture** | ✅ **Done** — 89% of the presented 1280x720 surface is drawn |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — the composite samples the wrong VRAM region (asset data, not the display buffer) |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

@@ -1,0 +1,128 @@
+struct PSInput {
+    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;
+    float4 fog : FOG;
+    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;
+    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;
+};
+Texture2D    rsx_tex[16] : register(t0);
+SamplerState rsx_samp[16] : register(s0);
+cbuffer PSConstants : register(b1) {
+    float4 fp_constants[16];
+    float4 fp_alpha;
+};
+float4 main(PSInput input) : SV_TARGET {
+    float4 r[48]; float4 h[48];
+    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }
+    float4 cc0 = (float4)0; float4 cc1 = (float4)0;
+    { float4 _v = (float4)((input.tc0).xyzw); r[2].xy = _v.xy; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[0]).xxxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(((r[2]).xxxy) + ((fp_constants[1]).yzyz)); r[2].zw = _v.zw; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[1].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[2]).xyxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[3].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[3]).xyxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[3]).xyzw) + ((r[0]).xyzw)); r[3].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[4]).xyxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[1]).xyzw) + ((r[0]).xyzw)); r[1].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xxxy) + ((fp_constants[5]).xxxy)); r[0].zw = _v.zw; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).zwzz).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[3]).xyzw) + ((r[0]).xyzw)); r[3].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[6]).xyxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[1]).xyzz) + ((r[0]).xyzz)); r[1].xyw = _v.xyw; }
+    { float4 _v = (float4)(((r[2]).xxxy) + ((fp_constants[7]).xxxy)); r[0].zw = _v.zw; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).zwzz).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[3]).xyzw) + ((r[0]).xyzw)); r[3].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[8]).xxxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[1]).xywz) + ((r[0]).xyzw)); r[1].xyz = _v.xyz; }
+    { float4 _v = (float4)((float4)(((r[1]).wwww) != (-((r[0]).zzzz))));
+      cc0.y = _v.y;
+    }
+    { float4 _v = (float4)(((r[1]).xxxx) + ((r[1]).yyyy)); r[3].w = _v.w; }
+    { float4 _v = (float4)(((r[2]).xxxy) + ((fp_constants[9]).xxxy)); r[0].zw = _v.zw; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).zwzz).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[3]).xyzw) + ((r[0]).xyzw)); r[3].xyz = _v.xyz; }
+    { float4 _v = (float4)((fp_constants[10]).xxxx); r[0].w = _v.w; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[11]).xyxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[3]).xyzw) + ((r[0]).xyzw)); r[3].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((fp_constants[12]).xyxx)); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[0]).xyzw).xy * float2(0.00138888889, 0.001953125))); r[0].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[3]).xyzw) + ((r[0]).xyzw)); r[3].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[1]).zzzz) * ((r[1]).zzzz)); r[0].x = _v.x; }
+    { float4 _v = (float4)(((r[3]).xyzw) * ((r[3]).xyzw)) / 4.0; r[1].w = _v.w; }
+    { float4 _v = (float4)((r[3]).wwww) / 2.0; r[0].y = _v.y; }
+    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((r[2]).zwzz).xy * float2(0.00138888889, 0.001953125))); r[2].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[1]).xyzw) * ((r[1]).yyyy) + (-((r[0]).xyzw))); r[0].x = _v.x; }
+    { float4 _v = (float4)((fp_constants[13]).xxxx); r[2].w = _v.w; }
+    { float4 _v = (float4)((float4)(((r[1]).wwww) >= ((r[0]).xyzw)));
+      cc0.x = _v.x;
+    }
+    { float4 _v = (float4)(((r[1]).xyzw) + (-((r[0]).xxxx))); r[1].w = _v.w; }
+    { float4 _v = (float4)(((r[3]).xyzw) + ((r[2]).xyzw)); r[2].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).xyzw) + ((r[1]).xyzw)); r[1].x = _v.x; }
+    { float4 _v = (float4)((abs(abs((r[1]).xyzw)) > 0.0 ? (abs((r[1]).xyzw)) / sqrt(abs(((r[1]).wwww).x)) : (float4)0.0));
+      float4 _p = (float4)((cc0).xxxx != (float4)0.0);
+      r[2].w = lerp(r[2].w, _v.w, _p.w);
+    }
+    { float4 _v = (float4)((r[1]).xyzw); r[1].xyz = _v.xyz; }
+    { float4 _v = (float4)(((r[2]).zzzz) + ((r[1]).zzzz)); r[1].w = _v.w; }
+    { float4 _v = (float4)(((r[2]).yyyy) + ((r[1]).yyyy)); r[2].x = _v.x; }
+    { float4 _v = (float4)(((r[0]).yyyy) + ((r[2]).wwww)); r[0].x = _v.x; }
+    { float4 _v = (float4)(((r[0]).yyyy) + (-((r[2]).wwww))); r[0].z = _v.z; }
+    { float4 _v = (float4)(((r[1]).xyzw) * ((r[1]).xyzw)); r[2].w = _v.w; }
+    { float4 _v = (float4)((r[1]).zzzz); r[0].y = _v.y; }
+    { float4 _v = (float4)(((r[1]).xyzw) * ((r[2]).xyzw) + (-((r[2]).wwww))); r[3].x = _v.x; }
+    { float4 _v = (float4)(((r[1]).xxxx) + ((r[2]).xxxx)); r[2].w = _v.w; }
+    { float4 _v = (float4)((float4)((abs((r[0]).xyzw)) <  (abs((r[0]).zzzz))));
+      cc0.x = _v.x;
+    }
+    { float4 _v = (float4)((r[0]).xyzw); r[3].z = _v.z; }
+    { float4 _v = (float4)((r[0]).xxxx);
+      float4 _p = (float4)((cc0).xxxx != (float4)0.0);
+      r[3].z = lerp(r[3].z, _v.z, _p.z);
+    }
+    { float4 _v = (float4)(((r[2]).wwww) * ((r[2]).wwww)) / 4.0; r[0].x = _v.x; }
+    { float4 _v = (float4)((float4)(((r[0]).xyzw) >= ((r[3]).xyzw)));
+      cc0.x = _v.x;
+    }
+    { float4 _v = (float4)(((r[0]).xxxx) + (-((r[3]).xxxx))); r[3].w = _v.w; }
+    { float4 _v = (float4)((abs(abs((r[3]).xyzw)) > 0.0 ? (abs((r[3]).xyzw)) / sqrt(abs(((r[3]).wwww).x)) : (float4)0.0));
+      float4 _p = (float4)((cc0).xxxx != (float4)0.0);
+      r[0].w = lerp(r[0].w, _v.w, _p.w);
+    }
+    { float4 _v = (float4)((-((r[1]).yyyy)) + ((r[3]).zzzz)); r[0].x = _v.x; }
+    { float4 _v = (float4)(dot(((r[0]).xyzw).xy, ((r[0]).xyzw).xy)); r[0].z = _v.z; }
+    { float4 _v = (float4)((fp_constants[14]).xxxx); r[1].xy = _v.xy; }
+    { float4 _v = (float4)((abs((r[0]).xyzw) > 0.0 ? ((r[0]).xyzw) / sqrt(abs(((r[0]).zzzz).x)) : (float4)0.0));
+      float4 _p = (float4)((cc0).yyyy != (float4)0.0);
+      r[1].xy = lerp(r[1].xy, _v.xy, _p.xy);
+    }
+    { float4 _v = (float4)((r[2]).xyzw) / 2.0; r[2].w = _v.w; }
+    { float4 _v = (float4)(((r[2]).wwww) + ((r[0]).wwww)); r[2].y = _v.y; }
+    { float4 _v = (float4)(((r[2]).xyzw) + (-((r[0]).xyzw))); r[2].w = _v.w; }
+    { float4 _v = (float4)((float4)((abs((r[2]).yyyy)) <  (abs((r[2]).wwww))));
+      cc0.x = _v.x;
+    }
+    { float4 _v = (float4)((r[2]).yyyy);
+      float4 _p = (float4)((cc0).xxxx != (float4)0.0);
+      r[2].w = lerp(r[2].w, _v.w, _p.w);
+    }
+    { float4 _v = (float4)((float4)(((r[2]).zzzz) != (-((r[1]).zzzz))));
+      cc0.x = _v.x;
+    }
+    { float4 _v = (float4)((r[1]).xyzw); r[0].w = _v.w; }
+    { float4 _v = (float4)(((r[2]).wwww) + (-((r[2]).xxxx))); r[0].z = _v.z; }
+    { float4 _v = (float4)((fp_constants[15]).xxxx); r[0].xy = _v.xy; }
+    { float4 _v = (float4)(dot(((r[0]).zwzz).xy, ((r[0]).zwzz).xy)); r[1].z = _v.z; }
+    { float4 _v = (float4)((abs((r[0]).zwzz) > 0.0 ? ((r[0]).zwzz) / sqrt(abs(((r[1]).zzzz).x)) : (float4)0.0));
+      float4 _p = (float4)((cc0).xxxx != (float4)0.0);
+      r[0].xy = lerp(r[0].xy, _v.xy, _p.xy);
+    }
+    { float4 _v = (float4)((r[1]).xxxy); r[0].zw = _v.zw; }
+    float4 _o = r[0];
+    return (_o == _o) ? _o : (float4)0;
+}
