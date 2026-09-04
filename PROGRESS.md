@@ -5704,3 +5704,62 @@ That is a hypothesis, not a measurement, and it is written here as one. What is
 measured: the FMV renders and advances; a third of each row arrives; after it the
 game draws nothing; `DrawEdge` stays at zero; neither buffer receives fresh
 content; and the guest never stops executing.
+
+## The FMV rows are fully written --- the SOURCE data is two-thirds pattern
+
+`SPU_ROWCOV` over a whole 2048-byte VRAM row, early (during the intro/FMV) and
+late in the same run:
+
+```
+early   blocks 0..19 = 207 writes   blocks 20..29 = 148   blocks 30..31 = 0
+late    blocks 0..19 = 413 writes   blocks 20..29 = 343   blocks 30..31 = 0
+
+bytes, late:  0000 F800 00F8  0000 F800 00F8  ... across ALL of blocks 0..29
+```
+
+Three things follow, and one of them closes a thread that was about to be chased
+into `Host2Local_Body`.
+
+**1. The writes are not truncated.** Every block from 0 to 29 --- bytes 0..1919,
+which covers both 320-pixel 24-bit buffers --- is written hundreds of times. There
+is no short transfer and no early loop exit. So the clamp inside
+`Host2Local_Body` (the `LS 0x24220` comparison this document was about to
+decode) is not the bug, and the `pixels/2` arithmetic retracted earlier was
+doubly wrong: not just the wrong explanation, but an explanation for something
+that is not happening.
+
+**2. Blocks 30--31 are never written at all**, i.e. VRAM x 960..1023. That is
+outside the 960-pixel region the game uses, so it is correct.
+
+**3. The source data is the problem.** Late in the run the whole row holds a
+repeating **6-byte** pattern. At three bytes per pixel that is exactly two
+pixels, alternating:
+
+```
+(00, F8, 00)  = green
+(F8, 00, 00)  = red
+```
+
+Green and red alternating per pixel is precisely the green-with-magenta-dots
+screen, and it is what the blit is being *given* to copy. The FMV frames that do
+show a picture are the moments when about a third of the row carried real decoded
+pixels and the rest still carried this pattern.
+
+### So the FMV defect is upstream of the SPU entirely
+
+`Host2Local_Body` faithfully copies what it is handed. Two thirds of what it is
+handed is a fixed two-pixel pattern rather than decoded video. That puts the bug
+in **MDEC decode** --- the PPU-side video decoder --- which produces roughly a
+third of each frame and leaves the remainder as whatever the buffer held.
+
+This is the fifth place this defect has been attributed to in these notes ---
+composite, byte order, mip chain, display flip, SPU blit --- and each of the
+previous four was closed by measurement. The pattern in the *source* is the first
+explanation that accounts for the exact byte values, the exact period, the
+partial frames, and the fully-striped frames all at once.
+
+`ps1_netemu` has no `mdec` string anywhere in its image and no `mdec.c` among its
+embedded source filenames, so the decoder lives inside one of the modules that do
+have names (`gpuio.cc` being the obvious candidate) or in code with no
+diagnostics at all. Finding it is the next job; the signature to look for is
+whoever fills the staging buffer that `Host2Local_Body` reads.
