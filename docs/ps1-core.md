@@ -3214,3 +3214,60 @@ What is solid: the EvCB table is valid, and those three kernel words are zero.
 Narrow, and independent of the hedge: **what should have written those three slots?** They are
 BIOS kernel globals, so the writer is the BIOS routine that opens the events --- most plausibly
 during CD driver init. Finding why it never ran, or ran and stored nothing, is the last step.
+
+### CONFIRMED: they are `HwCdRom` events, and `CdInit` never ran
+
+The three zero descriptors are **CD-ROM event handles**. Scanning the BIOS ROM for every access
+to those kernel words finds exactly three writers, all storing a call's return value, at
+`0xBFC52BF0` / `0xBFC52C30` / `0xBFC52C58`. The code around them:
+
+```
+BFC52BB0  lui   $a0, 0xf000
+BFC52BB4  ori   $a0, $a0, 3        ; class = 0xF0000003 = HwCdRom
+BFC52BB8  addiu $a1, $zero, 0x10   ; spec
+BFC52BBC  addiu $a2, $zero, 0x2000 ; mode = EvMdNOINTR (poll, no callback)
+BFC52BC0  jal   0xbfc58b30         ; OpenEvent
+BFC52BD0  sw    $v0, -0x4de8($at)
+...  repeated for spec 0x20, 0x40, 0x80, 0x8000  ...
+BFC52C54  jal   0xbfc58b40         ; EnableEvent on each
+BFC52C58  sw    $v0, -0x4dd8($at)
+```
+
+and the callee is confirmed by its own trampoline:
+
+```
+BFC58B30  addiu $t2, $zero, 0xb0
+BFC58B34  jr    $t2
+BFC58B38  addiu $t1, $zero, 8      ; B-table 0x08 = OpenEvent
+```
+
+`0xF0000003` is **`HwCdRom`**. So this routine --- entry ~`0xBFC52B9C`, with no direct `jal`
+callers in the ROM, i.e. a BIOS service reached through the kernel jump tables, which makes it
+`CdInit` / `_96_init` --- opens five `HwCdRom` events in `EvMdNOINTR` mode and enables them.
+
+**And the handles are zero, which means that routine never ran.** A successful `OpenEvent`
+returns `0xF1000000 | index`; a failure returns `-1`. Zero is neither, so this is not a failed
+`OpenEvent` --- the store never executed.
+
+### The complete root cause
+
+```
+the game calls a BIOS CD routine that waits on the HwCdRom events
+  -> but CdInit never ran, so those handles are still zero
+     -> TestEvent over null handles can never succeed
+        -> the BIOS spins at 0xBFC53840 forever
+           -> the game never resumes and never draws again
+              -> only type-8 sync packets reach the GP0 ring
+                 -> the GPU SPUs idle; the framebuffer stays as it was
+```
+
+### What this does *not* say
+
+The PS1 clearly loaded the game off the disc --- it is executing game code in main RAM --- so CD
+reads worked at least once. Either that path does not go through these events, or they were
+opened and later closed. Stating that explicitly because the temptation here is to declare "the
+CD is broken", and it demonstrably is not.
+
+**The next step** is to determine whether `CdInit` is ever entered at all. That is a call-site
+question in the emulator's BIOS-call dispatch --- the A/B/C jump tables at `0xA0`/`0xB0`/`0xC0`
+--- rather than another guess.
