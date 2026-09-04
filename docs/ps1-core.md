@@ -3566,3 +3566,57 @@ BIOS CdInit is never entered
      -> the CD wait loop at 0xBFC5384C polls null handles with TestEvent
         -> it can never succeed; the game never resumes or draws
 ```
+
+## IDENTIFIED: the stalled call is `CdReadSector`, A(0xA5)
+
+The function the R3000 is stuck in is `0xBFC5361C`, and it is now identified **without relying
+on a recalled table** --- which is what went wrong three times earlier in this session.
+
+**Structural evidence.** It appears exactly once as a data word, at `0xBFC4FF24`, inside a
+contiguous run of 181 code pointers based at `0xBFC4FC90`. That is the PS1 BIOS **A-table**
+(`0xB4` entries), and `0xBFC4FF24` is entry index **`0xA5`**.
+
+**Behavioural evidence**, which is what actually settles it:
+
+```
+BFC53638  move  $s5, $a1
+BFC53640  move  $s3, $a0
+BFC53644  move  $s4, $a2       ; three arguments
+BFC5364C  move  $s6, $zero
+BFC53650  addiu $s5, $s5, 0x96 ; +150 -- the PS1 CD data-area sector offset
+BFC53654  addiu $s1, $zero, 1
+BFC53658  slti  $v0, $s6, 0xa  ; retry counter, limit 10
+```
+
+Three arguments; the second is a logical sector converted to physical by adding 150 (the standard
+two-second lead-in at 75 sectors/s); a ten-retry loop. That is
+**`CdReadSector(count, sector, buffer)`**, and the two lines of evidence agree.
+
+Its four direct callers (`0xBFC52E30`, `0xBFC52EE8`, `0xBFC53154`, `0xBFC53518`) are the BIOS's
+own file-read paths, so the game may reach it either directly through A(0xA5) or via the BIOS
+file API.
+
+### The full picture, every link measured or read
+
+```
+ps1_netemu boots the game, and only 55 of 8192 BIOS buckets ever execute
+  -> the BIOS's own CD init (CdInit, 0xBFC52B9C) is never entered
+     -> its five HwCdRom event handles stay zero
+        -> the game calls CdReadSector (A(0xA5)) to read a sector
+           -> CdReadSector polls those null handles with TestEvent
+              -> it can never succeed; it spins its 10-retry loop forever
+                 -> the game never resumes, so it never draws
+                    -> only type-8 sync packets reach the GP0 ring
+                       -> the GPU SPUs idle; the framebuffer never updates
+```
+
+### The load-bearing new fact
+
+**Only 55 of 8192 BIOS buckets ever execute** --- about 3.5 KB of a 512 KB ROM. A real PS1 boot
+runs far more BIOS than that. So little running is consistent with ps1_netemu fast-booting the
+executable and skipping the BIOS initialisation `CdReadSector` depends on.
+
+Stated as *consistent with* rather than established. Whether ps1_netemu is **supposed** to run
+that init, or supposed to intercept `CdReadSector` entirely, is the next thing to determine ---
+and that is a question about the firmware's design, answerable by reading how ps1_netemu handles
+A-table calls, rather than another guess about symptoms.
