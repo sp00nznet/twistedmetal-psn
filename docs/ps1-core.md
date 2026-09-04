@@ -6319,3 +6319,91 @@ those functions reach through the DMA callbacks at channel-record `+0x24`,
 
 Those three OPDs are the next thing to resolve, and resolving an OPD is one
 lookup. That is where this investigation ends and the fix begins.
+
+# GOAL REACHED: intro videos -> title -> attract mode
+
+One undriven run, screenshots 6 s apart, no input at any point:
+
+```
+t=058   intro card
+t=064.. THE INTRO FMV PLAYS -- full colour, full screen
+t=094.. title screen
+t=136   FMV: the chrome "TWISTED METAL" logo shot
+t=148   ATTRACT MODE: 3D gameplay demo -- night city street, cars,
+        explosions, HUD with "SWEET TOOTH", health bars and score
+t=166   attract carousel: car select with a 3D car model, "THUMPER"
+```
+
+Frame sizes went from a uniform ~450 KB pattern to **328 KB -- 2.25 MB varying**,
+which is what real moving video looks like to a PNG encoder. Evidence kept as
+`scratch/GOAL_fmv.png`, `scratch/GOAL_attract_gameplay.png` and
+`scratch/GOAL_attract_carselect.png` (gitignored --- they are frames of
+copyrighted video).
+
+## The fix: five VMX instructions, in ps3recomp's lifter
+
+`ps1_netemu`'s MDEC is built out of VMX, and the lifter got five of the
+instructions it uses wrong.
+
+**Missing entirely** --- emitted as `/* TODO */`, i.e. silent no-ops:
+
+| instruction | sites | where |
+|---|---|---|
+| `vmsumshs` | 32 | **all** in `func_000E90B4`, the MDEC decode function |
+| `vsumsws` | (in the same 32) | same |
+| `vmulesh` | 6 | same |
+
+`vmsumshs` is the multiply-accumulate an IDCT is built from. With it and
+`vsumsws` absent, **the inverse DCT never ran at all.**
+
+**Byte-order bugs** --- `vr[]` holds big-endian bytes and these read lanes
+through a host typed pointer, so every lane was byte-reversed:
+
+```
+vsraw       arithmetic shift of a byte-reversed word
+vrlw        rotate, same
+vmax/vmin   ub/uh/uw/sb/sh/sw -- the comparison picks the wrong operand
+vmulosh     byte-reversed halfword lanes AND byte-reversed products
+```
+
+The lifter already documented this exact failure mode, on `vadduwm`:
+*"ARITHMETIC, unlike the bitwise ops above, cares about byte order... (vadduwm
+was returning byte-reversed sums and corrupting neighbouring elements.)"*
+`vslw` and `vsrw` had been fixed to use `ppu_vldu4`/`ppu_vstu4`. Their siblings
+had not.
+
+## How it was found
+
+The route matters more than the patch, because twenty laps of this
+investigation went into the wrong half of the pipeline:
+
+1. Everything downstream of MDEC was verified correct, one stage at a time ---
+   the SPU blit (read as code), the DMA, VRAM coverage, the texture bind, and
+   the composite (the screen was reconstructed pixel-for-pixel from VRAM bytes).
+2. The stage **upstream** was verified correct too: the R3000's software Huffman
+   pass emits well-formed coefficient blocks with `0xFE00` terminators.
+3. That bracketed MDEC. Its handlers were found through the PS1 I/O
+   registration (`0x1F801820`, size `0x10`) rather than by name --- the firmware
+   has no `mdec` string and no symbol for it.
+4. **MDEC's own output buffer** was then dumped live from DMA channel 1's
+   descriptor (guest `0x00965CB0`) and held saturated primaries --- pure red,
+   pure green, pure white --- *before any blit touched it*.
+5. Saturated output from a clamp is what a colour conversion produces when fed
+   wrong values, and the conversion turned out to be the VMX code in
+   `func_000E90B4`, reached through the MDEC-out DMA callbacks at channel-record
+   `+0x24`/`+0x28`/`+0x2C`.
+6. Auditing every VMX mnemonic in that function against its lowering found the
+   five faults.
+
+The lesson worth keeping: the defect was in **our** recompiler, not in the
+firmware. `ps1_netemu`'s MDEC is correct code that runs on real hardware, so
+"MDEC returns a pattern" always meant *this port mishandles something MDEC
+does* --- and that reframing is what turned an open-ended hunt into an audit of
+eleven mnemonics.
+
+## Not specific to this title
+
+Any PS3 game whose code uses `vmsumshs`, `vsumsws` or `vmulesh` was silently
+getting no-ops, and anything using `vsraw`, `vrlw`, `vmulosh` or integer
+`vmax`/`vmin` was getting byte-reversed lanes. All are fixed in
+ps3recomp `93f1377`.
