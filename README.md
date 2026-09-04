@@ -174,13 +174,13 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | R3000 runs continuously | 🟨 Partly — **1.1 billion instructions (~14 MIPS)** in a good run; some runs wedge early |
 | Audio decoder reached and stable | ✅ Done — four `cellAdec` ABI faults fixed; `EndSeq` 4760 → 2 |
 | RSX pipeline fed | ✅ Done — 22,029 packets, 22,029 groups executed, **zero** drops |
-| PS1 GPU handoff (PPU → 4 SPUs) | ✅ Done — verified: **21,206 packets consumed** in step with production |
+| PS1 GPU handoff (PPU → 4 SPUs) | 🟨 Partly — **21,206 packets consumed**, but the SPUs emit no pixels |
 | **PS1 renders (BIOS boot screen in VRAM)** | ✅ **Done** — dumped and read: PlayStation logo + SCEA licence text |
 | **PS1 game runs and loads its art** | ✅ **Done** — VRAM holds Twisted Metal car sprites and title letters |
 | **Renderer produces a picture** | ✅ **Done** — 89% of the presented 1280x720 surface is drawn |
 | Whole PS3-side render path verified | ✅ Done — draws, shader, constants, upload, readback all correct |
 | PS1 display framebuffer placed correctly | ✅ Done — 320x240 block, native resolution, right position |
-| Intro video → menu → attract mode | ⬜ **BLOCKED** — framebuffer holds a 24px-period, 6-colour pattern; SPU texture/CLUT addressing |
+| Intro video → menu → attract mode | ⬜ **BLOCKED** — the four GPU SPUs consume commands and never DMA a pixel to VRAM |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

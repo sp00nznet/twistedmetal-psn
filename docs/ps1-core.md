@@ -2810,3 +2810,67 @@ collapses a real image onto a few entries at a fixed stride.
 and six distinct output colours are what a wrong texture-page or CLUT base produces while the
 rasteriser itself runs correctly --- and the rasteriser demonstrably does run, because the
 framebuffer is the right size, in the right place, fully covered, and updating.
+
+## The GPU SPUs consume commands and produce no pixels
+
+The PS1 GPU cores rasterise into VRAM by **DMA**, not by store, so their MFC PUT destinations are
+the only ground truth for what they actually produce. Logged (`SPU_PUTEA=1`):
+
+```
+[putea] spu1 cmd=0x20 ea=0x00000000E0015040 size=16 lsa=0x15080
+[putea] spu2 cmd=0x20 ea=0x00000000E0015050 size=16 lsa=0x15080
+[putea] spu3 cmd=0x20 ea=0x00000000E0015060 size=16 lsa=0x15080
+[putea] spu0 cmd=0x20 ea=0x00000000E0115030 size=16 lsa=0x15080
+[putea] spu0 cmd=0x20 ea=0x00000000E0215030 size=16 lsa=0x15080
+[putea] spu0 cmd=0x20 ea=0x00000000E0315030 size=16 lsa=0x15080
+```
+
+`0xE0000000 + n*0x100000` is SPU *n*'s window. So spu1/2/3 write 16 bytes into **spu0's** local
+store at `0x15040`/`50`/`60`, and spu0 writes into **spu1/2/3's** local store at `0x15030`. That
+is a master/slave work-distribution handshake with spu0 as master --- and it is all they do.
+
+Over a whole run the destination histogram (`SPU_PUTHIST=1`) shows every GPU-SPU write landing
+in buckets 0..3, the other SPUs' windows, and nowhere else:
+
+```
+spu0 ea~0x100000 / 0x200000 / 0x300000     (equal counts)
+spu1 ea~0x000000
+spu2 ea~0x000000
+spu3 ea~0x000000
+spu0    sizes: <=16:29573 <=32:24 <=128:120 <=256:600
+spu1..3 sizes: <=16:9856  <=256:600
+```
+
+Every non-empty bucket is printed, so the absence of a VRAM bucket is a reading rather than a
+gap. For contrast, spu4 (audio) writes 2 KB blocks to `0x60000000` and spreads ~32 MB across
+eight buckets --- that SPU is doing real work.
+
+### This corrects an earlier conclusion
+
+"`pub == done` on all four, 21,206 packets consumed" is true and was measured. But **consuming
+ring offsets is not the same as rasterising into VRAM**, and this document treated the first as
+evidence of the second. The SPUs advance their consumed pointer and exchange handshake messages;
+nothing writes a framebuffer.
+
+It also explains the display region: the 24-pixel-period, six-colour pattern is **not corrupted
+rasteriser output**, because there is no rasteriser output at all. It comes from some other path
+--- most likely ps1_netemu's own PPU-side code or an initial fill.
+
+### Ninth instance, and a new sub-species
+
+The first eight were *absence of evidence read as evidence of absence*. This one is different and
+worth naming separately: **evidence of one thing read as evidence of a different thing further
+down the chain.** The SPUs really did consume every packet. That says nothing about whether they
+drew anything, and it was never checked until now.
+
+### Where the port actually stands
+
+Verified working: the R3000 (1.1 billion instructions, ~14 MIPS), the GP0 command ring, the GPU
+SPUs' consumption of it, the texture upload, the composite shader and its constants, the draws,
+the presented surface, and the readback.
+
+The gap is now specific and upstream of everything the previous sections were investigating:
+**the four GPU SPUs run, consume commands, talk to each other, and never emit a pixel.** The
+question is what their handshake is waiting for before it starts producing --- the same shape of
+question as the semaphore and the user command, both of which turned out to be one missing link
+each.
