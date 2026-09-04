@@ -3271,3 +3271,42 @@ CD is broken", and it demonstrably is not.
 **The next step** is to determine whether `CdInit` is ever entered at all. That is a call-site
 question in the emulator's BIOS-call dispatch --- the A/B/C jump tables at `0xA0`/`0xB0`/`0xC0`
 --- rather than another guess.
+
+### All five slots are zero: `CdInit` never ran at all
+
+Reading every slot `CdInit` fills, not just the three the poll loop reads:
+
+```
+[ps1ev] ram=0x00770780  EvCB tbl=0xA000E028 size=448
+[ps1ev]   slot 0xB218 handle=0x00000000
+[ps1ev]   slot 0xB21C handle=0x00000000
+[ps1ev]   slot 0xB220 handle=0x00000000
+[ps1ev]   slot 0xB224 handle=0x00000000
+[ps1ev]   slot 0xB228 handle=0x00000000
+```
+
+All five. The routine at `0xBFC52B9C` issues its five `OpenEvent` calls in a straight line with
+no branches between them, so a partial run would leave a **mix** --- some handles set, some
+zero. Five zeros means it never executed a single one.
+
+That distinction was worth one more run: *"CdInit failed partway"* and *"CdInit was never
+entered"* need completely different investigations, and only the second is consistent with this.
+
+### The root cause, with nothing inferred on top of it
+
+```
+the BIOS routine that opens the HwCdRom events never runs
+  -> all five handles stay zero
+     -> the game's BIOS CD wait polls null handles with TestEvent
+        -> it can never succeed, so the game never resumes
+           -> nothing is drawn; only type-8 sync packets reach the GP0 ring
+              -> the GPU SPUs idle and the framebuffer never updates
+```
+
+### Next
+
+Find out whether `CdInit` is entered at all, and from where. It has no direct `jal` callers in
+the ROM, so it is reached through the kernel's A/B/C jump tables at `0xA0`/`0xB0`/`0xC0` ---
+which makes this a question about that dispatch, or about whether the game ever asks for it.
+Both are answerable by watching the R3000's pc for entry to `0xBFC52B9C`, and the
+`PS1_R3000_PC` probe already has the machinery.
