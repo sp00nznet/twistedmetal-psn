@@ -194,7 +194,7 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Polygon rasteriser works | ✅ **Done** — `DrawEdge` 0 → **88,040** entries/SPU once driven off the title screen; the 2D phase simply had no polygons |
 | **Bug 3**: menu inner panel is black | ⬜ Background blit arrives; the panel content does not |
 | **Bug 4**: core reset at 2^32 cycles | ⬜ Counter wrap at ~4.27B (2^32 = 4.295B) — happens undriven too; input is not involved |
-| **Bug 5**: blank screen after the FMV | ⬜ No polygon is drawn and the attract demo never begins; driven runs go blank after the menu too |
+| **Bug 5**: nothing is drawn after the FMV | ⬜ Not a stuck flip (`LD_PS1_BUF0` removes every blank frame) — neither buffer gets fresh content, so attract mode never begins |
 | Twisted Metal renders | ⬜ |
 
 ### The blocker

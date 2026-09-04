@@ -5237,3 +5237,56 @@ screen it never draws.
 With input the sequence instead reaches the main menu, and there too the screen
 goes blank after the selection. **Both paths end blank**, which points at one
 mechanism rather than two.
+
+## The blank screen is an absence of content, not a stuck flip
+
+During the blank phase every composite bind is `1:0x004003C0 fmt=0xE1` --- 24-bit
+buffer 1 --- while the content that exists, the decoded FMV frame, sits in buffer
+0. That is exactly the shape of a display flip parked on the buffer the game is
+not drawing into, so it was worth one line to test.
+
+`LD_PS1_BUF0=1` (diagnostic, off by default) rewrites a bind at `0x4003C0` to
+`0x400000`. Result:
+
+```
+without override   26 captures in the blank window, ALL 8342 bytes (blank)
+with override       0 blank captures -- 11 pattern, 2 title screen, 1 new frame
+```
+
+**The blank frames disappear entirely.** So the display was indeed showing an
+empty buffer. But what replaces them is the stale *pattern*, not a picture ---
+buffer 0 in that phase holds stale content too. Neither buffer has anything
+fresh in it.
+
+So the flip is not the bug. **The game is drawing nothing at all after the FMV**,
+in either buffer, which is the same conclusion `DrawEdge=0` reached from the
+other end. The blank screen is a symptom of that, not a cause.
+
+### And the FMV is a progressing sequence
+
+Two distinct frames captured, at different points and from different buffers:
+
+```
+scratch/fmv_onscreen.png    (t=122, no override)  rubble and architecture
+scratch/fmv_logo_reveal.png (t=130, buffer 0)     "W" and "M" carved in stone
+```
+
+The second is the **Twisted Metal logo reveal** --- the intro movie's title
+shot. Different content in each, so the movie is *playing through*, not stuck on
+one frame. Both show the same defect: a coherent third of the width, stale
+pattern across the rest, and the coherent third sits at a different horizontal
+position in each (consistent with looking at different buffers).
+
+### Which ties the two remaining bugs together
+
+The FMV plays, advances, and draws about a third of each row; then the game stops
+drawing and never reaches attract mode. One playback path explains both: if the
+machinery that blits the movie is malfunctioning, the machinery that decides the
+movie has *finished* is a reasonable suspect for malfunctioning with it --- and a
+title waiting on an end-of-stream that never arrives would sit exactly like this,
+executing (the counter keeps climbing through 79 heartbeats) and drawing nothing.
+
+That is a hypothesis, not a measurement, and it is written here as one. What is
+measured: the FMV renders and advances; a third of each row arrives; after it the
+game draws nothing; `DrawEdge` stays at zero; neither buffer receives fresh
+content; and the guest never stops executing.
