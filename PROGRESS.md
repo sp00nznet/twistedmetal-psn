@@ -6115,3 +6115,50 @@ source filename in the image, so it has to be found from the PS1 hardware
 interface inwards --- the MDEC registers at `0x1F801820` / `0x1F801824` and DMA
 channels 0 and 1, all already mapped in the PS1 I/O handler table documented
 earlier in this file.
+
+### The disc is not being read during playback --- so it is a WAIT, not a stream
+
+`PS3_FSTRACE=100` prints every hundredth disc read with its file offset. Over a
+300 s run:
+
+```
+[fs] n=100 fd=7 off=32899072 size=65536 -> 65536
+[fs] n=200 fd=7 off=3211264  size=65536 -> 65536
+[fs] n=300 fd=7 off=7471104  size=65536 -> 65536
+[fs] n=400 fd=7 off=14024704 size=65536 -> 65536
+
+total traced: 4      (i.e. ~400 reads in the entire run, all early)
+```
+
+**Four hundred reads, then nothing for the rest of the run** --- while
+`Host2Local_Body` climbs past 1.7 billion hops and keeps climbing. So the movie
+is not streaming off the disc at all during the endless playback. No new data is
+arriving, and the game is re-blitting what it already has, indefinitely.
+
+That changes the character of the blocker. "The movie never ends" reads like a
+stream that is too long or never terminates; it is not. **The game is waiting**
+--- spinning in a playback loop, pushing the same frame data at VRAM, while
+something it expects never arrives.
+
+Which fits every other measurement:
+
+| observed | consistent with a wait? |
+|---|---|
+| `H2L_Body` climbing forever | yes --- the loop keeps re-blitting its buffer |
+| `BlockClear` frozen at 11,655 | yes --- a waiting loop does not start new frames |
+| `DrawEdge` zero | yes --- no new geometry while waiting |
+| pixel source is a fixed pattern | yes --- the buffer it re-blits was never filled with a decoded frame |
+| the guest never stops executing | yes --- it is a spin, not a hang |
+| disc reads stop | yes --- it is not waiting for *data*, it is waiting for an *event* |
+
+So the question is no longer "why is the movie so long" or even "why is the
+picture wrong", but: **which completion does the title wait on after it has read
+its movie data?** MDEC decode-done and the MDEC-out DMA (channel 1) are the two
+candidates on the PS1 side, and both are in the I/O handler map recorded earlier
+in this document.
+
+This is the same shape as the bug fixed at the top of this session --- a PPU/SPU
+pair each waiting for the other, resolved by finding the one signal that never
+fired. The instruments for that already exist here (`PS1_SPINWAIT`,
+`SPU_WHOPOLLS`, `PPU_RWATCH`, `PS3_EVQSTAT`) and none of them has yet been
+pointed at the R3000's view of MDEC.
