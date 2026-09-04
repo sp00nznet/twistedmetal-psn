@@ -6386,3 +6386,80 @@ that moment, and arm the read watch on *that* address --- or widen the watch to
 the whole `0x801C0000..0x801F0000` span if the volume is tolerable. Neither is
 difficult; the point is that the fixed-address version is not the same
 experiment.
+
+## MDEC IS NAMED: `func_000E9A18` (write) and `func_000EA2F0` (read)
+
+The last unmeasured link now has an address. Found without symbols or strings, by
+going through the I/O registration this document already mapped.
+
+### How it was found
+
+The coefficient span is read only by `func_001066A8` --- the R3000 interpreter
+itself (`PPU_RWATCH` over `0x00930780..0x00960780`, 24 hits, all the same
+function). So the coefficients are consumed through the **emulated I/O path**,
+not by a separate PPC routine reading PS1 RAM. That points at the registered
+handler for the MDEC window, and the registration site is a single instruction
+away:
+
+```
+000E8E90  lwz  r5, -0x7bc4(r2)     ; read handler OPD
+000E8E94  lis  r3, 0x1f80
+000E8E98  lwz  r6, -0x7bc0(r2)     ; write handler OPD
+000E8EA8  ori  r3, r3, 0x1820      ; base = 0x1F801820  -- MDEC
+000E8EAC  li   r4, 0x10            ; size
+000E8ED4  bl   0xc23e0             ; the I/O registrar
+```
+
+Resolving the two OPDs:
+
+```
+MDEC read handler    TOC-0x7BC4 = 0x1BC16C -> OPD 0x001B5E10 -> func_000EA2F0
+MDEC write handler   TOC-0x7BC0 = 0x1BC170 -> OPD 0x001B5DF8 -> func_000E9A18
+```
+
+### And it is a real implementation, not a stub
+
+`func_000E9A18`:
+
+```
+000E9A18  rlwinm r3, r3, 0, 0x1c, 0x1d   ; addr & 0xC -> register offset
+000E9A24  cmpwi  cr7, r3, 0
+000E9A70  beq    cr7, 0xe9ad4            ; offset 0 -> MDEC0, data/command
+000E9A74  cmpwi  cr7, r3, 4
+000E9A78  beq    cr7, 0xe9c84            ; offset 4 -> MDEC1, control/status
+000E9A7C  lwz    r29, -0x7b80(r2)        ; otherwise return
+```
+
+It masks the address to bits 28--29 for the register index, dispatches MDEC0 and
+MDEC1 separately, saves fifteen registers and runs a 0xF0-byte frame. That is
+substantial code --- MDEC is implemented, not stubbed, so the fault is inside its
+data path rather than absent.
+
+### The state of the whole chain
+
+```
+disc -> STR bitstream
+     -> [R3000 software Huffman]      VERIFIED CORRECT (well-formed blocks, 0xFE00)
+     -> [MDEC func_000E9A18 / func_000EA2F0]   *** returns a 2-pixel pattern ***
+     -> [SPU Host2Local_Body]         VERIFIED CORRECT (read as code)
+     -> [DMA to PS1 VRAM]             VERIFIED CORRECT (full row coverage)
+     -> [texture bind]                VERIFIED CORRECT (single unit, formats)
+     -> [composite]                   VERIFIED CORRECT (screen rebuilt from bytes)
+```
+
+Every stage either side of MDEC is positively verified. MDEC is handed valid
+coefficient blocks and returns a repeating two-pixel pattern, which is why the
+FMV has no picture and why the title never leaves playback and never reaches
+attract mode.
+
+### The next step, concretely
+
+`0xE9AD4` is the MDEC0 path --- where coefficient writes land --- and `0xE9C84`
+is MDEC1, control. `func_000EA2F0` is the read side, i.e. where decoded pixels
+come back out. Both are ordinary PPC functions in the lifted tree, so they can be
+read directly, and the input feeding them is already known good.
+
+The specific question to answer first: does the MDEC0 path accumulate a full
+block and run an IDCT, or does it return a constant/placeholder? A repeating
+two-pixel output is what a colour conversion fed constant coefficients would
+produce, so the DC-coefficient handling in `0xE9AD4` is the place to start.
