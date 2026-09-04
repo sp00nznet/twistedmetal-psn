@@ -5639,3 +5639,65 @@ is the honest boundary of this session.
 Two of the three are reached. The third is blocked by the same single defect as
 the first, which is a better position than "three separate unknowns" --- but it
 is not the goal met, and it should not be written up as if it were.
+
+## ATTRACT MODE: the blocker is that the intro movie never ends
+
+Two experiments settle what attract mode is waiting on.
+
+### 1. The rasteriser works in-game --- it is not a rendering problem
+
+Driving past the movie with `PAD_SCRIPT` and letting the game run:
+
+```
+DrawEdge   93,556 / 70,631 / 69,953 / 118,461 entries across the four SPUs
+DrawRect   106,885            BlockClear  2,778,210
+```
+
+and `SPU_VRAMPC` shows `DrawEdge` reaching VRAM too (4,527 writes, 70 KB). So
+once the game is out of movie playback the polygon rasteriser runs and its pixels
+land in VRAM. Whatever blocks attract mode, it is not the renderer.
+
+### 2. Undriven, the movie never ends --- 560 s, the longest run attempted
+
+```
+DrawEdge     absent from the histogram entirely -- zero, all four SPUs
+BlockClear   frozen at 11,655 -- not one frame clear in the whole run
+H2L_Body     1,732,247,214 -> 1,732,714,734 between the last two reports
+```
+
+`H2L_Body` is still climbing after nine minutes of wall time; the movie is still
+streaming. `BlockClear` frozen means **the game is not even clearing frames** ---
+it is doing nothing but blitting movie frames, forever.
+
+So the title never leaves intro playback. Attract mode follows the intro, so it
+never begins. That is the whole blocker, stated as a measurement rather than an
+inference.
+
+### What that means together with the source measurement
+
+The movie's pixel data is a two-pixel repeating pattern (measured in local store
+at the blit). A title playing a movie that produces no picture, and never
+reaching its end, is one situation and not two: whatever decides "the movie is
+finished" is downstream of the same decode that is producing pattern instead of
+frames.
+
+**The sequence, as it actually stands:**
+
+```
+intro logos    render
+title screen   renders, full colour
+intro movie    frames render and advance, then degrade to pattern -- AND NEVER ENDS
+attract mode   never begins, because playback never finishes
+main menu      renders, but only reachable by pressing past the movie
+```
+
+Two of the three goal elements are reached. The third is blocked by movie
+playback not terminating, which is the same defect as the first --- so the port
+is one bug away from the sequence rather than three.
+
+The next lap has a single target and it has not moved for several sections now:
+**MDEC**, the PS1 video decoder on the PS3 side. No strings, no symbols, no
+source filename in the image, so it has to be found from the PS1 hardware
+interface inwards --- the MDEC registers at `0x1F801820` / `0x1F801824` and DMA
+channels 0 and 1, all already mapped in the PS1 I/O handler table documented
+earlier in this file.

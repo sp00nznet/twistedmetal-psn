@@ -190,7 +190,8 @@ REGION NUM = 0x00000082 code=A        <- 0x82 straight out of argv[3]="0082"
 | Intro logos render | ✅ **Done** — both Sony title cards, photographed at t=75s and t=90s |
 | Main menu renders and responds | ✅ **Done** — reproduced unattended via `PAD_SCRIPT`; background art correct, inner panel black |
 | Intro FMV plays | 🟨 **Partly** — frames render and advance (logo reveal captured); rows are written in full but ~2/3 of the SOURCE is a 2-pixel red/green pattern, so the defect is in MDEC decode |
-| 3D on top of the menu | ⬜ Missing — 2D draws, geometry does not |
+| 3D on top of the menu | ✅ **Done** — `DrawEdge` reaches VRAM once past the movie (93k entries, 4.5k VRAM writes) |
+| **Bug 6**: the intro movie never ends | ⬜ 560 s undriven: `H2L_Body` still climbing, `BlockClear` frozen at 11,655, `DrawEdge` 0 — this is what blocks attract mode |
 | Polygon rasteriser works | ✅ **Done** — `DrawEdge` 0 → **88,040** entries/SPU once driven off the title screen; the 2D phase simply had no polygons |
 | **Bug 3**: menu inner panel is black | ⬜ Background blit arrives; the panel content does not |
 | **Bug 4**: core reset at 2^32 cycles | ⬜ Counter wrap at ~4.27B (2^32 = 4.295B) — happens undriven too; input is not involved |
