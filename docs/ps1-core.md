@@ -3387,3 +3387,44 @@ Both of the last two findings needed a control or an uncapped re-run to stand, a
 the check changed something: the first found the probe silent because of a case-sensitive grep,
 this one narrowed "repeatedly" to "twice". Neither changed the conclusion --- which is the useful
 outcome --- but neither was safe to publish without it.
+
+## The event system works. One event is open, and it is `HwDMAC`, not `HwCdRom`.
+
+Dumping the whole PS1 kernel EvCB table rather than just the five CD slots changes the target.
+
+```
+[ps1ev] EvCB[ 0] class=0xF0000009 status=0x00002000 spec=0x00000020
+                 mode=0x00002000 func=0x00000000
+[ps1ev] 1 of 16 EvCB entries in use
+```
+
+* **The event system is up and working.** One event is open. The table pointer was already known
+  good (`0xA000E028`, 448 bytes = 16 entries of `0x1C`); now the contents confirm the kernel can
+  and does open events.
+* class `0xF0000009` is **`HwDMAC`**, not `0xF0000003` `HwCdRom`.
+* status `0x2000` is enabled-and-waiting; mode `0x2000` is `EvMdNOINTR` and `func` is 0, so it is
+  **polled** rather than callback-driven.
+* spec `0x20` selects the DMA channel.
+
+### This is a different fault from the one the last several sections converged on
+
+"`CdInit` never ran" remains true, and the five CD handles really are zero --- but the party
+actually blocked is waiting on a **DMA completion event**, and it *did* open that event properly.
+It is not waiting because it failed to register; it is waiting because the event is never
+delivered.
+
+**And event delivery is our side of the line.** On real hardware a DMA completion raises IRQ3,
+the BIOS ISR runs, and it calls `DeliverEvent(HwDMAC, spec)`. If the emulated DMA completes
+without raising that interrupt --- or the interrupt is raised but never reaches `DeliverEvent`
+--- an `EvMdNOINTR` waiter polls forever, which is exactly the observed shape.
+
+### Which reframes the target usefully
+
+Instead of chasing why the guest never calls `CdInit` (a guest control-flow puzzle with no
+obvious handle), the question is whether **our DMA emulation raises the DMA interrupt, and
+whether it reaches the BIOS handler.** That is a concrete, checkable gap in code we own, and the
+DMA registers are already mapped (`0x1F801080 +0x80` covers every channel plus DPCR and DICR).
+
+Being explicit that this supersedes my own framing twice over: the CD events are a red herring
+for the actual stall, and the "`CdInit` never runs" finding --- while correct --- describes a
+routine nobody is currently waiting for.
